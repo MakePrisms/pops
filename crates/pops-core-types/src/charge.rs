@@ -89,8 +89,8 @@ pub enum ChargeError {
         /// The bare requested `amount` (net the server must receive).
         amount: u64,
         /// Server-recomputed swap fee over the presented proofs' keyset(s)
-        /// (0 for fee-free keysets, e.g. pop_<ts> today). `required = amount
-        /// + expected_swap_fee`. Carried so the body is self-explaining and the
+        /// (0 for fee-free keysets, e.g. pop_<ts> today). `required = amount +
+        /// expected_swap_fee`. Carried so the body is self-explaining and the
         /// holder can see the fee component. (spec §Fees)
         expected_swap_fee: u64,
     },
