@@ -11,5 +11,25 @@
 //!
 //! Extracted verbatim from `cdk-pop` so the address-derivation logic has a
 //! single source of truth across the (eventually unified) PoPs kernel.
+//!
+//! ## Recovery (signer seam)
+//!
+//! [`recovery`] reconstructs a deposit's taproot construction from public
+//! params; [`recover_tx`] builds and signs the script-path spend that reclaims
+//! the CLTV-locked BTC, split into a custody-free [`recover_tx::build_unsigned`]
+//! and a sign-agnostic [`recover_tx::apply_signature`] (with a hot-key
+//! [`recover_tx::build_and_sign`] wrapper). All failures are typed
+//! [`error::RecoverError`] — the library never panics or prints on an error
+//! path.
 
+pub mod error;
+pub mod recover_tx;
+pub mod recovery;
 pub mod script;
+
+pub use error::RecoverError;
+pub use recover_tx::{
+    apply_signature, build_and_sign, build_unsigned, recovery_address, FeePolicy, RecoverInputs,
+    RecoverTx, UnsignedRecovery, MIN_RELAY_FEERATE_SAT_PER_VB,
+};
+pub use recovery::{descriptor, reconstruct, Construction, ConstructionParams};
