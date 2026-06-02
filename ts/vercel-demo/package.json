@@ -1,0 +1,23 @@
+{
+  "name": "pops-vercel-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Next.js (Node runtime) demo gating a real endpoint via pops-core-verify compiled to WASM: 402 -> verify + NUT-03 swap over injected fetch -> 200.",
+  "scripts": {
+    "build:wasm": "bash ../build-wasm.sh",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@makeprisms/pops-core-wasm": "file:../pops-core-wasm",
+    "next": "^15.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.0",
+    "typescript": "^5.6.0"
+  }
+}

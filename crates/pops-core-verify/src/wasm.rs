@@ -1,24 +1,33 @@
 //! wasm-bindgen surface for `pops-core-verify` (feature `wasm`).
 //!
-//! STEP 1 scope: the **envelope codec** the TS client / extension needs —
-//! pure `serde` + `base64`, secp-free, guaranteed-wasm. None of these touch
-//! `cashu`, so the wasm build stays lean and cannot pull the heavy crypto.
+//! Two layers cross the JS boundary here:
 //!
-//! All exports speak JSON strings at the boundary (no `serde-wasm-bindgen`
-//! dependency): inputs/outputs that carry structure are JSON, errors are
-//! thrown as JS strings.
+//! 1. The **envelope codec** the TS client / extension needs — pure `serde` +
+//!    `base64`, secp-free (`parse_payment_params`, `decode_request_envelope`,
+//!    `encode_request_envelope`, `parse_payment_credential`,
+//!    `build_payment_credential`). String-in, string-out; errors thrown as JS
+//!    strings.
 //!
-//! The full `verify_and_redeem` (decode + structural checks + the NUT-03
-//! swap over an injected `fetch`) is **Step 2's** de-risk — the export is
-//! present here as a STUB so Step 2 only fills the body.
+//! 2. The **full `verify_and_redeem`** (Step 2): decode + structural checks +
+//!    the NUT-03 swap, with HTTP performed by the injected-`fetch`
+//!    [`WasmMintClient`][crate::wasm_mint_client::WasmMintClient]. It is async
+//!    (returns a `Promise`) and resolves to a structured JS object on success
+//!    or REJECTS with a structured `{ ok:false, code, message }` so the JS
+//!    route can map the [`ChargeError`] discriminant to an HTTP status
+//!    (402 / 503 / 400).
 
+use pops_core_types::ChargeError;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
 
+use crate::cashu_credential::CashuCredential;
+use crate::credential::{ChargeRequirement, Credential};
 use crate::envelope::{
     decode_request_envelope as core_decode_request_envelope, encode_payment_credentials,
     encode_request_envelope as core_encode_request_envelope, parse_payment_authorization,
     parse_payment_params as core_parse_payment_params, PaymentCredentials, PAYMENT_SCHEME,
 };
+use crate::wasm_mint_client::WasmMintClient;
 
 /// Map any `Display` error to a JS exception value (a string).
 fn js_err<E: core::fmt::Display>(e: E) -> JsValue {
@@ -82,14 +91,99 @@ pub fn build_payment_credential(credentials_json: &str) -> Result<String, JsValu
     Ok(encode_payment_credentials(&creds))
 }
 
-/// STEP 2 STUB. The full verify+redeem (structural checks + the NUT-03 swap
-/// over an injected `fetch`) lands in Step 2; in Step 1 this export exists
-/// only so the Step-2 body can drop in without changing the surface. Calling
-/// it always errors.
+/// Stable, machine-readable discriminant for a [`ChargeError`], carried as the
+/// `code` field of the rejection object so the JS route can pick an HTTP status
+/// without parsing prose. Values mirror the spec's problem-types / status
+/// concerns (A=transport→503, B=verification→402, C=malformed→400/402).
+fn charge_error_code(e: &ChargeError) -> &'static str {
+    match e {
+        ChargeError::MintUnreachable { .. } => "mint-unreachable",
+        ChargeError::AmountMismatch { .. } => "amount-mismatch",
+        ChargeError::WrongUnit { .. } => "wrong-unit",
+        ChargeError::MintNotAllowed { .. } => "mint-not-allowed",
+        ChargeError::MultiMintOrUnit => "multi-mint-or-unit",
+        ChargeError::LockedToken => "locked-token",
+        ChargeError::DleqInvalid { .. } => "dleq-invalid",
+        ChargeError::ShortKeysetIdUnresolved { .. } => "short-keyset-id-unresolved",
+        ChargeError::DoubleSpend => "double-spend",
+        ChargeError::Expired => "expired",
+        ChargeError::ChallengeExpired => "challenge-expired",
+        ChargeError::InvalidChallenge => "invalid-challenge",
+        ChargeError::MalformedCredential(_) => "malformed-credential",
+        ChargeError::MalformedRequest(_) => "malformed-request",
+        ChargeError::TooManyProofs { .. } => "too-many-proofs",
+        // `#[non_exhaustive]`: any future variant degrades to a generic code
+        // (the route should treat an unknown code conservatively, e.g. 402).
+        _ => "charge-error",
+    }
+}
+
+/// Build the structured rejection value `{ ok:false, code, message }` for a
+/// [`ChargeError`]. `code` is the stable discriminant; `message` is the
+/// human-readable `Display`.
+fn charge_error_to_js(e: &ChargeError) -> JsValue {
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&obj, &"ok".into(), &JsValue::FALSE);
+    let _ = js_sys::Reflect::set(&obj, &"code".into(), &JsValue::from_str(charge_error_code(e)));
+    let _ = js_sys::Reflect::set(&obj, &"message".into(), &JsValue::from_str(&e.to_string()));
+    obj.into()
+}
+
+/// Full verify + redeem over an injected `fetch`. THE Step-2 export.
+///
+/// `presented` is the holder's `cashuB…` token string; `req_json` is the
+/// JSON form of a [`ChargeRequirement`] (`{ amount, unit, mints, payment_id,
+/// description, single_use }`). Constructs a
+/// [`CashuCredential<WasmMintClient>`] and runs the same decode → structural
+/// checks → NUT-03 swap pipeline the native path runs, with all HTTP issued
+/// via `globalThis.fetch` against the token's mint.
+///
+/// Returns a `Promise` that RESOLVES to
+/// `{ ok:true, fresh_proofs, amount, unit, active_keyset_id, token_hash }` on
+/// success, or REJECTS with `{ ok:false, code, message }` carrying the
+/// [`ChargeError`] discriminant so the JS route maps 402 / 503 / 400.
+///
+/// A malformed `req_json` (server-side config error, never the holder's fault)
+/// rejects with `code = "malformed-request"`.
 #[wasm_bindgen]
-pub fn verify_and_redeem(_presented: &str, _req_json: &str) -> Result<JsValue, JsValue> {
-    Err(JsValue::from_str(
-        "verify_and_redeem is not implemented in Step 1 (envelope-only wasm surface); \
-         the full swap-over-fetch path lands in Step 2",
-    ))
+pub fn verify_and_redeem(presented: &str, req_json: &str) -> js_sys::Promise {
+    let presented = presented.to_string();
+    let req_json = req_json.to_string();
+
+    future_to_promise(async move {
+        // Parse the requirement JSON. A bad requirement is server config, not a
+        // payment failure → surface as MalformedRequest (the route maps it off
+        // `code`, distinctly from a MalformedCredential).
+        let req: ChargeRequirement = match serde_json::from_str(&req_json) {
+            Ok(r) => r,
+            Err(e) => {
+                let err = ChargeError::MalformedRequest(format!("requirement json: {e}"));
+                return Err(charge_error_to_js(&err));
+            }
+        };
+
+        let cred = CashuCredential::new(WasmMintClient::new());
+
+        match cred.verify_and_redeem(&presented, &req).await {
+            Ok(redeemed) => {
+                let obj = js_sys::Object::new();
+                let set = |k: &str, v: &JsValue| {
+                    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(k), v);
+                };
+                set("ok", &JsValue::TRUE);
+                set("fresh_proofs", &JsValue::from_str(&redeemed.proofs.fresh_proofs));
+                // amount is u64; JS numbers are f64 — pop amounts are small, so
+                // an f64 round-trips exactly. Pass as f64.
+                set("amount", &JsValue::from_f64(redeemed.amount as f64));
+                set("unit", &JsValue::from_str(&redeemed.unit));
+                set(
+                    "active_keyset_id",
+                    &JsValue::from_str(&redeemed.proofs.active_keyset_id),
+                );
+                set("token_hash", &JsValue::from_str(&redeemed.proofs.token_hash));
+                Ok(obj.into())
+            }
+            Err(e) => Err(charge_error_to_js(&e)),
+        }
+    })
 }

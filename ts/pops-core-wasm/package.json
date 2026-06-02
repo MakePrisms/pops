@@ -1,0 +1,15 @@
+{
+  "name": "@makeprisms/pops-core-wasm",
+  "version": "0.1.0",
+  "description": "wasm-pack (nodejs target) build of pops-core-verify --features wasm. Generated, not hand-written: run `bash ts/build-wasm.sh` to (re)populate pkg/.",
+  "license": "MIT",
+  "private": true,
+  "main": "pkg/pops_core_verify.js",
+  "types": "pkg/pops_core_verify.d.ts",
+  "files": [
+    "pkg"
+  ],
+  "scripts": {
+    "build": "bash ../build-wasm.sh"
+  }
+}

@@ -27,6 +27,10 @@ pub mod credential;
 pub mod envelope;
 pub mod error;
 pub mod mint_client;
+// The cashu-pure NUT-03 swap ceremony + its raw-HTTP (`MintHttp`) seam. Always
+// compiled: the crypto is shared by the native cdk client and the wasm
+// injected-fetch client, and `cashu` itself compiles to wasm.
+pub mod swap_ceremony;
 
 // `cdk_mint_client` (cdk wallet HTTP) and `middleware` (axum) are the only
 // truly native-only modules. `challenge` is cashu-typed but cashu compiles to
@@ -38,5 +42,12 @@ pub mod cdk_mint_client;
 #[cfg(feature = "native")]
 pub mod middleware;
 
+// The injected-`fetch` MintClient + the wasm-bindgen export surface. Both are
+// wasm-feature-only (the fetch client needs js-sys/web-sys; the exports need
+// wasm-bindgen). `wasm_mint_client` is gated on the feature, not the target,
+// so a native `--features wasm` typecheck still sees it — but its `fetch`
+// bodies only run on wasm32.
 #[cfg(feature = "wasm")]
 pub mod wasm;
+#[cfg(feature = "wasm")]
+pub mod wasm_mint_client;
