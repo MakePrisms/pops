@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://makeprisms.com/pop-wallet/agent-state.schema.json",
+  "title": "pop-wallet agent state",
+  "description": "Per-human preferences an autonomous agent reads before driving the `pop` PoP funder wallet. Captured during onboarding (first use) and updated only with explicit human consent. Lives at ~/.pop-wallet/agent-state.json. This file is NOT a secret (it holds no keys or seed), but it encodes spending authority the agent is trusted to honor — treat changes as consequential.",
+  "$comment": "pop CLI output & error contract (FROZEN, schema_version 1): JSON is the DEFAULT output of every `pop` command, on success AND failure, on stdout — exactly ONE JSON object per invocation, nothing else (all progress/poll-status/diagnostics go to stderr). `--human` (alias `--pretty`) switches to human text (success -> stdout, failure -> stderr); `--json` is a deprecated accepted no-op. Every output carries top-level \"schema_version\": 1. Failure shape: { \"schema_version\": 1, \"error\": { \"code\", \"retriable\", \"message\", \"details\"? } } on stdout with non-zero exit (1); clap argument-parse errors exit 2 with no envelope. Branch on `code` + `details`, never on `message`. The closed, additive-only code set and per-code retry-class + details are documented in $defs.pop_cli_error_contract below and in SKILL.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "wallet_dir",
+    "network",
+    "default_mint",
+    "default_lock_duration",
+    "max_amount_sats_per_lock",
+    "onboarded_at"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Schema version for this state file."
+    },
+    "wallet_dir": {
+      "type": "string",
+      "description": "The pop wallet directory (the dir that holds config.toml, seed, wallet.db, recovery/). Default ~/.pop-wallet. Pass to every command as --wallet-dir if not the default.",
+      "examples": ["/home/alice/.pop-wallet"]
+    },
+    "network": {
+      "type": "string",
+      "enum": ["mainnet", "testnet", "signet", "regtest"],
+      "description": "Bitcoin network the wallet was init'd on (pinned for the wallet's life; informational here — the wallet enforces it)."
+    },
+    "mnemonic_backed_up": {
+      "type": "boolean",
+      "default": false,
+      "description": "Set true ONLY after the human confirms they have written down / safely stored the BIP-39 mnemonic shown once at `pop init`. The agent MUST refuse to lock real (mainnet) funds while this is false."
+    },
+    "default_mint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mint_url", "mint_pubkey"],
+      "description": "The mint to lock against unless the human names another. mint_pubkey is REQUIRED by `pop quote/mint` on first use of a mint and is TOFU-pinned in the wallet's config.toml.",
+      "properties": {
+        "mint_url": {
+          "type": "string",
+          "format": "uri",
+          "examples": ["https://mint.example"]
+        },
+        "mint_pubkey": {
+          "type": "string",
+          "pattern": "^0[23][0-9a-fA-F]{64}$",
+          "description": "The mint's 33-byte compressed identity pubkey (66 hex chars). Used to independently verify the funding address — the funder's sole defense against a malicious address.",
+          "examples": ["02abcd...<66 hex>"]
+        }
+      }
+    },
+    "additional_mints": {
+      "type": "array",
+      "description": "Other mints the human has approved, same shape as default_mint.",
+      "items": { "$ref": "#/properties/default_mint" },
+      "default": []
+    },
+    "default_lock_duration": {
+      "type": "string",
+      "pattern": "^[0-9]+[dhms]?$",
+      "description": "Default credential lifetime / CLTV term passed as `--duration` (e.g. 30d, 12h). The locked BTC is illiquid until now+duration. A bare number is days.",
+      "examples": ["30d", "7d", "12h"]
+    },
+    "max_amount_sats_per_lock": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Hard ceiling, in sats, on a single lock the agent may perform WITHOUT a fresh, explicit human approval that names the larger amount. A safety rail, not a balance.",
+      "examples": [100000]
+    },
+    "default_recovery_dest": {
+      "type": ["string", "null"],
+      "default": null,
+      "description": "Default destination address for `pop recover --dest`. Recommended: a fresh address the human controls (recovery reveals the construction on-chain). If null, the agent MUST ask for a destination before recovering. The agent MUST always re-confirm the destination with the human before broadcasting a recovery, and MUST never recover to an unconfirmed/unverified address.",
+      "examples": ["bc1q...", null]
+    },
+    "default_fee": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Default fee policy for recovery. Omit both to let the wallet size the fee from the mempool at --target blocks.",
+      "properties": {
+        "target_blocks": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 6,
+          "description": "Confirmation target for the mempool feerate estimate (`pop recover --target`)."
+        },
+        "absolute_sats": {
+          "type": ["integer", "null"],
+          "default": null,
+          "description": "Absolute fee in sats (`pop recover --fee`), overrides target_blocks if set."
+        }
+      }
+    },
+    "authorized_services": {
+      "type": "array",
+      "description": "Forward-looking: services / marketplaces the human has authorized the agent to obtain and spend PoP ecash with (e.g. a 402-paying browser flow, an MPP marketplace). The wallet itself does NOT spend ecash (it prints a cashuB token), so this is policy the agent honors when it hands a minted token to a downstream consumer.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "examples": ["pops-402-extension", "mpp-marketplace"] },
+          "url": { "type": "string", "format": "uri" },
+          "max_amount_sats_per_payment": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Per-payment ceiling for this service, if the human set one."
+          },
+          "notes": { "type": "string" }
+        }
+      },
+      "default": []
+    },
+    "onboarded_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO-8601 timestamp when onboarding completed."
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO-8601 timestamp of the last consented change to this file."
+    }
+  },
+  "$defs": {
+    "pop_cli_error_contract": {
+      "$comment": "DOCUMENTATION ONLY (not a validation rule). Reference for the `pop` CLI's frozen failure envelope `{ schema_version, error: { code, retriable, message, details? } }`. retry-class is doc-only, keyed by `code`: transient = retry same call as-is (retriable:true); needs_input = fix the call / ask the human then retry; terminal = do not retry. 'details: REQ' = the listed fields are always populated.",
+      "title": "pop CLI error codes (FROZEN, closed, additive-only — never remove/rename a code; a breaking change bumps schema_version)",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Stable lower_snake_case error code. The closed set is the enum below.",
+          "enum": [
+            "insufficient_funds",
+            "mint_unreachable",
+            "chain_unreachable",
+            "mint_error",
+            "funding_pending",
+            "cltv_not_expired",
+            "quote_expired",
+            "amount_mismatch",
+            "value_below_fee",
+            "not_402",
+            "payment_rejected",
+            "address_mismatch",
+            "network_mismatch",
+            "deposit_not_found",
+            "broadcast_failed",
+            "wallet_not_initialized",
+            "wallet_exists",
+            "invalid_mnemonic",
+            "invalid_input",
+            "internal_error"
+          ]
+        },
+        "retriable": {
+          "type": "boolean",
+          "description": "true iff the failure is transient (safe to retry the same call as-is). true for: mint_unreachable, chain_unreachable, funding_pending, cltv_not_expired, broadcast_failed. false for all others."
+        },
+        "message": { "type": "string", "description": "Human help only. Agents MUST NOT parse it." },
+        "details": { "type": "object", "description": "Structured remediation fields; see per-code table below." }
+      },
+      "codes": {
+        "insufficient_funds": { "retriable": false, "retry_class": "needs_input", "details": "{required_sats, available_sats}", "required": true },
+        "mint_unreachable": { "retriable": true, "retry_class": "transient", "details": "{mint_url}", "required": true, "note": "transient-network read side (mint unreachable); mirror of chain_unreachable" },
+        "chain_unreachable": { "retriable": true, "retry_class": "transient", "details": "{esplora_url, operation?}", "required": "esplora_url", "note": "esplora (chain backend) GET/read transport failure — operation in {tip_mtp, utxo_fetch, fee_estimate}; transient-network read side, mirror of mint_unreachable. DISTINCT from broadcast_failed (the esplora POST/broadcast write path); a malformed esplora body stays internal_error" },
+        "mint_error": { "retriable": false, "retry_class": "terminal", "details": "{status?, mint_message}", "required": "mint_message" },
+        "funding_pending": { "retriable": true, "retry_class": "transient", "details": "{address, expires_at, confs_seen?, confs_required?}", "required": "address, expires_at" },
+        "cltv_not_expired": { "retriable": true, "retry_class": "transient (gated by matures_at — wait then same retry)", "details": "{matures_at, now}", "required": true },
+        "quote_expired": { "retriable": false, "retry_class": "needs_input (STOP polling + re-quote)", "details": "{quote_id, expired_at}", "required": true },
+        "amount_mismatch": { "retriable": false, "retry_class": "needs_input (recover the misfunded UTXO — funds are safe on-chain)", "details": "{expected_sats, funded_sats}", "required": true },
+        "value_below_fee": { "retriable": false, "retry_class": "needs_input (lower fee / wait for feerate)", "details": "{value_sats, fee_sats}", "required": true },
+        "not_402": { "retriable": false, "retry_class": "terminal", "details": "{url, status_got}", "required": true, "note": "phase-2 `pay` only" },
+        "payment_rejected": { "retriable": false, "retry_class": "terminal (needs_input if required_amount given)", "details": "{required_amount?, unit?, reason?}", "required": "when the 402 told us", "note": "phase-2 `pay` only" },
+        "address_mismatch": { "retriable": false, "retry_class": "terminal (security — do NOT fund)", "details": "{expected, got}", "required": true },
+        "network_mismatch": { "retriable": false, "retry_class": "needs_input", "details": "{expected, got}", "required": true },
+        "deposit_not_found": { "retriable": false, "retry_class": "needs_input", "details": "{deposit_id}", "required": true },
+        "broadcast_failed": { "retriable": true, "retry_class": "transient", "details": "{reject_reason?, txid?}", "required": false },
+        "wallet_not_initialized": { "retriable": false, "retry_class": "needs_input", "details": "message-only" },
+        "wallet_exists": { "retriable": false, "retry_class": "needs_input", "details": "message-only" },
+        "invalid_mnemonic": { "retriable": false, "retry_class": "needs_input", "details": "message-only (NEVER echoes the mnemonic)" },
+        "invalid_input": { "retriable": false, "retry_class": "needs_input", "details": "message-only" },
+        "internal_error": { "retriable": false, "retry_class": "terminal", "details": "message-only" }
+      }
+    }
+  }
+}

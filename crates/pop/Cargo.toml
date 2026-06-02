@@ -1,0 +1,57 @@
+[package]
+name = "pop"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+authors = ["CDK Developers"]
+license = "MIT"
+description = "Funder-side CLI wallet for PoP (Proof-of-Power) Cashu credentials: mint, hold, and recover CLTV-backed BTC deposits"
+repository = "https://github.com/MakePrisms/pops"
+
+[[bin]]
+name = "pop"
+path = "src/main.rs"
+
+[dependencies]
+# PoPs funder-side kernel: the deterministic taproot address + CLTV recovery
+# construction, split into a custody-free build / sign-agnostic apply seam. The
+# wallet and the mint share this single source of address-derivation truth
+# (cannot drift). Replaces the former cdk-pop git dep.
+pops-core-funder = { path = "../pops-core-funder" }
+
+# cdk-common carries the Cashu primitives the mint/issue flow uses (NUT-04/20
+# MintRequest, proofs, keysets).
+cdk-common = { git = "https://github.com/MakePrisms/cdk.git", branch = "feat/cdk-pop-readonly", default-features = false, features = ["wallet", "mint"] }
+
+# bitcoin 0.32.x MUST match pops-core-funder's bitcoin version so the kernel's
+# return types (XOnlyPublicKey, ScriptBuf, TapSighash, schnorr::Signature,
+# Transaction, ...) are the same types we sign with. pops-core-funder pins
+# 0.32.2; the workspace resolves both to the same 0.32.x.
+bitcoin = { version = "0.32.2", default-features = false, features = ["std", "serde", "rand", "rand-std"] }
+
+# Chain I/O (UTXO fetch + broadcast). Match cdk-pop's esplora-client version.
+esplora-client = { version = "0.12", default-features = false, features = ["async-https-rustls", "tokio"] }
+
+# Mint HTTP (quote/mint/swap/keysets). reqwest with rustls, no native deps.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Seed: BIP-39 mnemonic + seed. BIP-32 derivation comes from bitcoin::bip32.
+bip39 = { version = "2.0", features = ["rand"] }
+
+# State store (standalone; NOT cdk-sqlite). Bundled sqlite so no system lib.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI + serde + misc.
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+zeroize = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,13 @@
+/target
+
+# Cargo.lock IS committed: this is a binary crate, and reproducible builds
+# matter for a wallet that recovers real BTC.
+
+# Wallet state never belongs in git: secrets, db, and recovery artifacts.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+seed.enc
+/.pop-wallet/
+*.recovery.json

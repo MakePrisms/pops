@@ -1,0 +1,6 @@
+# Fetch git dependencies via the system git CLI. The cdk dependency
+# (MakePrisms/cdk, feat/cdk-pop-readonly) is reachable anonymously over HTTPS
+# with the git CLI, but a global insteadOf rewrite to ssh breaks cargo's
+# built-in libgit2 fetcher. Using the CLI sidesteps that.
+[net]
+git-fetch-with-cli = true
