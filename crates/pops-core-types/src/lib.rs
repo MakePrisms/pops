@@ -9,11 +9,11 @@
 //!
 //! The `CurrencyUnit` adapter (`unit_to_string`) deliberately stays cdk-side;
 //! this crate knows nothing about cashu types.
-//!
-// TODO(co-design with cashu-mpp): ChargeError (envelope-mappable) + RedeemedProofs
-// + cashu Token/Proofs re-export. Placeholder only — no impl yet.
 
 use thiserror::Error;
+
+pub mod charge;
+pub use charge::{ChargeError, DleqLocation, RedeemedProofs};
 
 /// Errors from parsing the `pop_<ts_expiry>` unit grammar.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
