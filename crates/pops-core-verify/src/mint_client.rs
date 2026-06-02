@@ -1,0 +1,103 @@
+//! Mint client abstraction used by the verify core.
+//!
+//! [`CashuCredential`][crate::cashu_credential::CashuCredential] confirms a
+//! token's structural fit against a
+//! [`CashuRequirement`][crate::challenge::CashuRequirement] locally, then
+//! calls the issuing mint to perform an atomic swap. A successful swap proves
+//! the proofs are unexpired (mint enforces `final_expiry`) and unspent (mint
+//! enforces nullifier replay protection), and yields new proofs under the
+//! verifier's secrets — the charge is transfer-on-use.
+//!
+//! This module exposes only the trait + error surface. A concrete
+//! `cdk`-backed implementation lives in [`crate::cdk_mint_client`] (native
+//! only); tests in this crate use a mock impl defined alongside the
+//! `cashu_credential` tests.
+//!
+//! The trait deliberately takes a [`MintUrl`] and [`Proofs`] rather than the
+//! decoded [`Token`][cashu::Token] so concrete implementations can fetch
+//! mint keyset info up front and feed already-expanded proofs to the swap
+//! call. Translating a [`Token`][cashu::Token] into [`Proofs`] is the
+//! validator's responsibility — and is why [`MintClient::keysets`] exists
+//! as its own trait method: V1-format token keyset IDs are short (7 bytes)
+//! and need a full [`KeySetInfo`] list to resolve into a long [`Id`][cashu::nuts::Id]
+//! before [`Token::proofs`][cashu::Token::proofs] will return them.
+//!
+//! `MintClientError` is intentionally coarse: `Unreachable` for transport
+//! failures and `RejectedSwap` for any mint-side refusal. It does not
+//! distinguish expired vs. double-spent vs. keyset-rotated refusals.
+//!
+//! On `wasm32` the trait is `#[async_trait(?Send)]` (single-threaded; matches
+//! cdk's own wasm32 usage). On native it is `Send + Sync` so the validator can
+//! be shared across async tasks (e.g. inside an HTTP handler chain).
+
+use async_trait::async_trait;
+use cashu::nuts::nut02::KeySetInfo;
+use cashu::{MintUrl, Proofs};
+use thiserror::Error;
+
+/// Abstraction over the calls the verify core makes to a Cashu mint.
+///
+/// On native, implementations are expected to be `Send + Sync` so the
+/// validator can be shared across async tasks. On `wasm32` the futures are
+/// `?Send` (single-threaded).
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait]
+pub trait MintClient: Send + Sync {
+    /// Fetch the mint's keyset list.
+    ///
+    /// The validator needs this to resolve V1-format short keyset IDs
+    /// that appear in tokens on the wire. Without a matching
+    /// [`KeySetInfo`] the cashu crate cannot decode the proofs — see
+    /// [`cashu::Token::proofs`].
+    ///
+    /// Returning an empty `Vec` is valid (the mint reports no keysets);
+    /// callers must treat that as "no V1 IDs resolvable" rather than an
+    /// error.
+    async fn keysets(
+        &self,
+        mint_url: &MintUrl,
+    ) -> Result<Vec<KeySetInfo>, MintClientError>;
+
+    /// Swap `proofs` at `mint_url` for new proofs held by the verifier.
+    ///
+    /// The mint atomically consumes the inputs (failing if any are
+    /// spent, expired, or otherwise invalid) and returns blinded
+    /// signatures the verifier unblinds into the returned [`Proofs`].
+    async fn swap(
+        &self,
+        mint_url: &MintUrl,
+        proofs: Proofs,
+    ) -> Result<Proofs, MintClientError>;
+}
+
+/// Abstraction over the calls the verify core makes to a Cashu mint
+/// (`wasm32` variant: `?Send` futures, single-threaded).
+#[cfg(target_arch = "wasm32")]
+#[async_trait(?Send)]
+pub trait MintClient {
+    /// Fetch the mint's keyset list. See the native variant for details.
+    async fn keysets(
+        &self,
+        mint_url: &MintUrl,
+    ) -> Result<Vec<KeySetInfo>, MintClientError>;
+
+    /// Swap `proofs` at `mint_url` for new proofs. See the native variant.
+    async fn swap(
+        &self,
+        mint_url: &MintUrl,
+        proofs: Proofs,
+    ) -> Result<Proofs, MintClientError>;
+}
+
+/// Errors returned by [`MintClient`] implementations.
+#[derive(Debug, Error)]
+pub enum MintClientError {
+    /// The mint could not be reached (DNS, TCP, TLS, timeout, etc.).
+    #[error("mint unreachable: {0}")]
+    Unreachable(String),
+
+    /// The mint reached us but refused the swap (expired credential,
+    /// double-spent proof, invalid signature, keyset rotated, etc.).
+    #[error("mint rejected swap: {0}")]
+    RejectedSwap(String),
+}

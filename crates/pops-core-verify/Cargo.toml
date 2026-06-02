@@ -1,0 +1,67 @@
+[package]
+name = "pops-core-verify"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "PoPs ecash-agnostic verify core: Credential trait + CashuCredential<M:MintClient>; verify+swap-to-redeem behind a swappable MintClient; native (axum/cdk) + wasm surfaces."
+
+[lib]
+# rlib for native consumers (gateway, demos); cdylib so the `wasm` feature
+# can be built to wasm32 via wasm-pack/wasm-bindgen.
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# crates.io cashu (NOT a fork) — the verify crypto + token/proof/keyset types.
+# Compiles to wasm32 (cashu ships a cfg(target_arch="wasm32") block).
+cashu = "0.16"
+# The shared cross-slice contract: ChargeError / RedeemedProofs / parse_pop_unit.
+# This is the ONLY intra-workspace edge slice 2 introduces (NOT -funder).
+pops-core-types = { path = "../pops-core-types" }
+async-trait = "0.1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# thiserror "1" matches pops-core-types (the contract crate this wires to);
+# cashu/cdk pull thiserror 2 transitively — both majors coexist (as in the
+# upstream verifier today).
+thiserror = "1"
+# SHA-256 for RedeemedProofs.token_hash (lowercase hex of the presented token).
+# Pure-Rust, wasm-clean — kept out of the cashu/secp dep so the envelope-only
+# wasm surface stays lean while token_hash is still computable in core.
+sha2 = "0.10"
+
+# ── native feature deps (off on wasm) ───────────────────────────────────────
+# cdk supplies wallet::{HttpClient, MintConnector} for the real MintClient.
+cdk = { version = "0.16", default-features = false, features = ["wallet"], optional = true }
+# axum 0.7 powers the require_charge middleware (from_fn_with_state + Next::run).
+axum = { version = "0.7", optional = true }
+# http types (StatusCode / HeaderValue) used directly by the middleware.
+http = { version = "1", optional = true }
+# uuid v4 generates the per-request challenge `id`.
+uuid = { version = "1", features = ["v4"], optional = true }
+
+# ── wasm feature deps (off on native) ───────────────────────────────────────
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+# getrandom appears here ONLY so the wasm feature can flip on its `js` backend
+# (the redeem path's blinding RNG needs it on wasm32; envelope-only does not,
+# but selecting the backend at the crate root is harmless and future-proofs
+# Step 2). Pinned to 0.2 to match the cashu/bitcoin transitive major.
+getrandom = { version = "0.2", optional = true }
+
+[features]
+default = ["native"]
+native = ["dep:cdk", "dep:axum", "dep:http", "dep:uuid"]
+# `uuid/js` selects uuid's wasm randomness backend. uuid is pulled
+# TRANSITIVELY by cashu (not just our native dep), and uuid 1.23+ refuses to
+# compile on wasm32 without an explicit randomness feature; `getrandom/js`
+# alone no longer satisfies it. Enabling `uuid/js` here activates that backend
+# on the uuid already in the graph. (Plan §risk (d) — the wasm RNG source.)
+wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "getrandom/js", "uuid/js"]
+
+[dev-dependencies]
+# async test runtime for the folded validator/middleware tests.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# tower::ServiceExt::oneshot drives the axum router in the middleware tests.
+tower = "0.5"
