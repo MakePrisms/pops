@@ -1,0 +1,59 @@
+[package]
+name = "pops-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native (no-WASM) Docker reverse proxy that gates an operator's unmodified API with pops/cashu payment: verify + NUT-03 swap via pops-core-verify, persist the redeemed proofs, then forward upstream. Operator-run, non-custodial."
+
+[[bin]]
+name = "pops-gateway"
+path = "src/main.rs"
+
+[dependencies]
+# The verify core — the gateway is a THIN HOST around the existing gate. We
+# reuse the native `CashuCredential<CdkMintClient>` (verify + NUT-03 swap), the
+# cashu-typed `CashuRequirement` + `encode_challenge`, the request-envelope
+# codec, and the `Credential` seam. Verify logic is NOT reimplemented here.
+pops-core-verify = { path = "../pops-core-verify", default-features = false, features = ["native"] }
+# The cross-slice contract: `ChargeError` (mapped to HTTP status here) +
+# `RedeemedProofs` (what we persist) + `parse_pop_unit` (config validation).
+pops-core-types = { path = "../pops-core-types" }
+# cashu 0.16 — only to build the cashu-typed `CashuRequirement` (CurrencyUnit /
+# MintUrl / Amount) the verify core's challenge codec consumes. Same major as
+# pops-core-verify; no fork.
+cashu = "0.16"
+
+# ── HTTP server (gateway-own listener) ──────────────────────────────────────
+# axum 0.7 / http 1 — same majors as the verify crate's middleware so the
+# `http::StatusCode` / `HeaderValue` types line up across the reuse boundary.
+axum = "0.7"
+http = "1"
+# tokio multi-thread runtime + fs/sync for the durable proofs_sink append.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "sync", "signal"] }
+
+# ── Upstream forwarding + readiness probe ───────────────────────────────────
+# reqwest 0.12 drives the proxied request to `upstream_url` and the cheap
+# `/v1/keysets` reachability probe behind `/readyz`. `stream` lets us pipe the
+# upstream body back without buffering it whole.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Bridge a reqwest streaming body into an axum response body.
+futures-util = "0.3"
+
+# ── Config ──────────────────────────────────────────────────────────────────
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# serde_json serializes the proofs_sink JSONL record (one line per settlement).
+serde_json = "1"
+
+# ── Observability ───────────────────────────────────────────────────────────
+# JSON structured logs so an agent/operator can parse outcomes (plan §4.2).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+# tower::ServiceExt::oneshot drives the axum router in the integration tests.
+tower = { version = "0.5", features = ["util"] }
+# async-trait to write the mock MintClient the tests inject into CashuCredential.
+async-trait = "0.1"
+# A throwaway in-process upstream + reading back the persisted JSONL.
+tempfile = "3"
