@@ -1,0 +1,20 @@
+[package]
+name = "pops-core-funder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "PoPs funder-side crypto: taproot output-key + CLTV recovery script (OP_VERIFY leaf) construction"
+
+[lib]
+# Plain rlib. This crate is NON-WASM (no cdylib): bitcoin's secp256k1 dep
+# pulls C, so the WASM surface lives elsewhere. Native consumers only.
+
+[dependencies]
+# bitcoin 0.32.2 with the exact feature set pop-wallet proved compiles this
+# script code. std + serde + rand + rand-std. NOT default-features.
+bitcoin = { version = "0.32.2", default-features = false, features = ["std", "serde", "rand", "rand-std"] }
+
+# Topology edge: declare the dependency on pops-core-types even though
+# script.rs does not consume it yet (the pop_<ts> grammar will be the
+# shared vocabulary once the funder flow lands).
+pops-core-types = { path = "../pops-core-types" }
