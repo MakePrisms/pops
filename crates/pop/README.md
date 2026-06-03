@@ -132,7 +132,8 @@ summing to exactly the charge plus a change set, asserts the send set is exact
 JSON. `--max-amount` is a hard cap so a malicious 402 cannot trick you into
 overpaying. On a **post-swap** failure the input is already spent, so the error
 carries BOTH the send token and any change token to recover. Full per-field
-contract: **[SKILL.md](SKILL.md)**.
+contract: **[skills/pop-wallet.md](../../skills/pop-wallet.md)** (the `pop` agent
+machine contract).
 
 ### recover
 

@@ -69,59 +69,10 @@ amount = 1                                   # exact net value required per requ
 ## Paying the gateway (client side)
 
 A client that receives a `402` pays by **retrying with an `Authorization:
-Payment <credential>` header**. The credential ECHOES the challenge from the
-402 and carries a `cashuB…` token. The field names + encoding below are exact —
-they are what the gateway parses (source of truth:
-`crates/pops-core-verify/src/envelope.rs`).
-
-### Flow
-
-1. **`GET`** the protected resource → `402` with a challenge header:
-   ```
-   WWW-Authenticate: Payment id="…", realm="…", method="cashu", intent="charge", request="<envelope>"
-   ```
-2. **Base64url-nopad-decode** the `request` param → JSON
-   `{"cashu_request":"creqA…"}`. The `creqA…` is a cashu payment-request that
-   describes the charge (amount, unit, accepted mints).
-3. With your **cashu wallet**, mint/select a `cashuB…` token for that amount +
-   unit at one of the accepted mints.
-4. **Build the credential** — a JSON object that echoes the challenge and
-   carries the token, then base64url-nopad-encode it and prefix `Payment `:
-   ```json
-   {
-     "challenge": {
-       "id": "<echo>",
-       "realm": "<echo>",
-       "method": "cashu",
-       "intent": "charge",
-       "request": "<echo of the request param, verbatim>"
-     },
-     "payload": { "cashu_token": "cashuB…" }
-   }
-   ```
-   → header value: `Payment <base64url-nopad(that JSON)>`
-5. **Retry** the request with that `Authorization` header → `200` (gated
-   content) or `402` (re-challenge — e.g. wrong amount/unit/mint, double-spend,
-   or mint unreachable; on `503` retry, the token was **not** consumed).
-
-### Rules
-
-- The scheme `Payment` is **case-insensitive**.
-- All **five** `challenge` fields (`id`, `realm`, `method`, `intent`, `request`)
-  are **REQUIRED** and must be echoed **verbatim** from the 402.
-- `method` **must** equal `cashu`.
-- Extra fields (`source`, `description`, …) are tolerated and ignored.
-
-### Canonical builder
-
-Don't hand-roll the encoding. `pops-core-verify` exposes the builder:
-
-- **WASM:** `build_payment_credential(credentials_json)` — takes the JSON object
-  above as a string, returns the base64url-nopad blob; you prepend `Payment `.
-- **Native (Rust):** `encode_payment_credentials(&PaymentCredentials)` — same
-  blob.
-
-Source of truth for the format: `crates/pops-core-verify/src/envelope.rs`.
+Payment <credential>` header** echoing the challenge and carrying a `cashuB…`
+token. That wire format (the `402` challenge shape, the credential to build, the
+rules, and the canonical encoders) is documented once, canonically, in
+**[skills/payment-credential.md](../../skills/payment-credential.md)**.
 
 ---
 

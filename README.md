@@ -1,10 +1,11 @@
 # PoPs — Proof of Power
 
-> **Agents:** drive the `pop` wallet from its machine contract —
-> **[crates/pop/SKILL.md](crates/pop/SKILL.md)** (exact per-command JSON, the
-> frozen 20-code error table, and the safety rails for locking real BTC). To gate
-> a server, see the gateway contract in
-> **[crates/pops-gateway/README.md](crates/pops-gateway/README.md)**.
+> **Agents → [AGENTS.md](AGENTS.md).** That's the entry point: it maps the two
+> pathways — **use pops** (drive the `pop` wallet from its machine contract,
+> **[skills/pop-wallet.md](skills/pop-wallet.md)** — exact per-command JSON, the
+> frozen 31-code error table, and the safety rails for locking real BTC) and
+> **gate your own service** (**[skills/gate-a-service.md](skills/gate-a-service.md)**)
+> — plus the shared `Payment` wire format.
 
 ---
 
@@ -23,7 +24,7 @@ value clients spend.
 
 ## Use it with your agent
 
-Point your agent at **[crates/pop/SKILL.md](crates/pop/SKILL.md)** and it will
+Point your agent at **[skills/pop-wallet.md](skills/pop-wallet.md)** and it will
 drive the `pop` wallet for you: create a seed, lock BTC to mint a pop, and
 recover the BTC after the timelock matures. The skill keeps you in the loop on
 the three numbers that matter every lock — amount, duration, and the
@@ -34,7 +35,7 @@ against a gated endpoint and pays it with an exact-amount token — it swaps the
 held pop down to the exact charge and hands back the change as a new `cashuB`. It
 is token-in / change-out (you supply the `cashuB` to spend), so the wallet still
 holds no token custody. See the pay contract in
-**[crates/pop/SKILL.md](crates/pop/SKILL.md)** (the `--max-amount` cap, the JSON
+**[skills/pop-wallet.md](skills/pop-wallet.md)** (the `--max-amount` cap, the JSON
 result, and recovering both tokens on a post-swap failure).
 
 ## What you can do
@@ -54,10 +55,16 @@ result, and recovering both tokens on a post-swap failure).
 
 ## Docs
 
-- **Gate a server:** [crates/pops-gateway/README.md](crates/pops-gateway/README.md)
+- **Agent entry point (both pathways):** [AGENTS.md](AGENTS.md)
+- **Gate a service (routes the 3 modes):** [skills/gate-a-service.md](skills/gate-a-service.md)
+  → reverse-proxy: [crates/pops-gateway/README.md](crates/pops-gateway/README.md)
 - **`pop` CLI wallet:** [crates/pop/README.md](crates/pop/README.md)
-- **Agent machine contract for `pop`:** [crates/pop/SKILL.md](crates/pop/SKILL.md)
+- **Agent machine contract for `pop`:** [skills/pop-wallet.md](skills/pop-wallet.md)
+- **`Payment` wire format (canonical):** [skills/payment-credential.md](skills/payment-credential.md)
 - **Serverless verify demo:** `ts/vercel-demo/app/api/secret/route.ts`
 
-Built on Cashu (ecash) + a CLTV-locked Bitcoin UTXO; funder crypto derives from
-[`MakePrisms/cdk`](https://github.com/MakePrisms/cdk) (`cdk-pop`).
+Built on Cashu (ecash) + a CLTV-locked Bitcoin UTXO. The funder crypto lives
+in-repo in the `pops-core-funder` crate (historically extracted from
+[`MakePrisms/cdk`](https://github.com/MakePrisms/cdk)'s `cdk-pop`); `cdk` /
+`cdk-common` are normal crates.io `0.16` dependencies. **No cdk fork or private
+access is needed to build.**

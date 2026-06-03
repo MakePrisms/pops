@@ -12,7 +12,7 @@ description: >-
 
 # pop-wallet — managing PoP funds on a human's behalf
 
-## PRIMER (read this first, every time the skill loads)
+## PRIMER (read this first, every time this guide loads)
 
 `pop` is the **funder** wallet for PoP (Proof-of-Power) credentials. The model,
 in plain terms:
@@ -35,7 +35,7 @@ So three numbers matter on every lock and the human must always see them: the
 **amount** (real BTC), the **lock duration**, and the resulting **recover-after
 date**. Funding is on-chain (~1 confirmation), not instant.
 
-This skill teaches you to drive `pop` for a human while keeping them in the loop.
+This guide teaches you to drive `pop` for a human while keeping them in the loop.
 **JSON is the DEFAULT output** on every command — parse it, never scrape human
 text. (`--human` / `--pretty` switches to human-readable text for a person to
 read; you should not normally pass it.)
@@ -49,7 +49,7 @@ read; you should not normally pass it.)
 ## Output & error contract (FROZEN, schema_version 1)
 
 `pop` speaks a frozen machine contract — see the per-code table under ERROR
-CONTRACT below and `agent-state.schema.json` for the schema.
+CONTRACT below and `pop-wallet.schema.json` for the schema.
 
 - **JSON is the default** on success AND failure, written to **stdout**.
   `--human` (alias `--pretty`) switches to text (success → stdout, failure →
@@ -163,7 +163,7 @@ Do this the first time the human asks you to use PoP, or whenever
    secure reason — it puts the secret on the parse/log channel.
 
 3. **Capture preferences and write the state file** at
-   `~/.pop-wallet/agent-state.json` (schema: `agent-state.schema.json`). Ask the
+   `~/.pop-wallet/agent-state.json` (schema: `pop-wallet.schema.json`). Ask the
    human for, and record: default mint URL + mint-pubkey, network, default lock
    duration, **max amount per lock**, default recovery destination address, and
    any authorized services/marketplaces. Stamp `onboarded_at`.
@@ -507,7 +507,7 @@ week's bitcoin" or "how much have I got locked":
 
 ## State-file reference
 
-Schema: `agent-state.schema.json` (next to this file). Filled example
+Schema: `pop-wallet.schema.json` (next to this file). Filled example
 (`~/.pop-wallet/agent-state.json`):
 
 ```json
