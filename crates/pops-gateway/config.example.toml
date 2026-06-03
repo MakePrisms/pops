@@ -26,6 +26,19 @@ proofs_sink = "/data/proofs.jsonl"
 # Gateway's own listen address. Default: 0.0.0.0:8080.
 # listen = "0.0.0.0:8080"
 
+# Max buffered request-body size in BYTES. The gateway buffers each request body
+# in full before forwarding it upstream; a larger body is rejected with
+# `413 Payload Too Large` (on a gated path, BEFORE any charge — the pop is not
+# consumed). This caps memory so an unbounded body on a public path can't OOM
+# the process. Default: 1048576 (1 MiB). Raise it if your API takes large
+# uploads.
+# max_body_bytes = 1048576
+
+# Upstream request timeout in SECONDS (connect + total). Bounds a hung upstream
+# so a request whose pop was already redeemed isn't stranded forever, and makes
+# the 504 response reachable. Default: 30. Set to 0 to disable (NOT recommended).
+# upstream_timeout_secs = 30
+
 [charge]
 # The pop_<unix_ts> currency unit you accept.
 #

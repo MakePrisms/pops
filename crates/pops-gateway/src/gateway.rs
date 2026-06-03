@@ -73,17 +73,36 @@ pub struct AppState<C: Credential> {
 
 impl<C: Credential> AppState<C> {
     /// Build the shared state from a validated config + credential + sink. The
-    /// `WWW-Authenticate` value is prebuilt here.
+    /// `WWW-Authenticate` value is prebuilt here, and the forwarding HTTP client
+    /// is built with the configured request + connect timeout so a hung upstream
+    /// is bounded (and the `504` path is reachable).
     pub fn new(config: ValidatedConfig, credential: C, sink: ProofsSink) -> Self {
         let www_authenticate = build_www_authenticate(&config.requirement);
+        let upstream = build_upstream_client(config.upstream_timeout);
         Self {
             config,
             credential: Arc::new(credential),
             sink: Arc::new(sink),
             www_authenticate,
-            upstream: reqwest::Client::new(),
+            upstream,
         }
     }
+}
+
+/// Build the forwarding `reqwest::Client`, applying the configured upstream
+/// timeout as BOTH a total-request timeout and a connect timeout. `None`
+/// (config `upstream_timeout_secs = 0`) builds a client with no timeout. If the
+/// builder somehow fails we fall back to a default client rather than panic at
+/// startup; the timeout is a safety bound, not a correctness invariant.
+fn build_upstream_client(timeout: Option<std::time::Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(t) = timeout {
+        builder = builder.timeout(t).connect_timeout(t);
+    }
+    builder.build().unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to build upstream client with timeout; using default");
+        reqwest::Client::new()
+    })
 }
 
 impl AppState<CashuCredential<CdkMintClient>> {
@@ -125,27 +144,58 @@ where
 }
 
 /// The gated path: enforce payment, persist on success, then forward.
+///
+/// Ordering matters for value-safety and DoS-resistance:
+/// 1. extract the credential FIRST — a bare/malformed request gets a 402
+///    WITHOUT us ever buffering its body (so an unauthenticated caller cannot
+///    make us buffer up to the cap);
+/// 2. buffer the body (capped) BEFORE the swap — an over-cap body is a 413 and
+///    a body-read failure is a 4xx, BOTH before the pop is consumed (so we
+///    never spend a pop on a request we then can't read; cf. the value-loss
+///    edge where a post-charge read failure looked retriable);
+/// 3. swap + persist;
+/// 4. forward the already-buffered body (no read can fail after the charge).
 async fn gate_then_forward<C>(state: Arc<AppState<C>>, req: Request) -> Response
 where
     C: Credential + Send + Sync + 'static,
 {
+    let (parts, body) = req.into_parts();
+
     // ── Step 1: extract + validate the Authorization: Payment credential. ──
-    let token = match extract_token(req.headers()) {
+    let token = match extract_token(&parts.headers) {
         Ok(t) => t,
-        // No header / non-Payment scheme → a bare 402 (no failure body).
+        // No header / non-Payment scheme → a bare 402 (no failure body). Note we
+        // have NOT touched the body, so this is cheap for unauthenticated load.
         Err(TokenExtract::NoAttempt) => return challenge_402(&state, None),
         // A malformed Payment attempt → 402 + a reason.
         Err(TokenExtract::Malformed(reason)) => return challenge_402(&state, Some(&reason)),
     };
 
-    // ── Step 2: verify + NUT-03 swap via the reused credential. ──
+    // ── Step 2: buffer the request body (capped) BEFORE charging. ──
+    // Over the cap → 413; a read failure → 4xx. Both happen while the pop is
+    // still UNSPENT, so the value-loss edge (charge, then fail to read the body,
+    // returning a retriable-looking 400) cannot occur.
+    let body_bytes = match read_body_capped(body, state.config.max_body_bytes).await {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge) => return payload_too_large(state.config.max_body_bytes),
+        Err(BodyReadError::Read(e)) => {
+            tracing::warn!(error = %e, "failed to read request body before charge");
+            return (StatusCode::BAD_REQUEST, "could not read request body").into_response();
+        }
+    };
+
+    // ── Step 3: verify + NUT-03 swap via the reused credential. ──
     let charge_req = charge_requirement_from_cashu(&state.config.requirement);
-    let redeemed = match state.credential.verify_and_redeem(&token, &charge_req).await {
+    let redeemed = match state
+        .credential
+        .verify_and_redeem(&token, &charge_req)
+        .await
+    {
         Ok(r) => r,
         Err(e) => return charge_error_to_response(&state, e),
     };
 
-    // ── Step 3: PERSIST fresh_proofs DURABLY *before* forwarding. ──
+    // ── Step 4: PERSIST fresh_proofs DURABLY *before* forwarding. ──
     // (spec refinement #2: a crash between forward and persist loses
     // already-consumed proofs.) On failure we do NOT forward and emit the
     // proofs + token_hash to stderr as a last resort so value is never silently
@@ -176,33 +226,102 @@ where
         "charge settled and persisted; forwarding upstream"
     );
 
-    // ── Step 4: forward the ORIGINAL request, stream the response back. ──
-    forward(&state, req).await
+    // ── Step 5: forward the ORIGINAL request (buffered body), stream back. ──
+    forward_buffered(&state, parts, body_bytes).await
 }
 
-/// Forward `req` verbatim (method/path+query/headers/body) to `upstream_url`
-/// and stream the upstream response back. Used for both gated (post-persist)
-/// and public requests.
+/// Forward a PUBLIC request: no gate, no persist. Buffers the body (capped →
+/// 413 on overflow) then forwards. This is the unauthenticated path, so the cap
+/// is the primary guard against an unbounded-body OOM.
 async fn forward<C>(state: &AppState<C>, req: Request) -> Response
 where
     C: Credential,
 {
     let (parts, body) = req.into_parts();
+    let body_bytes = match read_body_capped(body, state.config.max_body_bytes).await {
+        Ok(b) => b,
+        Err(BodyReadError::TooLarge) => return payload_too_large(state.config.max_body_bytes),
+        Err(BodyReadError::Read(e)) => {
+            tracing::warn!(error = %e, "failed to read request body");
+            return (StatusCode::BAD_REQUEST, "could not read request body").into_response();
+        }
+    };
+    forward_buffered(state, parts, body_bytes).await
+}
+
+/// Why a request body could not be turned into bytes.
+enum BodyReadError {
+    /// The body exceeded the configured `max_body_bytes` cap → `413`.
+    TooLarge,
+    /// An underlying read/stream error (client disconnect, etc.) → `4xx`.
+    Read(axum::Error),
+}
+
+/// Buffer an axum request `body` into `Bytes`, capped at `max` bytes.
+///
+/// `axum::body::to_bytes(body, max)` returns an error BOTH when the stream
+/// errors AND when the body exceeds `max`; we disambiguate by checking
+/// `is_length_limit_error` so an over-cap body maps to `413` (not a generic
+/// 4xx). This caps the in-memory buffer so an attacker streaming an unbounded
+/// body on a public/unauthenticated path cannot OOM the process.
+async fn read_body_capped(body: Body, max: usize) -> Result<axum::body::Bytes, BodyReadError> {
+    match axum::body::to_bytes(body, max).await {
+        Ok(b) => Ok(b),
+        Err(e) if is_length_limit_error(&e) => Err(BodyReadError::TooLarge),
+        Err(e) => Err(BodyReadError::Read(e)),
+    }
+}
+
+/// Whether an `axum::Error` from `to_bytes` is the length-limit (over-cap)
+/// error vs an underlying stream/read error. axum's `LengthLimitError` is the
+/// source; it carries no public type to match, so we sniff the error chain's
+/// `Display` for the stable axum message. (Falls back to treating an
+/// unrecognized error as a read error — i.e. a 4xx — which is the safe default:
+/// on a gated path we have not yet charged.)
+fn is_length_limit_error(e: &axum::Error) -> bool {
+    let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = src {
+        if err.to_string().contains("length limit exceeded") {
+            return true;
+        }
+        src = err.source();
+    }
+    false
+}
+
+/// `413 Payload Too Large` with a tiny JSON body naming the cap.
+fn payload_too_large(max: usize) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        format!(r#"{{"error":"payload_too_large","max_body_bytes":{max}}}"#),
+    )
+        .into_response()
+}
+
+/// Forward an already-buffered request (`parts` + `body_bytes`) to
+/// `upstream_url` and stream the upstream response back. Shared by the gated
+/// (post-charge) and public paths; the body is in memory so no read can fail
+/// here — crucially, on the gated path the pop is ALREADY spent by now.
+async fn forward_buffered<C>(
+    state: &AppState<C>,
+    parts: http::request::Parts,
+    body_bytes: axum::body::Bytes,
+) -> Response
+where
+    C: Credential,
+{
     let target = match upstream_target(&state.config.upstream_url, &parts.uri) {
         Ok(u) => u,
         Err(e) => {
             tracing::error!(error = %e, "could not build upstream URL");
             return (StatusCode::BAD_GATEWAY, "bad upstream URL").into_response();
-        }
-    };
-
-    // Buffer the request body (request bodies for these APIs are small; the
-    // RESPONSE is what we stream). axum's Body → bytes.
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to read request body");
-            return (StatusCode::BAD_REQUEST, "could not read request body").into_response();
         }
     };
 
@@ -230,8 +349,8 @@ where
     };
 
     // Map status + headers, then stream the body.
-    let status = StatusCode::from_u16(upstream_resp.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = forward_response_headers(upstream_resp.headers());
 
     let stream = upstream_resp.bytes_stream();
