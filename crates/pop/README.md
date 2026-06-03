@@ -33,9 +33,8 @@ crate.
 
 ## Build
 
-Rust 1.85+. The `cdk-pop` / `cdk-common` dependencies are pinned to the
-`feat/cdk-pop-readonly` branch of `MakePrisms/cdk` and fetched over HTTPS via
-the system git CLI (see `.cargo/config.toml`).
+Rust 1.95+. `cdk-common = "0.16"` is a normal crates.io dependency — no
+private fork or git CLI access required to build.
 
 ```
 cargo build --release
