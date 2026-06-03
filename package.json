@@ -1,0 +1,16 @@
+{
+  "name": "@makeprisms/pops-core-wasm",
+  "version": "0.1.0",
+  "description": "Prebuilt wasm-pack (nodejs target) build of pops-core-verify --features wasm. Generated dist branch — install directly via an npm git dependency, no Rust/wasm toolchain required.",
+  "license": "MIT",
+  "main": "pkg/pops_core_verify.js",
+  "types": "pkg/pops_core_verify.d.ts",
+  "files": [
+    "pkg"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MakePrisms/pops.git"
+  },
+  "homepage": "https://github.com/MakePrisms/pops/tree/wasm-pkg"
+}
