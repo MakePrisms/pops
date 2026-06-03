@@ -128,10 +128,19 @@ const redeemed = await wasm.verify_and_redeem(                      // full veri
 `mint-unreachable` → `503`, `malformed-request` → `400`, everything else → `402`
 + a fresh challenge.
 
-The bindings are **not on npm** — build them from source first
-(`bash ts/build-wasm.sh`). Authoritative doc + toolchain:
-**[ts/README.md](../ts/README.md)**. **Reference implementation** (a complete
-gated route to copy):
+Install the bindings prebuilt from GitHub — no Rust/wasm toolchain, no
+npm-registry auth:
+
+```sh
+npm install github:MakePrisms/pops#wasm-pkg          # tracks main
+npm install github:MakePrisms/pops#wasm-v0.1.0       # pinned, immutable
+```
+
+(In `package.json`: `"@makeprisms/pops-core-wasm":
+"github:MakePrisms/pops#wasm-pkg"`.) Building from source
+(`bash ts/build-wasm.sh`) is only needed if you change the Rust kernel.
+Authoritative doc + toolchain: **[ts/README.md](../ts/README.md)**. **Reference
+implementation** (a complete gated route to copy):
 [`ts/vercel-demo/app/api/secret/route.ts`](../ts/vercel-demo/app/api/secret/route.ts).
 
 ---
