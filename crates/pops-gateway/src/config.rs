@@ -191,7 +191,8 @@ impl Config {
     /// Checks (each → a field-named [`ConfigError`]):
     /// - `mint_url` parses as a cashu `MintUrl`;
     /// - `upstream_url` parses as an absolute http(s) URL;
-    /// - `charge.unit` is a well-formed `pop_<ts>` (via `parse_pop_unit`);
+    /// - `charge.unit` is a well-formed `pop_<ts>` (via `parse_pop_unit`); the
+    ///   advertised requirement carries its CANONICAL form (`format_pop_unit`);
     /// - `charge.amount > 0`;
     /// - `max_body_bytes > 0`;
     /// - every `charge.mints` entry parses as a `MintUrl`;
@@ -218,8 +219,13 @@ impl Config {
         // readiness probe; MintUrl::from_str enforces http(s)).
         let mint_url = MintUrl::from_str_checked(self.mint_url.trim())?;
 
-        // charge.unit — a well-formed pop_<ts>.
-        pops_core_types::parse_pop_unit(self.charge.unit.trim()).map_err(|e| {
+        // charge.unit — a well-formed pop_<ts>. Keep the parsed ts so the
+        // advertised requirement below carries the CANONICAL unit string
+        // (`format_pop_unit(ts)`) rather than the raw operator spelling. With
+        // the strict `parse_pop_unit` this is belt-and-braces (a non-canonical
+        // spelling already fails the parse), but it pins the advertised unit to
+        // exactly what the grammar emits no matter what an operator typed.
+        let charge_ts = pops_core_types::parse_pop_unit(self.charge.unit.trim()).map_err(|e| {
             ConfigError::new("charge.unit", format!("not a valid pop_<ts> unit: {e}"))
         })?;
 
@@ -257,8 +263,8 @@ impl Config {
         // exact "lose received value" failure refinement #1 guards against).
         validate_proofs_sink(&self.proofs_sink)?;
 
-        // Build the cashu requirement ONCE.
-        let unit = CurrencyUnit::Custom(self.charge.unit.trim().to_string());
+        // Build the cashu requirement ONCE, with the CANONICAL unit string.
+        let unit = CurrencyUnit::Custom(pops_core_types::format_pop_unit(charge_ts));
         let requirement = CashuRequirement {
             unit,
             mints,
@@ -407,9 +413,58 @@ amount = 1
         let v = cfg.validate().expect("validates");
         assert_eq!(v.listen, DEFAULT_LISTEN);
         assert_eq!(v.requirement.amount, Amount::from(1));
+        // The advertised unit is the canonical pop_<ts> string.
+        assert_eq!(
+            v.requirement.unit,
+            CurrencyUnit::Custom("pop_1782668279".to_string())
+        );
         // mints defaulted to [mint_url].
         assert_eq!(v.requirement.mints.len(), 1);
         assert!(v.routes.is_empty());
+    }
+
+    #[test]
+    fn unit_is_canonicalized_in_requirement() {
+        // An operator who pads the unit with surrounding whitespace still gets
+        // a CANONICAL `pop_<ts>` advertised (trim happens at the boundary, and
+        // the requirement is built from `format_pop_unit(parsed_ts)` — never the
+        // raw operator string). Belt-and-braces alongside the strict parser.
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+
+[charge]
+unit = "  pop_1782668279  "
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(
+            v.requirement.unit,
+            CurrencyUnit::Custom("pop_1782668279".to_string()),
+            "advertised unit must be the canonical, trimmed pop_<ts>"
+        );
+    }
+
+    #[test]
+    fn non_canonical_unit_is_rejected_at_gateway() {
+        // The single-source strict `parse_pop_unit` tightening reaches the
+        // gateway boundary: a leading-zero spelling (same numeric value as the
+        // canonical unit) is rejected as a named charge.unit error, never
+        // silently advertised as a divergent-string unit.
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+
+[charge]
+unit = "pop_01782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let err = cfg.validate().expect_err("leading-zero unit must fail");
+        assert_eq!(err.field, "charge.unit");
     }
 
     #[test]
