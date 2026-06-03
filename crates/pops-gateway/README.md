@@ -209,19 +209,8 @@ Checks: `upstream_url` / `mint_url` parse; `charge.unit` is a well-formed
 ## Building the image yourself
 
 The crate is a workspace member (path deps on `pops-core-verify` /
-`pops-core-types`, plus a git dep on `cdk`), so the Docker build context is the
-**workspace root**.
-
-The `cdk` git dep (`MakePrisms/cdk`, branch `feat/cdk-pop-readonly`) is a
-**private** repo, so the builder needs a read credential, supplied as a BuildKit
-secret (it is never baked into an image layer):
+`pops-core-types`), so the Docker build context is the **workspace root**:
 
 ```sh
-DOCKER_BUILDKIT=1 docker build \
-  --secret id=ghtoken,src=<(gh auth token) \
-  -f crates/pops-gateway/Dockerfile -t pops-gateway .
+docker build -f crates/pops-gateway/Dockerfile -t pops-gateway .
 ```
-
-`gh auth token` must print a token with `repo` read on `MakePrisms/cdk`. In CI,
-point `--secret` `src` at a file/env holding a token (or deploy key) with the
-same read access.

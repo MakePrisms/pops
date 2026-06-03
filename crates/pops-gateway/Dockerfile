@@ -5,20 +5,10 @@
 # /etc/pops-gateway/config.toml and points clients at the gateway.
 #
 # Build context = the WORKSPACE ROOT (the gateway depends on the sibling
-# path-crates pops-core-verify / pops-core-types, and on cdk as a git dep, so
-# the whole workspace + .cargo/config.toml must be in context).
+# path-crates pops-core-verify / pops-core-types, so the whole workspace must
+# be in context):
 #
-# The cdk git dep (MakePrisms/cdk, branch feat/cdk-pop-readonly) is a PRIVATE
-# repo, so the builder needs a read credential. It is supplied as a BuildKit
-# secret (never baked into a layer). Working build command:
-#
-#   DOCKER_BUILDKIT=1 docker build \
-#     --secret id=ghtoken,src=<(gh auth token) \
-#     -f crates/pops-gateway/Dockerfile -t pops-gateway .
-#
-# (`gh auth token` must print a token with `repo` read on MakePrisms/cdk.)
-# In CI the secret src is a file/env holding a token (or deploy key) with the
-# same read access — see ghcr publish notes.
+#   docker build -f crates/pops-gateway/Dockerfile -t pops-gateway .
 #
 # (The published image — ghcr.io/makeprisms/pops-gateway — is produced by
 # CI/release; this Dockerfile is the buildable shape, no local build for the
@@ -27,36 +17,20 @@
 # ── Stage 1: builder ────────────────────────────────────────────────────────
 FROM rust:1.95-slim-bookworm AS builder
 
-# git: the cdk dependency is a git source (MakePrisms/cdk, fetched over HTTPS via
-# the git CLI — see .cargo/config.toml `git-fetch-with-cli = true`).
 # pkg-config + libssl-dev: native TLS / secp build inputs. ca-certificates: the
-# HTTPS git fetch + crates.io.
+# crates.io fetch.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git pkg-config libssl-dev ca-certificates \
+        pkg-config libssl-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
-# Copy the whole workspace (path deps + the .cargo config that selects the git
-# CLI fetcher). A release build of just the gateway binary.
+# Copy the whole workspace (path deps). A release build of just the gateway
+# binary.
 COPY . .
 
-# Fail fast (and legibly) on a missing/invalid git credential instead of hanging
-# on a TTY prompt or surfacing a misleading "revision not found": GIT_TERMINAL_PROMPT=0
-# makes git error immediately when a cred is absent, and CARGO_NET_GIT_FETCH_WITH_CLI=true
-# makes cargo use the git CLI fetcher explicitly (so the insteadOf rewrite below is
-# honored even without .cargo/config.toml).
-ENV GIT_TERMINAL_PROMPT=0 CARGO_NET_GIT_FETCH_WITH_CLI=true
-
-# The cdk git dep is private: mount the read token as a BuildKit secret and rewrite
-# https://github.com/ -> token-authenticated HTTPS for the duration of this RUN.
-# The token lives only in the build secret tmpfs (not in any image layer), and the
-# git insteadOf rewrite is set on a throwaway global config in this layer.
-# Relies on .cargo/config.toml `git-fetch-with-cli = true` (cargo's libgit2
-# fetcher would ignore this insteadOf; only the git CLI honors it).
-RUN --mount=type=secret,id=ghtoken \
-    sh -c 'git config --global url."https://$(cat /run/secrets/ghtoken)@github.com/".insteadOf "https://github.com/" && cargo build --release --locked -p pops-gateway'
+RUN cargo build --release --locked -p pops-gateway
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
