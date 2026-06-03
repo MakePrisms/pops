@@ -29,9 +29,13 @@ recover the BTC after the timelock matures. The skill keeps you in the loop on
 the three numbers that matter every lock — amount, duration, and the
 recover-after date.
 
-Note: `pop` **mints** the credential (it prints a `cashuB` token). *Spending* a
-pop at a gated endpoint is done by the consumer or the gateway — there is no `pop
-pay` command yet (it's a planned follow-up).
+`pop` also **spends**: `pop pay <URL> --token <cashuB>` runs the HTTP-402 dance
+against a gated endpoint and pays it with an exact-amount token — it swaps the
+held pop down to the exact charge and hands back the change as a new `cashuB`. It
+is token-in / change-out (you supply the `cashuB` to spend), so the wallet still
+holds no token custody. See the pay contract in
+**[crates/pop/SKILL.md](crates/pop/SKILL.md)** (the `--max-amount` cap, the JSON
+result, and recovering both tokens on a post-swap failure).
 
 ## What you can do
 
@@ -41,9 +45,10 @@ pay` command yet (it's a planned follow-up).
   (Pull and run the published image — `docker run … ghcr.io/makeprisms/pops-gateway`;
   or build it yourself per the gateway README. You can also embed the verifier
   directly in a Rust/axum service or a serverless function via the WASM build.)
-- **Let your agent pay automatically** — an agent driving the `pop` wallet (and a
-  consumer that spends the minted token) can satisfy a gated endpoint's `402` on
-  your behalf.
+- **Let your agent pay automatically** — `pop pay <URL> --token <cashuB>` does the
+  `402` dance and pays a gated endpoint with an exact-amount token (swapping the
+  held pop to the exact charge and returning the change), so an agent driving the
+  `pop` wallet can satisfy the challenge on your behalf.
 - **Mint and recover via the CLI** — lock BTC, get a pop, and reclaim the
   unspent BTC after the CLTV expiry, all from the `pop` command.
 

@@ -115,6 +115,25 @@ first use** of a mint and is TOFU-pinned in `config.toml`; the quote response
 does not carry it, and it is needed to verify the address. A changed key for a
 known mint is a hard error.
 
+### pay
+
+```
+pop pay <URL> [--token <cashuB> | --token-file PATH | <stdin>]
+        [--max-amount SATS] [--method GET]
+```
+
+Spends a held pop at a gated endpoint via the **HTTP-402 dance**: fetches the
+URL, and if it answers `402` with a `WWW-Authenticate: Payment` challenge,
+presents a Cashu token worth **exactly** the charge, then returns the resource.
+It is **token-in / change-out** — you supply the `cashuB` to pay with (flag,
+file, or stdin), and `pay` does a NUT-03 swap that splits it into a send set
+summing to exactly the charge plus a change set, asserts the send set is exact
+(never overspends), and hands the leftover back as a new `change_token` in the
+JSON. `--max-amount` is a hard cap so a malicious 402 cannot trick you into
+overpaying. On a **post-swap** failure the input is already spent, so the error
+carries BOTH the send token and any change token to recover. Full per-field
+contract: **[SKILL.md](SKILL.md)**.
+
 ### recover
 
 ```
