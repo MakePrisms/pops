@@ -385,6 +385,12 @@ pub(crate) fn verify_blind_signatures(
 /// [`Signer::sign_mint_request`] signs + self-verifies it in place for the
 /// deposit at `funder_index`.
 ///
+/// Returns BOTH the assembled [`Token`] AND the raw [`Proofs`] it was built
+/// from. The proofs are returned alongside so the caller can pre-serialize them
+/// for value-recovery BEFORE stringifying the token: the mint has ALREADY issued
+/// the ecash by the time this returns, so if the `cashuB` Display (CBOR) were to
+/// fail, the freshly-issued bearer ecash would survive ONLY as these proofs.
+///
 /// # Errors
 ///
 /// Propagates HTTP, signing, and unblinding errors.
@@ -396,7 +402,7 @@ pub async fn mint_token(
     amount: u64,
     signer: &dyn Signer,
     funder_index: u32,
-) -> Result<Token, Box<dyn std::error::Error>> {
+) -> Result<(Token, Proofs), Box<dyn std::error::Error>> {
     let base = base.trim_end_matches('/');
 
     // Select the active keyset + fetch its amount->pubkey map.
@@ -459,8 +465,11 @@ pub async fn mint_token(
 
     let mint_url_typed = MintUrl::from_str(base)
         .map_err(|e| format!("mint url `{base}` is not a valid MintUrl: {e}"))?;
-    let token = Token::new(mint_url_typed, proofs, None, unit.clone());
-    Ok(token)
+    // Build the token from a CLONE so the raw proofs can be returned for
+    // value-recovery (the ecash is already issued; if stringify ever fails the
+    // proofs are the only surviving form). `Proof: Clone`, sets are tiny.
+    let token = Token::new(mint_url_typed, proofs.clone(), None, unit.clone());
+    Ok((token, proofs))
 }
 
 /// Performs a NUT-03 swap (`POST /v1/swap`) and unblinds the result into one
@@ -552,6 +561,29 @@ pub async fn swap(
 /// and a PoP token's total is far below `u64::MAX`).
 pub fn proofs_value(proofs: &[Proof]) -> u64 {
     proofs.iter().map(|p| p.amount.to_u64()).sum()
+}
+
+/// Stringifies a [`Token`] to its `cashuB…` form WITHOUT the `.to_string()`
+/// panic. `Token`'s `Display` (CBOR-encodes via ciborium) can return a
+/// `fmt::Error`; `ToString::to_string` PANICS on that — and on any path where the
+/// mint has ALREADY issued the ecash (the `mint` finish, the `pay` post-swap),
+/// that panic would VAPORIZE already-issued bearer ecash. Writing through
+/// [`std::fmt::Write`] surfaces the error as an `Err` instead, so the caller can
+/// recover the proofs.
+pub fn token_to_string(token: &Token) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    write!(&mut s, "{token}").map_err(|_| "cashuB encoding (CBOR) failed".to_string())?;
+    Ok(s)
+}
+
+/// Serializes a proof set to a JSON array string for recovery surfacing (the
+/// wire `Proof` shape: `{amount, id, secret, C, ...}`). Falls back to a
+/// diagnostic placeholder if serde ever fails (it does not for valid proofs) —
+/// this is a last-ditch value-recovery aid, never a hard error.
+pub fn proofs_to_json(proofs: &Proofs) -> String {
+    serde_json::to_string(proofs)
+        .unwrap_or_else(|e| format!("<proofs unserializable: {e}; {} proof(s)>", proofs.len()))
 }
 
 /// Parse a 64-hex funder secret into a `cdk_common` secret key (NUT-20 key).

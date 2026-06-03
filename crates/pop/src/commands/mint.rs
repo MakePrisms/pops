@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bitcoin::secp256k1::XOnlyPublicKey;
 use bitcoin::Network;
-use cdk_common::nuts::CurrencyUnit;
+use cdk_common::nuts::{CurrencyUnit, Proofs};
 use clap::Parser;
 
 use pops_core_funder::{reconstruct, Construction, ConstructionParams};
@@ -338,6 +338,11 @@ pub async fn run(
     .await?;
     eprintln!("Funding credited (amount_paid={}).", paid.amount_paid);
 
+    // ---- Guard: the mint must have credited EXACTLY the quoted amount. ----
+    // PoP is exact-amount; an under-/over-funded deposit must NOT mint the wrong
+    // value. The on-chain BTC stays CLTV-recoverable, so abort before issuing.
+    verify_funded_amount(outcome.amount, paid.amount_paid)?;
+
     // ---- Record the funding outpoint + patch the recovery file. ----
     record_funding_outpoint(
         &wallet,
@@ -448,6 +453,10 @@ async fn resume(
         )
         .await?;
         eprintln!("Funding credited (amount_paid={}).", paid.amount_paid);
+        // Guard: the mint must have credited EXACTLY the quoted amount (PoP is
+        // exact-amount). On a mismatch the on-chain BTC stays CLTV-recoverable;
+        // abort before issuing rather than mint the wrong value.
+        verify_funded_amount(dep.amount, paid.amount_paid)?;
         // Patch outpoint into the recovery file.
         let dir = wallet.dir.clone();
         let recovery_path = RecoveryFile::path_in(&recovery_dir(&dir), deposit_id);
@@ -486,7 +495,10 @@ async fn finish_mint(
     let signer = HotKeySigner::new(seed, wallet.network(), dep.funder_index);
 
     eprintln!("Issuing {} sats of {unit_str} ...", dep.amount);
-    let token = mint_client::mint_token(
+    // `mint_token` returns the token AND the raw proofs it was built from: the
+    // mint has ALREADY issued the bearer ecash once this returns, so the proofs
+    // are available to pre-serialize for value-recovery if the stringify fails.
+    let (token, proofs) = mint_client::mint_token(
         http,
         base,
         &dep.quote_id,
@@ -496,16 +508,26 @@ async fn finish_mint(
         dep.funder_index,
     )
     .await?;
-    let token_str = token.to_string();
 
+    // ---- VALUE-RECOVERY GATE (the exact bug `pay` was hardened against). ----
+    // The ecash is issued. `Token`'s `Display` (CBOR via ciborium) can return a
+    // `fmt::Error`, and `ToString::to_string` PANICS on that — which here would
+    // VAPORIZE freshly-minted, already-issued bearer ecash with no recovery. So
+    // use the fallible `token_to_string`; on Err, surface `token_encode_failed`
+    // carrying the raw proofs as JSON so the issued ecash is recoverable, never
+    // silently lost. Must never fire in practice (proof CBOR does not fail).
+    let token_str = mint_client::token_to_string(&token)
+        .map_err(|reason| token_encode_failure(&reason, &proofs))?;
+
+    // Only NOW — with the token string successfully in hand — record the deposit
+    // as Minted. (If stringify had failed above we returned the recovery error
+    // WITHOUT advancing state, so a `--resume` can still re-issue against the
+    // quote and the value is never stranded behind a `Minted` flag.)
     wallet.db.set_state(deposit_id, DepositState::Minted)?;
 
-    if let Some(path) = &args.token_out {
-        std::fs::write(path, &token_str)
-            .map_err(|e| PopError::invalid_input(format!("failed to write token to {}: {e}", path.display())))?;
-        eprintln!("Token written to {}", path.display());
-    }
-
+    // SURFACE THE ECASH FIRST. Emit the token (json object / human block) to
+    // stdout BEFORE the optional `--token-out` file write — so the issued ecash
+    // is ALWAYS surfaced on stdout even if that file write fails.
     if json {
         let out = serde_json::json!({
             "schema_version": SCHEMA_VERSION,
@@ -525,6 +547,19 @@ async fn finish_mint(
         println!("deposit id:  {deposit_id}");
         println!("\nYour cashuB credential token (NOT stored by this wallet — save it):\n");
         println!("{token_str}");
+    }
+
+    // The token is already on stdout, so a `--token-out` write failure is a
+    // non-fatal convenience miss, NOT value loss — downgrade it to a stderr
+    // WARNING rather than an error that would hide the only copy of the token.
+    if let Some(path) = &args.token_out {
+        match std::fs::write(path, &token_str) {
+            Ok(()) => eprintln!("Token written to {}", path.display()),
+            Err(e) => eprintln!(
+                "warning: failed to write token to {} ({e}); the token was printed to stdout above — save it from there",
+                path.display()
+            ),
+        }
     }
     Ok(())
 }
@@ -564,6 +599,36 @@ async fn record_funding_outpoint(
         }
     }
     Ok(())
+}
+
+/// Money-safety gate: the amount the mint credited (`funded`) must equal the
+/// amount we quoted/expected (`expected`). PoP is exact-amount, so an
+/// under-/over-funded deposit must NEVER mint the wrong value — abort with
+/// [`PopError::AmountMismatch`] BEFORE issuing. The on-chain BTC is untouched and
+/// stays CLTV-recoverable (`pop recover` after the timelock). Mirrors `pay`'s
+/// exact-amount assertion, on the issuance side.
+fn verify_funded_amount(expected: u64, funded: u64) -> Result<(), Box<dyn std::error::Error>> {
+    if funded != expected {
+        return Err(PopError::AmountMismatch {
+            expected_sats: expected,
+            funded_sats: funded,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Builds the value-recovery error for when a freshly-ISSUED mint token cannot
+/// be encoded to its `cashuB` string. The mint already issued the bearer ecash,
+/// so the raw `proofs` are surfaced as JSON in [`PopError::TokenEncodeFailed`]
+/// (`send_proofs`; the mint path has no change bucket) so the issued ecash is
+/// recoverable rather than vaporized by a stringify panic.
+fn token_encode_failure(reason: &str, proofs: &Proofs) -> PopError {
+    PopError::TokenEncodeFailed {
+        reason: format!("issued mint token: {reason}"),
+        send_proofs_json: Some(mint_client::proofs_to_json(proofs)),
+        change_proofs_json: None,
+    }
 }
 
 /// Resolves the unit string from `--unit` or `--duration` (`now + dur`).
@@ -793,6 +858,122 @@ mod tests {
         assert_eq!(parse_unit_ts("pop_1782259200").unwrap(), 1_782_259_200);
         assert!(parse_unit_ts("pop_notanumber").is_err());
         assert!(parse_unit_ts("sat").is_err());
+    }
+
+    // ---- MAJOR 2: amount_mismatch is now ENFORCED after poll_until_paid -------
+
+    #[test]
+    fn verify_funded_amount_passes_on_exact() {
+        // The credited amount equals the quoted amount → mint proceeds.
+        assert!(verify_funded_amount(50_000, 50_000).is_ok());
+    }
+
+    #[test]
+    fn verify_funded_amount_fires_on_underfund() {
+        // Mint credited LESS than quoted → abort with amount_mismatch (do NOT
+        // mint the wrong value; the BTC stays CLTV-recoverable).
+        let err = verify_funded_amount(50_000, 49_999).unwrap_err();
+        let pe = crate::error::from_boxed(err);
+        assert_eq!(pe.code(), "amount_mismatch");
+        // NOT retriable: re-polling won't change a wrong on-chain credit.
+        assert!(!pe.retriable());
+        let d = pe.details().unwrap();
+        assert_eq!(d["expected_sats"], serde_json::json!(50_000));
+        assert_eq!(d["funded_sats"], serde_json::json!(49_999));
+    }
+
+    #[test]
+    fn verify_funded_amount_fires_on_overfund() {
+        // Mint credited MORE than quoted → also a mismatch (exact-amount only).
+        let err = verify_funded_amount(50_000, 50_001).unwrap_err();
+        let pe = crate::error::from_boxed(err);
+        assert_eq!(pe.code(), "amount_mismatch");
+        let d = pe.details().unwrap();
+        assert_eq!(d["expected_sats"], serde_json::json!(50_000));
+        assert_eq!(d["funded_sats"], serde_json::json!(50_001));
+    }
+
+    // ---- MAJOR 1: a stringify failure surfaces recoverable proofs, no panic ---
+
+    /// Builds representative proofs (V0 short keyset id → round-trips through the
+    /// token codec without needing KeySetInfo).
+    fn sample_proofs(amounts: &[u64]) -> Proofs {
+        use cdk_common::dhke::hash_to_curve;
+        use cdk_common::nuts::{Id, Proof};
+        use cdk_common::secret::Secret;
+        use cdk_common::Amount as CdkAmount;
+        let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        amounts
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| {
+                let mut preimage = [0u8; 33];
+                preimage[0] = 1;
+                preimage[1] = i as u8;
+                let c = hash_to_curve(&preimage).expect("hash_to_curve");
+                Proof::new(CdkAmount::from(a), keyset_id, Secret::generate(), c)
+            })
+            .collect()
+    }
+
+    /// On the issuance path, if a token cannot be stringified the wallet MUST
+    /// surface the freshly-issued ecash as recoverable raw proofs in a
+    /// `token_encode_failed` error — NEVER panic (the bug `pay` was hardened
+    /// against, ported to `mint`). This drives the exact recovery-error
+    /// constructor `finish_mint` uses on the `token_to_string` Err branch.
+    #[test]
+    fn token_encode_failure_carries_recoverable_proofs() {
+        let proofs = sample_proofs(&[16, 32, 2]); // 50 sats total
+        let pe = token_encode_failure("cashuB encoding (CBOR) failed", &proofs);
+
+        // The documented value-recovery code, terminal, with the reason.
+        assert_eq!(pe.code(), "token_encode_failed");
+        assert!(!pe.retriable());
+
+        // The issued ecash survives as the send proofs (mint has no change set).
+        let d = pe.details().unwrap();
+        let send = &d["send_proofs"];
+        assert!(
+            send.is_array(),
+            "send_proofs must be the recoverable proof array"
+        );
+        assert_eq!(send.as_array().unwrap().len(), 3);
+        // The amounts round-trip — these ARE the user's ecash, re-encodable.
+        let sats: u64 = send
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["amount"].as_u64().unwrap())
+            .sum();
+        assert_eq!(sats, 50);
+        // No change bucket on the mint path.
+        assert!(d.get("change_proofs").is_none());
+        // It surfaces raw proofs (not cashuB tokens) for the human-mode renderer.
+        let (sp, cp) = pe.recovery_proofs_json().expect("carries recovery proofs");
+        assert!(sp.is_some());
+        assert!(cp.is_none());
+    }
+
+    /// The shared fallible stringify round-trips a real token back through
+    /// `Token::from_str` (it does NOT panic, and produces a parseable `cashuB`).
+    /// This is the helper that replaced the panicking `token.to_string()`.
+    #[test]
+    fn token_to_string_roundtrips_a_real_token() {
+        use cdk_common::mint_url::MintUrl;
+        use cdk_common::nuts::Token;
+        let proofs = sample_proofs(&[8, 1]); // 9 sats
+        let mint_url = MintUrl::from_str("https://mint.example").unwrap();
+        let token = Token::new(
+            mint_url,
+            proofs,
+            None,
+            CurrencyUnit::Custom("pop_1782668279".to_string()),
+        );
+        let s = mint_client::token_to_string(&token).expect("encodes");
+        assert!(s.starts_with("cashuB"), "got: {s}");
+        // Round-trips back to a token of the same value.
+        let back = Token::from_str(&s).expect("parses back");
+        assert_eq!(back.value().unwrap().to_u64(), 9);
     }
 
     #[test]

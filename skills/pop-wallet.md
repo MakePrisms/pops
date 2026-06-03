@@ -247,8 +247,13 @@ Returns:
 While `mint --resume` polls for funding it prints poll-status / progress to
 **stderr** (stdout stays empty until the single final token object). If it
 fails, you get the failure envelope — e.g. `funding_pending` (keep polling,
-retriable), `quote_expired` (stop + re-quote), or `amount_mismatch` (the
-on-chain funds are safe — recover that deposit). See the code table.
+retriable), `quote_expired` (stop + re-quote), or `amount_mismatch` (the mint
+credited a different sat amount than was quoted — PoP is exact-amount, so the
+deposit is NOT minted; the on-chain funds are safe in the CLTV address —
+`recover` that deposit). In the rare case the ecash is issued but its `cashuB`
+string cannot be encoded, `token_encode_failed` carries the raw proofs
+(`details.send_proofs`) to re-encode — the value is never silently lost. See the
+code table.
 
 **The `token` (a `cashuB` string) is the credential and is NOT stored by the
 wallet.** Deliver it to the human (or, per an entry in `authorized_services`,
@@ -570,7 +575,7 @@ from them.
 | `exact_amount_assertion_failed` | false | terminal | `{required, got}` REQ | (`pay`) INTERNAL money-safety abort — the send set didn't equal the charge; SENT NOTHING. Must never happen — report it |
 | `gateway_rejected_payment` | false | terminal | `{status, body, send_token, change_token?}` REQ(status, body, send_token) | (`pay`) the gateway answered non-2xx after a valid payment; surface `body`. The gateway did NOT redeem, so **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH** (the pop's input was spent by the swap). `--human` mode prints both tokens to stderr |
 | `gateway_retry_failed` | false | terminal | `{reason, send_token, change_token?}` REQ(reason, send_token) | (`pay`) the payment-retry HTTP call failed at the transport layer AFTER the swap spent the input — the retry never reached the gateway. **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH and present `send_token` to the gateway directly; do NOT retry with the original `--token` (it is spent).** `--human` prints both to stderr |
-| `token_encode_failed` | false | terminal | `{reason, send_proofs?, change_proofs?}` REQ(reason) | (`pay`) INTERNAL: the swap spent the input but a proof set could not be encoded to a `cashuB` string. The raw proofs are in `details.send_proofs`/`details.change_proofs` (and printed in `--human`) — they ARE your ecash; re-encode to recover. Must never happen — report it |
+| `token_encode_failed` | false | terminal | `{reason, send_proofs?, change_proofs?}` REQ(reason) | (`pay`/`mint`) INTERNAL: the ecash was issued (`mint`) or swapped (`pay`) but a proof set could not be encoded to a `cashuB` string. The raw proofs are in `details.send_proofs`/`details.change_proofs` (and printed in `--human`) — they ARE your ecash; re-encode to recover. On `mint` only `send_proofs` is present (the freshly-issued token). Must never happen — report it |
 | `address_mismatch` | false | terminal (security) | `{expected, got}` REQ | mint's address ≠ our reconstruction — do NOT fund; tell the human |
 | `network_mismatch` | false | needs_input | `{expected, got}` REQ | wrong-network `--dest`; supply a `expected`-network address |
 | `deposit_not_found` | false | needs_input | `{deposit_id}` REQ | no such deposit id — re-check `pop list` |
@@ -597,7 +602,10 @@ Notes:
   `challenge_parse_failed`, `token_unit_mismatch`, `token_mint_mismatch`,
   `insufficient_token_value`, `amount_exceeds_cap`, `swap_failed`,
   `exact_amount_assertion_failed`, `gateway_rejected_payment`,
-  `gateway_retry_failed`, `token_encode_failed`) all belong to `pop pay`. The
+  `gateway_retry_failed`, `token_encode_failed`) all belong to `pop pay` —
+  EXCEPT `token_encode_failed`, which `pop mint` ALSO emits if a freshly-issued
+  token cannot be encoded to its `cashuB` string (then only `send_proofs` is
+  present; the issued ecash is recoverable from them). The
   validation codes (`token_*`, `insufficient_token_value`, `amount_exceeds_cap`)
   and `swap_failed` are raised BEFORE / without a completed swap — when you see
   them, **no token was sent and the held pop is intact** (verify on `swap_failed`).

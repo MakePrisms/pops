@@ -46,7 +46,7 @@ use crate::http402::{
     decode_request_envelope, encode_payment_credentials, parse_payment_params, CashuPayload,
     EchoedChallenge, PaymentCredentials, PaymentParams,
 };
-use crate::mint_client::{self, proofs_value};
+use crate::mint_client::{self, proofs_to_json, proofs_value, token_to_string};
 use crate::SCHEMA_VERSION;
 
 /// Arguments for `pop pay`.
@@ -487,26 +487,6 @@ async fn build_exact_payment(
         send_token,
         change_token,
     })
-}
-
-/// Serializes a proof set to a JSON array string for recovery surfacing. Falls
-/// back to a diagnostic placeholder if serde ever fails (it does not for valid
-/// proofs) — this is a last-ditch value-recovery aid, never a hard error.
-fn proofs_to_json(proofs: &Proofs) -> String {
-    serde_json::to_string(proofs)
-        .unwrap_or_else(|e| format!("<proofs unserializable: {e}; {} proof(s)>", proofs.len()))
-}
-
-/// Stringifies a [`Token`] to its `cashuB…` form WITHOUT the `.to_string()`
-/// panic. `Token`'s `Display` (CBOR-encodes via ciborium) can return a
-/// `fmt::Error`; `ToString::to_string` PANICS on that, which on the post-swap
-/// path would vaporize already-spent proofs. Writing through [`std::fmt::Write`]
-/// surfaces the error as an `Err` instead, so the caller can recover the proofs.
-fn token_to_string(token: &Token) -> Result<String, String> {
-    use std::fmt::Write as _;
-    let mut s = String::new();
-    write!(&mut s, "{token}").map_err(|_| "cashuB encoding (CBOR) failed".to_string())?;
-    Ok(s)
 }
 
 /// Decodes the concrete [`Charge`] from parsed 402 params: unwrap the request
