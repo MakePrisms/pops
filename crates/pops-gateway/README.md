@@ -16,10 +16,15 @@ re-implement verification.
 
 ## Quickstart
 
-The image is **published and public** at
+The image is **published and public** (multi-arch: linux/amd64 + linux/arm64) at
 [`ghcr.io/makeprisms/pops-gateway`](https://github.com/MakePrisms/pops/pkgs/container/pops-gateway)
-(tag `latest`) — anonymously pullable, no login needed. Two prep steps, then one
-command:
+(tag `latest`) — anonymously pullable, no login needed:
+
+```sh
+docker pull ghcr.io/makeprisms/pops-gateway:latest
+```
+
+Two prep steps, then one command:
 
 1. Copy [`config.example.toml`](./config.example.toml) → `config.toml`.
 2. Edit the five required facts (`upstream_url`, `mint_url`, `proofs_sink`,

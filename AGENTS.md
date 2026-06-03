@@ -21,6 +21,10 @@ with the pop in `Authorization: Payment …`.
    Start at the front door:
    **[skills/gate-a-service.md](skills/gate-a-service.md)** — it routes the three
    integration modes (reverse-proxy, Rust/axum in-process, serverless/JS WASM).
+   Two of the three need **no build**: the reverse-proxy is a published public
+   image (`docker run ghcr.io/makeprisms/pops-gateway:latest`) and the WASM
+   bindings install prebuilt from GitHub
+   (`npm install github:MakePrisms/pops#wasm-pkg`).
 
 ## The wire format both sides share
 
@@ -32,8 +36,12 @@ CLI, you don't build this yourself — `pop pay` does.)
 
 ## Build / test
 
-The `pop` CLI is a Cargo workspace member: `cargo build -p pop` /
-`cargo test -p pop`. The toolchain is pinned in `rust-toolchain.toml` (Rust
-1.95). The other crates: `pops-core-verify` (the verifier), `pops-gateway` (the
-reverse-proxy), `pops-core-funder` / `pops-core-types` (support), plus `ts/`
-(WASM bindings + a Next.js serverless demo).
+This is a **public** repo — `git clone https://github.com/MakePrisms/pops` and
+build with no special access (`cdk-common` is a normal crates.io `0.16` dep). The
+`pop` CLI is a Cargo workspace member: `cargo build -p pop` / `cargo test -p
+pop`. The toolchain is pinned in `rust-toolchain.toml` (Rust 1.95). The other
+crates: `pops-core-verify` (the verifier), `pops-gateway` (the reverse-proxy),
+`pops-core-funder` (the in-repo funder crypto kernel, extracted from `cdk-pop`) /
+`pops-core-types` (support), plus `ts/` (WASM bindings + a Next.js serverless
+demo). The gateway image and the WASM bindings are also published (ghcr +
+`wasm-pkg` branch) if you want to consume rather than build.

@@ -6,10 +6,19 @@ verification **in JS** — a Vercel/Node serverless function performs the full
 `402 → verify + NUT-03 swap → 200` entirely in-process, over an injected
 `globalThis.fetch`.
 
-> **Not on npm.** `@makeprisms/pops-core-wasm` is a **local `file:` dependency**,
-> not a published package. To consume the bindings or run the demo you **build
-> the WASM from source first** (steps below). npm-publish is a later step — see
-> [Publishing](#publishing-later).
+> **Install (no build needed).** The prebuilt bindings are published to the
+> public `wasm-pkg` branch, so a Node project consumes them straight from GitHub —
+> no Rust/wasm toolchain, no npm-registry auth:
+>
+> ```sh
+> npm install github:MakePrisms/pops#wasm-pkg
+> ```
+>
+> Or pin the immutable dist tag for reproducible installs:
+> `npm install github:MakePrisms/pops#wasm-v0.1.0`. In `package.json` that is
+> `"@makeprisms/pops-core-wasm": "github:MakePrisms/pops#wasm-pkg"`. The package
+> name is `@makeprisms/pops-core-wasm`. Building from source (below) is only
+> needed if you are changing the Rust kernel.
 
 ---
 
@@ -24,7 +33,11 @@ verification **in JS** — a Vercel/Node serverless function performs the full
 
 ---
 
-## Build from source
+## Build from source (fallback — only if you change the kernel)
+
+Consuming the bindings does **not** require this — `npm install
+github:MakePrisms/pops#wasm-pkg` ships them prebuilt. Build from source only when
+you are modifying the Rust crate and want to regenerate the WASM locally.
 
 The bindings (`ts/pops-core-wasm/pkg/`) are **generated, not committed**. Build
 them with `ts/build-wasm.sh`, which runs:
@@ -42,8 +55,8 @@ native `cdk`/`axum` deps; `wasm` selects `wasm-bindgen` + the `getrandom/js` /
 `uuid/js` randomness backends) to `wasm32-unknown-unknown` and emits the
 nodejs/CommonJS glue + the `.wasm` binary into `ts/pops-core-wasm/pkg/`.
 
-Post-repoint (cdk-common is on crates.io 0.16), **the crate builds clean — no
-private-repo access or credential is needed**.
+`cdk-common` is a normal crates.io `0.16` dependency, so the crate builds clean
+from a plain public checkout.
 
 ### Nix (reproducible toolchain)
 
@@ -127,11 +140,23 @@ that read.
 
 ---
 
-## Publishing (later)
+## Publishing (how the prebuilt branch is produced)
 
-`@makeprisms/pops-core-wasm` is **not published to npm yet** — it is consumed
-purely as a local `file:` dependency, so external users must build it from
-source as above. npm-publish is a deliberate **later step**; until then,
-build-from-source is the only path to the bindings. (The
-`ghcr.io/makeprisms/pops-gateway` Docker image, by contrast, **is** published —
+External users do **not** build from source — they install the prebuilt bindings
+straight from GitHub:
+
+```sh
+npm install github:MakePrisms/pops#wasm-pkg          # tracks main
+npm install github:MakePrisms/pops#wasm-v0.1.0       # pinned, immutable
+```
+
+The `wasm-pkg` branch is an orphan dist branch produced by the
+[`publish-wasm`](../.github/workflows/publish-wasm.yml) workflow: it rebuilds the
+WASM in the pinned flake toolchain and force-pushes only the generated artifacts
+(plus a derived `package.json`/`README.md`). It refreshes on pushes to `main`
+that touch the bindings source, and `workflow_dispatch` can also cut an immutable
+dist tag (e.g. `wasm-v0.1.0`). The `vercel-demo` here consumes the bindings via a
+local `file:` dependency instead, because it lives in-repo and rebuilds them
+locally — but **your** project should use the git install above. (The
+`ghcr.io/makeprisms/pops-gateway` Docker image is likewise published and public —
 see `crates/pops-gateway/README.md`.)

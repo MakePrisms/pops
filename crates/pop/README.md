@@ -12,10 +12,13 @@ a CLTV-locked Bitcoin UTXO. This wallet is the funder's single tool to:
 - **`balance`** — an aggregated ledger summary (total locked, per-state
   counts/sats, mintable/recoverable now).
 
-It is a downstream consumer of [`cdk-pop`](https://github.com/MakePrisms/cdk)
-(it reuses `cdk-pop`'s `script::*` address-derivation functions and the proven
-quote/mint/recover crypto from `pop_test_tool`), built as its own standalone
-crate.
+The funder crypto (the `script::*` address-derivation + the quote/mint/recover
+construction) lives **in-repo** in the [`pops-core-funder`](../pops-core-funder)
+crate, which `pop` depends on by path — it replaces the former `cdk-pop` git
+dependency. That kernel was extracted verbatim from
+[`cdk-pop`](https://github.com/MakePrisms/cdk) so the address-derivation logic
+has a single source of truth across the (eventually unified) PoPs kernel; `cdk`
+consumes the same construction. `pop` itself is a standalone workspace crate.
 
 ## Two realities to understand up front
 
@@ -33,11 +36,12 @@ crate.
 
 ## Build
 
-Rust 1.95+. `cdk-common = "0.16"` is a normal crates.io dependency — no
-private fork or git CLI access required to build.
+Clone the public repo and build — `cdk-common = "0.16"` is a normal crates.io
+dependency, so a plain `cargo build` works from a fresh checkout (Rust 1.95+):
 
 ```
-cargo build --release
+git clone https://github.com/MakePrisms/pops
+cargo build --release          # from the repo root, or: cargo build -p pop
 ```
 
 The binary is `target/release/pop`. Install with

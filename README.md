@@ -43,9 +43,12 @@ result, and recovering both tokens on a post-swap failure).
 - **Gate any HTTP server** — put the **pops-gateway** reverse-proxy in front of
   your unmodified API. One `config.toml`, zero app-code changes; it challenges
   each request with `402`, verifies + redeems valid pops, and forwards upstream.
-  (Pull and run the published image — `docker run … ghcr.io/makeprisms/pops-gateway`;
-  or build it yourself per the gateway README. You can also embed the verifier
-  directly in a Rust/axum service or a serverless function via the WASM build.)
+  Run the published, public, multi-arch image (no build):
+  `docker run … ghcr.io/makeprisms/pops-gateway:latest` (building from source is
+  the fallback — see the gateway README). You can also embed the verifier
+  directly in a Rust/axum service, or in a serverless function via the WASM
+  bindings — install those prebuilt with
+  `npm install github:MakePrisms/pops#wasm-pkg` (no toolchain needed).
 - **Let your agent pay automatically** — `pop pay <URL> --token <cashuB>` does the
   `402` dance and pays a gated endpoint with an exact-amount token (swapping the
   held pop to the exact charge and returning the change), so an agent driving the
@@ -63,8 +66,12 @@ result, and recovering both tokens on a post-swap failure).
 - **`Payment` wire format (canonical):** [skills/payment-credential.md](skills/payment-credential.md)
 - **Serverless verify demo:** `ts/vercel-demo/app/api/secret/route.ts`
 
-Built on Cashu (ecash) + a CLTV-locked Bitcoin UTXO. The funder crypto lives
-in-repo in the `pops-core-funder` crate (historically extracted from
-[`MakePrisms/cdk`](https://github.com/MakePrisms/cdk)'s `cdk-pop`); `cdk` /
-`cdk-common` are normal crates.io `0.16` dependencies. **No cdk fork or private
-access is needed to build.**
+Built on Cashu (ecash) + a CLTV-locked Bitcoin UTXO. The funder crypto kernel
+lives **in-repo** in the `pops-core-funder` crate (extracted verbatim from
+[`MakePrisms/cdk`](https://github.com/MakePrisms/cdk)'s `cdk-pop`, which consumes
+the same construction); `cdk-common` is a normal crates.io `0.16` dependency. To
+build from source, clone the public repo and `cargo build`:
+
+```sh
+git clone https://github.com/MakePrisms/pops && cd pops && cargo build --release
+```
