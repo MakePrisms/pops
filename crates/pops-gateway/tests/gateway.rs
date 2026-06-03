@@ -166,6 +166,7 @@ fn validated_config(
             pops_gateway::config::DEFAULT_UPSTREAM_TIMEOUT_SECS,
         )),
         requirement: requirement(),
+        max_proofs: pops_gateway::config::DEFAULT_MAX_PROOFS,
         routes,
     }
 }

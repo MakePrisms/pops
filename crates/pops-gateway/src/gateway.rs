@@ -106,9 +106,12 @@ fn build_upstream_client(timeout: Option<std::time::Duration>) -> reqwest::Clien
 }
 
 impl AppState<CashuCredential<CdkMintClient>> {
-    /// Production wiring: the real cdk-backed credential.
+    /// Production wiring: the real cdk-backed credential, with the configured
+    /// per-token `max_proofs` DoS cap enforced pre-swap.
     pub fn production(config: ValidatedConfig, sink: ProofsSink) -> Self {
-        Self::new(config, CashuCredential::new(CdkMintClient::new()), sink)
+        let credential =
+            CashuCredential::with_max_proofs(CdkMintClient::new(), config.max_proofs);
+        Self::new(config, credential, sink)
     }
 }
 

@@ -214,14 +214,38 @@ pub struct PaymentParams {
     pub request: String,
 }
 
+/// Strip exactly ONE matched pair of surrounding double-quotes from an
+/// auth-param value, returning the inner string. Returns `None` (a reject) if
+/// the value is not a well-formed quoted-string:
+///   - not wrapped in quotes at all (`x`),
+///   - only one quote (`"x` / `x"`),
+///   - the bare empty/single `"`,
+///   - or carries an interior `"` (`"x"y"`, `""x""`) — our auth-param values
+///     are base64url-nopad / identifiers and never contain a quote, so any
+///     interior quote means an unbalanced/garbled value.
+fn strip_quoted(s: &str) -> Option<&str> {
+    let inner = s.strip_prefix('"')?.strip_suffix('"')?;
+    // `strip_suffix` on a lone `"` would leave `inner == ""` having consumed the
+    // SAME quote twice — guard by requiring the original to be ≥ 2 bytes.
+    if s.len() < 2 {
+        return None;
+    }
+    if inner.contains('"') {
+        return None;
+    }
+    Some(inner)
+}
+
 /// Parse a `WWW-Authenticate: Payment id="…", realm="…", method="…",
 /// intent="…", request="…"` header into its [`PaymentParams`].
 ///
 /// Tolerant of the `Payment ` scheme prefix being present or absent, of
 /// surrounding whitespace, and of extra/reordered params (only the five
-/// known fields are surfaced). Values are quoted-string auth-params. Returns
-/// [`AuthParseError::JsonParse`] with a descriptive message if a required
-/// field is missing or the value is unquoted/garbled.
+/// known fields are surfaced). Values MUST be RFC 7235 quoted-strings — each
+/// of the five known params is wrapped in exactly one matched `"` pair, and an
+/// unquoted or unbalanced value is rejected (not leniently stripped). Returns
+/// [`AuthParseError::JsonParse`] with a descriptive message if a required field
+/// is missing or a present value is unquoted/garbled.
 pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthParseError> {
     let trimmed = header_value.trim();
 
@@ -250,8 +274,24 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
             continue;
         };
         let key = key.trim();
-        // Strip surrounding double-quotes from the value.
-        let val = val_raw.trim().trim_matches('"');
+        // Only the five known params carry meaning; an unknown key's value is
+        // never inspected, so do not waste a strict-quote check on it.
+        if !matches!(key, "id" | "realm" | "method" | "intent" | "request") {
+            continue;
+        }
+        // RFC 7235 auth-params are quoted-strings: the value MUST be wrapped in
+        // exactly ONE matched pair of double-quotes. Reject an unquoted value
+        // or an unbalanced quote rather than silently `trim_matches('"')` (which
+        // would accept `id=x`, `id="x`, or `id=""x""` alike) — a lenient strip
+        // lets a malformed challenge through and can mis-bind the echoed value.
+        let val = match strip_quoted(val_raw.trim()) {
+            Some(v) => v,
+            None => {
+                return Err(AuthParseError::JsonParse(format!(
+                    "WWW-Authenticate Payment `{key}` value must be a double-quoted string"
+                )))
+            }
+        };
         match key {
             "id" => id = Some(val.to_string()),
             "realm" => realm = Some(val.to_string()),
@@ -592,5 +632,68 @@ mod tests {
             matches!(err, AuthParseError::JsonParse(_)),
             "expected JsonParse, got {err:?}"
         );
+    }
+
+    #[test]
+    fn parse_payment_params_rejects_unquoted_value() {
+        // `id=x` (no quotes at all) must be rejected, not leniently accepted as
+        // `x` the way `trim_matches('"')` would.
+        let header = r#"Payment id=x, realm="r", method="cashu", intent="charge", request="e""#;
+        let err = parse_payment_params(header).expect_err("unquoted id must fail");
+        assert!(
+            matches!(err, AuthParseError::JsonParse(_)),
+            "expected JsonParse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_payment_params_rejects_unbalanced_trailing_quote() {
+        // `id="x` (missing the closing quote) must be rejected.
+        let header = r#"Payment id="x, realm="r", method="cashu", intent="charge", request="e""#;
+        let err =
+            parse_payment_params(header).expect_err("missing-trailing-quote id must fail");
+        assert!(matches!(err, AuthParseError::JsonParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_payment_params_rejects_unbalanced_leading_quote() {
+        // `id=x"` (missing the opening quote) must be rejected.
+        let header = r#"Payment id=x", realm="r", method="cashu", intent="charge", request="e""#;
+        let err = parse_payment_params(header).expect_err("missing-leading-quote id must fail");
+        assert!(matches!(err, AuthParseError::JsonParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_payment_params_rejects_doubled_quotes() {
+        // `id=""x""` — an interior quote means a garbled/unbalanced value; the
+        // strict strip rejects it rather than peeling layers.
+        let header =
+            r#"Payment id=""x"", realm="r", method="cashu", intent="charge", request="e""#;
+        let err = parse_payment_params(header).expect_err("doubled-quote id must fail");
+        assert!(matches!(err, AuthParseError::JsonParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn parse_payment_params_accepts_empty_quoted_value() {
+        // A properly-quoted EMPTY string `realm=""` is a well-formed
+        // quoted-string and must be accepted (it strips to ``), distinct from an
+        // unquoted/unbalanced value.
+        let header =
+            r#"Payment id="x", realm="", method="cashu", intent="charge", request="e""#;
+        let params = parse_payment_params(header).expect("empty quoted realm is valid");
+        assert_eq!(params.realm, "");
+        assert_eq!(params.id, "x");
+    }
+
+    #[test]
+    fn strip_quoted_unit() {
+        assert_eq!(strip_quoted(r#""abc""#), Some("abc"));
+        assert_eq!(strip_quoted(r#""""#), Some("")); // empty quoted string
+        assert_eq!(strip_quoted("abc"), None); // unquoted
+        assert_eq!(strip_quoted(r#""abc"#), None); // missing trailing
+        assert_eq!(strip_quoted(r#"abc""#), None); // missing leading
+        assert_eq!(strip_quoted(r#"""#), None); // lone quote
+        assert_eq!(strip_quoted(""), None); // empty
+        assert_eq!(strip_quoted(r#""a"b""#), None); // interior quote
     }
 }

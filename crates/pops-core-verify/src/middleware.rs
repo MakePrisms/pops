@@ -15,10 +15,11 @@
 //!    Payment <base64url-nopad-JSON>` where the JSON has the shape
 //!    described in [`crate::envelope::PaymentCredentials`]. The
 //!    middleware extracts the `cashuB…` token from
-//!    `payload.cashu_token`, runs the full [`ChargeValidator`] pipeline,
-//!    and on success attaches a [`ValidatedCharge`][crate::cashu_credential::ValidatedCharge]
-//!    to `request.extensions_mut()` so the downstream handler can read it
-//!    via `Extension<ValidatedCharge>`.
+//!    `payload.cashu_token`, runs verify+redeem through the generic
+//!    [`Credential`] seam, and on success attaches the
+//!    [`Redeemed`][crate::credential::Redeemed] result to
+//!    `request.extensions_mut()` so the downstream handler can read it via
+//!    `Extension<Redeemed>`.
 //!
 //! ## Failure mapping
 //!
@@ -305,6 +306,9 @@ mod tests {
     enum SwapResponse {
         Echo,
         Unreachable,
+        /// A post-submit (indeterminate) swap transport failure — exercises the
+        /// `MintUnreachable { indeterminate: true }` → 503 mapping end-to-end.
+        UnreachableIndeterminate,
         RejectedSwap,
         /// Swap-output DLEQ gate rejected the mint's returned blind signatures
         /// (missing/invalid DLEQ). Drives the end-to-end money-safety path:
@@ -341,6 +345,9 @@ mod tests {
                 SwapResponse::Unreachable => Err(MintClientError::Unreachable(
                     "mock unreachable".into(),
                 )),
+                SwapResponse::UnreachableIndeterminate => Err(
+                    MintClientError::UnreachableIndeterminate("mock indeterminate".into()),
+                ),
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
@@ -368,6 +375,23 @@ mod tests {
         preimage[1] = index;
         let c = hash_to_curve(&preimage).expect("hash_to_curve");
         Proof::new(Amount::from(amount), keyset_id, Secret::generate(), c)
+    }
+
+    /// A NUT-10 P2PK-locked proof (bearer-only intent must reject it pre-swap).
+    fn p2pk_locked_proof(amount: u64, index: u8) -> Proof {
+        use cashu::nuts::nut10::SpendingConditions;
+        use cashu::nuts::SecretKey;
+
+        let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        let pk = SecretKey::generate().public_key();
+        let nut10_secret: Secret = SpendingConditions::new_p2pk(pk, None)
+            .try_into()
+            .expect("P2PK condition serializes to a NUT-10 secret");
+        let mut preimage = [0u8; 33];
+        preimage[0] = 3;
+        preimage[1] = index;
+        let c = hash_to_curve(&preimage).expect("hash_to_curve");
+        Proof::new(Amount::from(amount), keyset_id, nut10_secret, c)
     }
 
     fn make_token(mint: MintUrl, unit: CurrencyUnit, proofs: Proofs) -> Token {
@@ -407,6 +431,20 @@ mod tests {
     fn state_with(swap: SwapResponse) -> Arc<ChargeMiddlewareState<TestCredential>> {
         let mock = MockMintClient::new(swap);
         let credential = CashuCredential::new(mock);
+        Arc::new(ChargeMiddlewareState::new(
+            requirement(pop_unit(), vec![mint_a()], 10),
+            credential,
+        ))
+    }
+
+    /// As [`state_with`] but the credential enforces a per-token `max_proofs`
+    /// cap (the wired DoS guard).
+    fn state_with_max_proofs(
+        swap: SwapResponse,
+        max_proofs: usize,
+    ) -> Arc<ChargeMiddlewareState<TestCredential>> {
+        let mock = MockMintClient::new(swap);
+        let credential = CashuCredential::with_max_proofs(mock, max_proofs);
         Arc::new(ChargeMiddlewareState::new(
             requirement(pop_unit(), vec![mint_a()], 10),
             credential,
@@ -796,6 +834,80 @@ mod tests {
         assert!(
             body.to_ascii_lowercase().contains("dleq"),
             "expected a DLEQ failure message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn locked_proof_returns_402_and_does_not_serve_resource() {
+        // A NUT-10 P2PK-locked proof is a verification failure (LockedToken) →
+        // 402 + fresh re-challenge; the swap is never attempted and the gated
+        // handler never runs.
+        let token = make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app
+            .oneshot(request_with_token(&token.to_string()))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .is_some());
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>");
+        assert!(!body.starts_with("ok:"), "gated resource must NOT be served");
+        assert!(
+            body.contains("locked") || body.to_ascii_lowercase().contains("nut-10"),
+            "body should name the locked-token failure, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_proofs_returns_402_and_does_not_serve_resource() {
+        // A 3-proof token against a credential capped at 2 → TooManyProofs →
+        // 402; swap not attempted, handler not run.
+        let token = make_token(
+            mint_a(),
+            pop_unit(),
+            vec![make_proof(2, 0), make_proof(4, 1), make_proof(4, 2)],
+        );
+        let app = router_with(state_with_max_proofs(SwapResponse::Echo, 2));
+        let response = app
+            .oneshot(request_with_token(&token.to_string()))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>");
+        assert!(!body.starts_with("ok:"), "gated resource must NOT be served");
+        assert!(
+            body.contains("too many proofs"),
+            "body should name the too-many-proofs failure, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_swap_failure_returns_503() {
+        // An indeterminate swap-POST transport failure maps to MintUnreachable
+        // { indeterminate: true } → still 503 at the HTTP layer (the
+        // indeterminate flag never changes status, only the operator's
+        // checkstate obligation). Drive it through the real ceremony by stubbing
+        // the mock at MintHttp::post_swap level is overkill here; instead the
+        // validator-level mock returns the indeterminate error directly.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::UnreachableIndeterminate));
+        let response = app
+            .oneshot(request_with_token(&token.to_string()))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "indeterminate is still a 503 (the flag never changes status)"
         );
     }
 

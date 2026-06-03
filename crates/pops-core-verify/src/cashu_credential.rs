@@ -56,9 +56,11 @@ pub struct ValidatedCharge {
 /// Errors a [`ChargeValidator`] can return.
 ///
 /// Variants split into two groups: structural (`UnitMismatch`,
-/// `MintNotAllowed`, `AmountMismatch`, `TokenEmpty`) — raised before
-/// any network call — and mint-mediated (`MintRejectedSwap`,
-/// `SwapOutputDleqInvalid`, `MintUnreachable`) — raised after the swap attempt.
+/// `MintNotAllowed`, `AmountMismatch`, `TokenEmpty`, `LockedToken`,
+/// `MultiMintOrUnit`, `TooManyProofs`) — raised before any network call OR
+/// before the swap, so the swap is NEVER attempted on them — and mint-mediated
+/// (`MintRejectedSwap`, `SwapOutputDleqInvalid`, `MintUnreachable`,
+/// `MintUnreachableIndeterminate`) — raised at/after the swap attempt.
 ///
 /// These are the cashu-typed internal arms; the public
 /// [`CashuCredential`] maps them onto
@@ -72,6 +74,30 @@ pub enum ValidationError {
         expected: CurrencyUnit,
         /// Unit found on the presented token.
         got: CurrencyUnit,
+    },
+
+    /// One or more proofs carry a NUT-10 well-known spending-condition secret
+    /// (P2PK / HTLC) — a LOCKED token. This intent accepts plain-secret BEARER
+    /// proofs only; a locked proof is rejected BEFORE the swap (so the swap is
+    /// never attempted on it).
+    #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
+    LockedToken,
+
+    /// The presented proofs are not homogeneous: a proof's keyset/unit differs
+    /// from the others, or from the declared requirement unit. Caught BEFORE the
+    /// swap so the `proofs[0]` output-keyset assumption the ceremony makes is
+    /// sound.
+    #[error("token references multiple keysets/units (must be a single keyset)")]
+    MultiMintOrUnit,
+
+    /// The token carries more proofs than the validator's configured maximum — a
+    /// pre-swap DoS guard. Rejected BEFORE the swap.
+    #[error("too many proofs: {got} exceeds max {max}")]
+    TooManyProofs {
+        /// Proof count the token carried.
+        got: usize,
+        /// Configured per-token maximum.
+        max: usize,
     },
 
     /// Token was issued by a mint not in the requirement's allowlist.
@@ -112,9 +138,20 @@ pub enum ValidationError {
     #[error("swap-output DLEQ verification failed: {0}")]
     SwapOutputDleqInvalid(String),
 
-    /// Mint could not be reached (DNS, TCP, TLS, timeout, etc.).
+    /// Mint could not be reached on a DETERMINATE call (a pre-swap keysets/keys
+    /// GET, or a connect failure that never submitted the swap inputs). The
+    /// token was NOT consumed; a retry with the same token is authoritative.
     #[error("mint unreachable: {0}")]
     MintUnreachable(String),
+
+    /// The swap POST itself failed in transport (5xx / read-timeout AFTER the
+    /// inputs were submitted), so the outcome is INDETERMINATE — the mint may
+    /// already have consumed the inputs. Same 503+retry as
+    /// [`Self::MintUnreachable`], but maps to the contract's
+    /// `indeterminate: true` so the operator does not assume the token is still
+    /// good without a checkstate.
+    #[error("mint unreachable (indeterminate swap outcome): {0}")]
+    MintUnreachableIndeterminate(String),
 
     /// Token carried zero proofs — nothing to validate or swap.
     #[error("token contains no proofs")]
@@ -131,15 +168,35 @@ pub enum ValidationError {
 ///
 /// Construct once with a configured [`MintClient`] and reuse for many
 /// validations. The validator holds no per-request state.
+///
+/// `max_proofs` is an optional pre-swap DoS guard: a token carrying more than
+/// this many proofs is rejected with [`ValidationError::TooManyProofs`] BEFORE
+/// the swap. `None` (the default from [`Self::new`]) imposes no cap; the
+/// gateway wires a concrete bound from its config.
 #[derive(Debug)]
 pub struct ChargeValidator<M: MintClient> {
     mint_client: M,
+    max_proofs: Option<usize>,
 }
 
 impl<M: MintClient> ChargeValidator<M> {
-    /// Construct a validator backed by the supplied mint client.
+    /// Construct a validator backed by the supplied mint client, with NO
+    /// proof-count cap.
     pub fn new(mint_client: M) -> Self {
-        Self { mint_client }
+        Self {
+            mint_client,
+            max_proofs: None,
+        }
+    }
+
+    /// Construct a validator with a per-token `max_proofs` cap (pre-swap DoS
+    /// guard). A token carrying more than `max_proofs` proofs is rejected with
+    /// [`ValidationError::TooManyProofs`] before any swap.
+    pub fn with_max_proofs(mint_client: M, max_proofs: usize) -> Self {
+        Self {
+            mint_client,
+            max_proofs: Some(max_proofs),
+        }
     }
 
     /// Borrow the underlying mint client (used by the [`CashuCredential`]
@@ -193,6 +250,39 @@ impl<M: MintClient> ChargeValidator<M> {
             });
         }
 
+        // Structural: proof-count DoS guard + locked-proof rejection.
+        //
+        // Both read `token_secrets()` — the raw per-proof secrets, available
+        // across V3/V4 WITHOUT a keyset-resolution network call — so an
+        // oversized or locked token short-circuits BEFORE we even fetch keysets,
+        // let alone swap.
+        let secrets = token.token_secrets();
+
+        // Pre-swap DoS guard: reject a token carrying more than the configured
+        // maximum proof count. Cheapest possible rejection (no network, no
+        // decode), so a flood of huge tokens cannot make us do swap work.
+        if let Some(max) = self.max_proofs {
+            if secrets.len() > max {
+                return Err(ValidationError::TooManyProofs {
+                    got: secrets.len(),
+                    max,
+                });
+            }
+        }
+
+        // Locked-token rejection: this intent accepts plain-secret BEARER proofs
+        // only. A proof whose secret parses as a NUT-10 well-known secret (P2PK
+        // or HTLC) is LOCKED — reject BEFORE the swap so we never submit a
+        // spend-conditioned proof (which the bearer ceremony cannot satisfy).
+        // A plain 32-byte hex secret does NOT parse as NUT-10, so this only
+        // fires on genuinely locked proofs.
+        if secrets
+            .iter()
+            .any(|s| cashu::nuts::nut10::Secret::try_from(*s).is_ok())
+        {
+            return Err(ValidationError::LockedToken);
+        }
+
         // Network: fetch keysets for V1 short-id resolution.
         //
         // V0 keyset IDs round-trip locally; V1 short IDs are a 7-byte
@@ -207,6 +297,12 @@ impl<M: MintClient> ChargeValidator<M> {
             .await
             .map_err(|e| match e {
                 MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
+                // `keysets()` submits no swap inputs, so it cannot produce an
+                // indeterminate outcome; if it somehow surfaces here, treat it
+                // as the determinate pre-swap unreachable it is.
+                MintClientError::UnreachableIndeterminate(msg) => {
+                    ValidationError::MintUnreachable(msg)
+                }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
                 // `keysets()` does no DLEQ work, so this arm is unreachable in
                 // practice; map defensively to a swap-rejection rather than
@@ -227,6 +323,21 @@ impl<M: MintClient> ChargeValidator<M> {
         // Structural: non-empty.
         if proofs.is_empty() {
             return Err(ValidationError::TokenEmpty);
+        }
+
+        // Structural: per-proof keyset homogeneity.
+        //
+        // Every extracted proof must reference the SAME keyset id. A cashu
+        // keyset is mint-AND-unit-specific, so a single shared keyset id implies
+        // a single mint and a single unit — which is what makes the swap
+        // ceremony's `proofs[0].keyset_id` resolution (it derives the active
+        // OUTPUT keyset from the first input alone) sound for the WHOLE set. A
+        // token mixing keysets (hence possibly mixing mints/units) is rejected
+        // here, before the swap, as `MultiMintOrUnit`. (The declared-unit match
+        // was already enforced against `token.unit()` above.)
+        let first_keyset = proofs[0].keyset_id;
+        if proofs.iter().any(|p| p.keyset_id != first_keyset) {
+            return Err(ValidationError::MultiMintOrUnit);
         }
 
         // Structural: amount must match EXACTLY.
@@ -280,7 +391,15 @@ impl<M: MintClient> ChargeValidator<M> {
             .swap(&token_mint, proofs)
             .await
             .map_err(|e| match e {
+                // A determinate transport failure (pre-POST GET, or a connect
+                // failure that never submitted the inputs): the token is NOT
+                // consumed, a retry is authoritative.
                 MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
+                // The swap POST itself failed after submitting inputs: the
+                // outcome is indeterminate (the mint MAY have spent them).
+                MintClientError::UnreachableIndeterminate(msg) => {
+                    ValidationError::MintUnreachableIndeterminate(msg)
+                }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
                 // Money-safety: a missing/invalid swap-output DLEQ is its own
                 // outcome, NEVER collapsed into MintRejectedSwap (which would
@@ -361,14 +480,20 @@ fn token_hash_hex(presented: &str) -> String {
 /// [`ChargeError`] contract. `mint_url` supplies the transport context the
 /// cashu arm does not carry.
 ///
-/// The mapping follows the build-plan §1.3 "currently fully emitted" set:
+/// The mapping:
 /// - `MintUnreachable` → `MintUnreachable { indeterminate: false }`
-///   (pre-/at-swap transport failure; the durability-driven indeterminate
-///   case is not split in Step 1).
+///   (DETERMINATE transport failure — pre-swap GET or pre-submit connect fail;
+///   the token is not consumed, a retry is authoritative).
+/// - `MintUnreachableIndeterminate` → `MintUnreachable { indeterminate: true }`
+///   (the swap POST itself failed AFTER submitting inputs; same 503+retry but
+///   the operator must checkstate before assuming the token is still good).
 /// - `AmountMismatch`  → `AmountMismatch { expected_swap_fee: 0 }`
 ///   (fee forced 0 today; `required == amount`).
 /// - `UnitMismatch`    → `WrongUnit`.
 /// - `MintNotAllowed`  → `MintNotAllowed`.
+/// - `LockedToken`     → `LockedToken` (NUT-10 locked proof; 402, pre-swap).
+/// - `MultiMintOrUnit` → `MultiMintOrUnit` (mixed keysets/units; 402, pre-swap).
+/// - `TooManyProofs`   → `TooManyProofs` (over the DoS cap; 402, pre-swap).
 /// - `TokenEmpty` / `MalformedToken` → `MalformedCredential`.
 /// - `MintRejectedSwap`→ `DoubleSpend` (SAFE interim — both swap-rejections
 ///   collapse to DoubleSpend=402 until the NUT-03 error-body parse for
@@ -384,6 +509,14 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
             transport_detail: detail,
             indeterminate: false,
         },
+        ValidationError::MintUnreachableIndeterminate(detail) => ChargeError::MintUnreachable {
+            mint_url: mint_url.to_string(),
+            transport_detail: detail,
+            indeterminate: true,
+        },
+        ValidationError::LockedToken => ChargeError::LockedToken,
+        ValidationError::MultiMintOrUnit => ChargeError::MultiMintOrUnit,
+        ValidationError::TooManyProofs { got, max } => ChargeError::TooManyProofs { got, max },
         ValidationError::AmountMismatch { required, got } => ChargeError::AmountMismatch {
             required: u64::from(required),
             presented: u64::from(got),
@@ -433,10 +566,18 @@ pub struct CashuCredential<M: MintClient> {
 }
 
 impl<M: MintClient> CashuCredential<M> {
-    /// Construct from a configured [`MintClient`].
+    /// Construct from a configured [`MintClient`], with NO proof-count cap.
     pub fn new(mint_client: M) -> Self {
         Self {
             validator: ChargeValidator::new(mint_client),
+        }
+    }
+
+    /// Construct from a configured [`MintClient`] with a per-token `max_proofs`
+    /// cap (pre-swap DoS guard; see [`ChargeValidator::with_max_proofs`]).
+    pub fn with_max_proofs(mint_client: M, max_proofs: usize) -> Self {
+        Self {
+            validator: ChargeValidator::with_max_proofs(mint_client, max_proofs),
         }
     }
 
@@ -552,8 +693,13 @@ mod tests {
         /// Echo the incoming proofs back as the "new" proofs. Lets tests
         /// assert amount preservation without constructing fresh proofs.
         Echo,
-        /// Return [`MintClientError::Unreachable`] with a fixed message.
+        /// Return [`MintClientError::Unreachable`] with a fixed message (a
+        /// DETERMINATE transport failure).
         Unreachable,
+        /// Return [`MintClientError::UnreachableIndeterminate`] — the swap-POST
+        /// itself failed after submitting inputs (the ceremony's re-tag),
+        /// asserting the validator surfaces the indeterminate arm.
+        UnreachableIndeterminate,
         /// Return [`MintClientError::RejectedSwap`] with a fixed message.
         RejectedSwap,
         /// Return [`MintClientError::SwapOutputDleqInvalid`] — the swap-output
@@ -650,6 +796,9 @@ mod tests {
                 SwapResponse::Unreachable => {
                     Err(MintClientError::Unreachable("mock unreachable".into()))
                 }
+                SwapResponse::UnreachableIndeterminate => Err(
+                    MintClientError::UnreachableIndeterminate("mock indeterminate".into()),
+                ),
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
@@ -690,6 +839,26 @@ mod tests {
         preimage[1] = index;
         let c = hash_to_curve(&preimage).expect("hash_to_curve");
         Proof::new(Amount::from(amount), keyset_id, Secret::generate(), c)
+    }
+
+    /// A NUT-10 P2PK-LOCKED proof on the V0 test keyset: its secret is a
+    /// well-known `["P2PK", …]` NUT-10 secret rather than a plain 32-byte hex
+    /// string, so the locked-token gate must reject it.
+    fn p2pk_locked_proof(amount: u64, index: u8) -> Proof {
+        use cashu::nuts::nut10::SpendingConditions;
+        use cashu::nuts::SecretKey;
+
+        let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        let pk = SecretKey::generate().public_key();
+        // A bare P2PK lock (no extra conditions) — the minimal NUT-10 secret.
+        let nut10_secret: Secret = SpendingConditions::new_p2pk(pk, None)
+            .try_into()
+            .expect("P2PK spending-condition serializes to a NUT-10 secret");
+        let mut preimage = [0u8; 33];
+        preimage[0] = 3;
+        preimage[1] = index;
+        let c = hash_to_curve(&preimage).expect("hash_to_curve");
+        Proof::new(Amount::from(amount), keyset_id, nut10_secret, c)
     }
 
     /// Build a representative V1 keyset id (`01` prefix + 32 bytes).
@@ -1094,6 +1263,213 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn validate_rejects_locked_p2pk_proof_before_swap() {
+        // A NUT-10 P2PK-locked proof: this intent is bearer-only, so the
+        // validator must reject it as LockedToken BEFORE any network call —
+        // neither keysets() nor swap() may be contacted.
+        let token = make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("a NUT-10 locked proof must be rejected");
+        assert!(
+            matches!(err, ValidationError::LockedToken),
+            "expected LockedToken, got {err:?}"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            0,
+            "swap must NOT be called on a locked proof"
+        );
+        assert_eq!(
+            counters.keysets.load(Ordering::SeqCst),
+            0,
+            "keysets must NOT be called on a locked proof (pre-network gate)"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_locked_proof_mixed_with_plain() {
+        // Even ONE locked proof among otherwise-plain proofs rejects the whole
+        // token (the gate is `any`), and still before any swap.
+        let token = make_token(
+            mint_a(),
+            pop_unit(),
+            vec![make_proof(8, 0), p2pk_locked_proof(2, 1)],
+        );
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("one locked proof must reject the whole token");
+        assert!(
+            matches!(err, ValidationError::LockedToken),
+            "expected LockedToken, got {err:?}"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            0,
+            "swap must NOT be called when any proof is locked"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_mixed_keysets_before_swap() {
+        // Two proofs on DIFFERENT keyset ids (a V0 id and a V1 id) — a token
+        // mixing keysets (hence possibly mints/units) must be rejected as
+        // MultiMintOrUnit before the swap, so the `proofs[0]` output-keyset
+        // assumption stays sound. The V1 keyset is resolvable (we supply its
+        // KeySetInfo) so extraction itself succeeds and the homogeneity check is
+        // what fires.
+        let v0 = make_proof(4, 0); // keyset 009a1f293253e41e
+        let v1_id = v1_keyset_id();
+        let v1 = proof_with_keyset(6, 1, v1_id);
+        let token_str = make_token(mint_a(), pop_unit(), vec![v0, v1]).to_string();
+        let token = Token::from_str(&token_str).expect("mixed-keyset token round-trips");
+
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::new(
+            SwapResponse::Echo,
+            KeysetsResponse::Ok(vec![keyset_info(v1_id, pop_unit())]),
+        );
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("a token mixing keysets must be rejected");
+        assert!(
+            matches!(err, ValidationError::MultiMintOrUnit),
+            "expected MultiMintOrUnit, got {err:?}"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            0,
+            "swap must NOT be called on a mixed-keyset token"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_too_many_proofs_before_swap() {
+        // A validator with a max-proofs cap of 2; a 3-proof token must be
+        // rejected as TooManyProofs before any network call.
+        let token = make_token(
+            mint_a(),
+            pop_unit(),
+            vec![make_proof(2, 0), make_proof(4, 1), make_proof(4, 2)],
+        );
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
+        let validator = ChargeValidator::with_max_proofs(mock, 2);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("over the proof cap must be rejected");
+        match err {
+            ValidationError::TooManyProofs { got, max } => {
+                assert_eq!(got, 3, "reports the actual proof count");
+                assert_eq!(max, 2, "reports the configured cap");
+            }
+            other => panic!("expected TooManyProofs, got {other:?}"),
+        }
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            0,
+            "swap must NOT be called when over the proof cap"
+        );
+        assert_eq!(
+            counters.keysets.load(Ordering::SeqCst),
+            0,
+            "keysets must NOT be called when over the proof cap (pre-network gate)"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_at_proof_cap_boundary_passes() {
+        // Exactly at the cap (2 proofs, cap 2) is allowed — the guard is
+        // strictly `>`, not `>=`.
+        let token = make_token(
+            mint_a(),
+            pop_unit(),
+            vec![make_proof(8, 0), make_proof(2, 1)],
+        );
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
+        let validator = ChargeValidator::with_max_proofs(mock, 2);
+
+        validator
+            .validate(&token, &req)
+            .await
+            .expect("a token exactly at the cap must validate");
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            1,
+            "swap runs for a token at (not over) the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_swap_unreachable_is_determinate_at_validator() {
+        // A `MintClientError::Unreachable` from the swap seam is a DETERMINATE
+        // failure (the validator's mock stubs MintClient::swap directly, which
+        // is the pre-submit-equivalent contract here): it maps to the plain
+        // MintUnreachable arm, NOT the indeterminate one.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::Unreachable);
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("unreachable swap must fail");
+        assert!(
+            matches!(err, ValidationError::MintUnreachable(_)),
+            "a determinate Unreachable must map to MintUnreachable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_swap_unreachable_indeterminate_maps_through() {
+        // An indeterminate swap-POST failure (the ceremony re-tags a post-submit
+        // transport failure as UnreachableIndeterminate) must surface as the
+        // distinct MintUnreachableIndeterminate validator arm.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::UnreachableIndeterminate);
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("indeterminate swap outcome must fail");
+        assert!(
+            matches!(err, ValidationError::MintUnreachableIndeterminate(_)),
+            "expected MintUnreachableIndeterminate, got {err:?}"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            1,
+            "swap was attempted before the indeterminate outcome surfaced"
+        );
+    }
+
     // ---- Credential impl: ValidationError → ChargeError mapping + the
     //      RedeemedProofs shape (build-plan §1.3 new tests) -------------
 
@@ -1316,5 +1692,108 @@ mod tests {
             matches!(err, ChargeError::MalformedCredential(_)),
             "expected MalformedCredential, got {err:?}"
         );
+    }
+
+    /// A real cashuA/TokenV3 string (cashu-0.16.0 test vector). The contract is
+    /// cashuB/TokenV4 only, so `verify_and_redeem` must reject it as
+    /// MalformedCredential — and never touch the mint.
+    const VERIFY_CASHU_A_V3: &str = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91IHZlcnkgbXVjaC4ifQ==";
+
+    #[tokio::test]
+    async fn verify_and_redeem_rejects_cashu_a_as_malformed() {
+        // cashuA is out of contract → MalformedCredential (a 402 about a
+        // malformed credential), not a verification failure about value.
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::Echo);
+        let cred = CashuCredential::new(mock);
+
+        let err = cred
+            .verify_and_redeem(VERIFY_CASHU_A_V3, &req)
+            .await
+            .expect_err("cashuA must be rejected as malformed");
+        assert!(
+            matches!(err, ChargeError::MalformedCredential(_)),
+            "expected MalformedCredential for cashuA, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_maps_locked_token_to_locked_token() {
+        // A NUT-10 P2PK-locked proof maps to the contract's LockedToken (402,
+        // pre-swap) — the dead-but-defined variant is now wired.
+        let presented =
+            make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]).to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::Echo);
+        let cred = CashuCredential::new(mock);
+
+        let err = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect_err("a locked proof must map to LockedToken");
+        assert!(
+            matches!(err, ChargeError::LockedToken),
+            "expected LockedToken, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_maps_too_many_proofs_to_too_many_proofs() {
+        // The wired DoS cap: a CashuCredential built with_max_proofs rejects an
+        // over-cap token with the contract's TooManyProofs (carrying got/max).
+        let presented = make_token(
+            mint_a(),
+            pop_unit(),
+            vec![make_proof(2, 0), make_proof(4, 1), make_proof(4, 2)],
+        )
+        .to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::Echo);
+        let cred = CashuCredential::with_max_proofs(mock, 2);
+
+        let err = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect_err("an over-cap token must map to TooManyProofs");
+        match err {
+            ChargeError::TooManyProofs { got, max } => {
+                assert_eq!(got, 3);
+                assert_eq!(max, 2);
+            }
+            other => panic!("expected TooManyProofs, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_maps_indeterminate_unreachable_to_indeterminate_true() {
+        // An indeterminate swap-POST transport failure maps to the contract's
+        // MintUnreachable { indeterminate: true } (still 503 at the HTTP layer,
+        // but the operator must checkstate before assuming the token is good).
+        let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::UnreachableIndeterminate);
+        let cred = CashuCredential::new(mock);
+
+        let err = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect_err("indeterminate outcome must map to MintUnreachable");
+        match err {
+            ChargeError::MintUnreachable {
+                indeterminate,
+                mint_url,
+                ..
+            } => {
+                assert!(
+                    indeterminate,
+                    "a post-submit swap failure must set indeterminate: true"
+                );
+                assert!(!mint_url.is_empty(), "mint_url must be threaded through");
+            }
+            other => panic!("expected MintUnreachable {{ indeterminate: true }}, got {other:?}"),
+        }
     }
 }
