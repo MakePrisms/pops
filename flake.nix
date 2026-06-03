@@ -36,9 +36,9 @@
             }.${system};
             hashes = {
               "aarch64-darwin" = "sha256-Nr6tyGxcAsURoVLo/CxjhQZGiH6X3JSuBFU2QPg56Ag=";
-              "x86_64-darwin" = pkgs.lib.fakeHash;
-              "x86_64-linux" = pkgs.lib.fakeHash;
-              "aarch64-linux" = pkgs.lib.fakeHash;
+              "x86_64-darwin" = pkgs.lib.fakeHash; # TODO: fill on first x86_64-darwin use
+              "x86_64-linux" = "sha256-Eio/4uqcbj6JtQ5C3Ro0bkmfP2WlSq4LTq62WBOdHg4=";
+              "aarch64-linux" = "sha256-HAsvBHHnc/I2n+tk5MoY8rRfq/mZbVVCWzTBumrnyJ8=";
             };
           in
           pkgs.stdenvNoCC.mkDerivation {
