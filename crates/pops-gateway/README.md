@@ -16,31 +16,27 @@ re-implement verification.
 
 ## Quickstart
 
-Two prep steps, then build the image and run it. Copy the shipped example, edit
-the five required values, build, then run:
+The image is **published and public** at
+[`ghcr.io/makeprisms/pops-gateway`](https://github.com/MakePrisms/pops/pkgs/container/pops-gateway)
+(tag `latest`) — anonymously pullable, no login needed. Two prep steps, then one
+command:
 
 1. Copy [`config.example.toml`](./config.example.toml) → `config.toml`.
 2. Edit the five required facts (`upstream_url`, `mint_url`, `proofs_sink`,
    `[charge].unit`, `[charge].amount`) — they are commented inline in the file.
-3. Build the image from the workspace root (clean, no secret/private deps):
-
-```sh
-docker build -f crates/pops-gateway/Dockerfile -t pops-gateway .
-```
-
-4. Run, mounting the config and a **persistent** volume for the proofs sink:
+3. Run, mounting the config and a **persistent** volume for the proofs sink
+   (`proofs_sink = "/data/proofs.jsonl"` in the example lands in `./data`):
 
 ```sh
 docker run -p 8080:8080 \
   -v ./config.toml:/etc/pops-gateway/config.toml \
   -v ./data:/data \
-  pops-gateway
+  ghcr.io/makeprisms/pops-gateway:latest
 ```
 
-> **Container image publishing soon** — once the
-> `ghcr.io/makeprisms/pops-gateway` image is published you can skip the build
-> step and `docker run … ghcr.io/makeprisms/pops-gateway` directly. Until then,
-> build it yourself as above.
+Prefer to build from source? See [Building the image
+yourself](#building-the-image-yourself) — the run command is identical, just
+swap the local tag for the `ghcr.io/...` one.
 
 Point your clients at `http://localhost:8080`.
 

@@ -114,6 +114,7 @@ that read.
 
 `@makeprisms/pops-core-wasm` is **not published to npm yet** — it is consumed
 purely as a local `file:` dependency, so external users must build it from
-source as above. npm-publish is a deliberate **later step**, the same status as
-publishing the `ghcr.io/makeprisms/pops-gateway` Docker image. Until then,
-build-from-source is the only path to the bindings.
+source as above. npm-publish is a deliberate **later step**; until then,
+build-from-source is the only path to the bindings. (The
+`ghcr.io/makeprisms/pops-gateway` Docker image, by contrast, **is** published —
+see `crates/pops-gateway/README.md`.)

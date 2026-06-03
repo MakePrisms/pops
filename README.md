@@ -38,9 +38,9 @@ pay` command yet (it's a planned follow-up).
 - **Gate any HTTP server** — put the **pops-gateway** reverse-proxy in front of
   your unmodified API. One `config.toml`, zero app-code changes; it challenges
   each request with `402`, verifies + redeems valid pops, and forwards upstream.
-  (Container image publishing soon — until then, build it yourself per the
-  gateway README; you can also embed the verifier directly in a Rust/axum service
-  or a serverless function via the WASM build.)
+  (Pull and run the published image — `docker run … ghcr.io/makeprisms/pops-gateway`;
+  or build it yourself per the gateway README. You can also embed the verifier
+  directly in a Rust/axum service or a serverless function via the WASM build.)
 - **Let your agent pay automatically** — an agent driving the `pop` wallet (and a
   consumer that spends the minted token) can satisfy a gated endpoint's `402` on
   your behalf.
