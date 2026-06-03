@@ -16,22 +16,33 @@ re-implement verification.
 
 ## Quickstart
 
-One command, two prep steps. Copy the shipped example, edit the five required
-values, then run the published image:
+Two prep steps, then build the image and run it. Copy the shipped example, edit
+the five required values, build, then run:
 
 1. Copy [`config.example.toml`](./config.example.toml) → `config.toml`.
 2. Edit the five required facts (`upstream_url`, `mint_url`, `proofs_sink`,
    `[charge].unit`, `[charge].amount`) — they are commented inline in the file.
-3. Run, mounting the config and a **persistent** volume for the proofs sink:
+3. Build the image from the workspace root (clean, no secret/private deps):
+
+```sh
+docker build -f crates/pops-gateway/Dockerfile -t pops-gateway .
+```
+
+4. Run, mounting the config and a **persistent** volume for the proofs sink:
 
 ```sh
 docker run -p 8080:8080 \
   -v ./config.toml:/etc/pops-gateway/config.toml \
   -v ./data:/data \
-  ghcr.io/makeprisms/pops-gateway
+  pops-gateway
 ```
 
-Point your clients at `http://localhost:8080`. That's it — no local build.
+> **Container image publishing soon** — once the
+> `ghcr.io/makeprisms/pops-gateway` image is published you can skip the build
+> step and `docker run … ghcr.io/makeprisms/pops-gateway` directly. Until then,
+> build it yourself as above.
+
+Point your clients at `http://localhost:8080`.
 
 A bare request gets a `402` with the challenge; a request carrying a valid
 `Authorization: Payment <blob>` credential gates through to your upstream. See
