@@ -1,0 +1,111 @@
+name: publish-wasm
+
+# Rebuilds the WASM bindings in the pinned flake toolchain and force-publishes
+# them to the `wasm-pkg` orphan branch, so Node projects can depend on the
+# prebuilt package via an npm git dependency:
+#
+#   "@makeprisms/pops-core-wasm": "github:MakePrisms/pops#wasm-pkg"
+#
+# Runs on changes to the bindings source (keeps `wasm-pkg` fresh), or manually
+# via workflow_dispatch (which can also cut an immutable dist tag, e.g.
+# wasm-v0.1.1, for consumers who want a pinned ref).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional immutable dist tag to also create (e.g. wasm-v0.1.1)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "crates/pops-core-verify/**"
+      - "crates/pops-core-types/**"
+      - "ts/build-wasm.sh"
+      - "ts/pops-core-wasm/package.json"
+      - "flake.nix"
+      - "flake.lock"
+      - "Cargo.lock"
+
+concurrency:
+  group: publish-wasm
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build bindings in the pinned toolchain
+        run: nix develop --command bash ts/build-wasm.sh
+
+      - name: Assemble the dist tree
+        run: |
+          set -euo pipefail
+          rm -rf dist && mkdir -p dist/pkg
+          # Only the generated artifacts — NOT pkg/.gitignore (which is `*`).
+          cp ts/pops-core-wasm/pkg/pops_core_verify.js \
+             ts/pops-core-wasm/pkg/pops_core_verify.d.ts \
+             ts/pops-core-wasm/pkg/pops_core_verify_bg.wasm \
+             ts/pops-core-wasm/pkg/pops_core_verify_bg.wasm.d.ts \
+             ts/pops-core-wasm/pkg/package.json \
+             dist/pkg/
+          # Derive the published manifest + README from the source manifest
+          # (single source of the version): drop `private` + the build script,
+          # add repo metadata. Done in node to avoid heredoc indentation issues.
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("ts/pops-core-wasm/package.json", "utf8"));
+            delete p.private; delete p.scripts;
+            p.description = "Prebuilt wasm-pack (nodejs target) build of pops-core-verify --features wasm. Generated dist branch.";
+            p.repository = { type: "git", url: "git+https://github.com/MakePrisms/pops.git" };
+            p.homepage = "https://github.com/MakePrisms/pops/tree/wasm-pkg";
+            fs.writeFileSync("dist/package.json", JSON.stringify(p, null, 2) + "\n");
+            const readme = [
+              "# @makeprisms/pops-core-wasm — prebuilt (dist branch)",
+              "",
+              "Generated dist branch (not source): the prebuilt wasm-pack (nodejs target)",
+              "build of pops-core-verify --features wasm, so a Node project can consume the",
+              "bindings without a Rust/wasm toolchain. Overwritten by the publish-wasm",
+              "workflow — do not edit. Source is on main.",
+              "",
+              "## Use it",
+              "",
+              "```json",
+              "{ \"dependencies\": { \"@makeprisms/pops-core-wasm\": \"github:MakePrisms/pops#wasm-pkg\" } }",
+              "```",
+              "",
+              "Pin an immutable dist tag (e.g. #wasm-v0.1.0) for reproducible installs.",
+              "",
+            ].join("\n");
+            fs.writeFileSync("dist/README.md", readme);
+          '
+
+      - name: Force-publish the wasm-pkg branch (and optional tag)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIST_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          cd dist
+          git init -q -b wasm-pkg
+          git config user.name  "pops-ci[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Prebuilt @makeprisms/pops-core-wasm (CI build of ${GITHUB_SHA})"
+          REMOTE="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push -q --force "$REMOTE" wasm-pkg
+          if [ -n "${DIST_TAG}" ]; then
+            git tag -a "${DIST_TAG}" -m "Prebuilt @makeprisms/pops-core-wasm (${DIST_TAG})"
+            git push -q "$REMOTE" "${DIST_TAG}"
+          fi

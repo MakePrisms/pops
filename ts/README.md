@@ -45,6 +45,23 @@ nodejs/CommonJS glue + the `.wasm` binary into `ts/pops-core-wasm/pkg/`.
 Post-repoint (cdk-common is on crates.io 0.16), **the crate builds clean — no
 private-repo access or credential is needed**.
 
+### Nix (reproducible toolchain)
+
+The repo ships a `flake.nix` dev shell that pins the entire toolchain below
+(including the exact `wasm-bindgen` 0.2.122 that must match `Cargo.lock` — nixpkgs
+ships 0.2.121, which aborts `wasm-pack` on a schema mismatch). From the repo root:
+
+```sh
+nix develop          # rust 1.95 + wasm32, wasm-pack, wasm-bindgen 0.2.122, node, llvm
+bash ts/build-wasm.sh
+```
+
+The shell wires `CC_wasm32_unknown_unknown` / `AR_wasm32_unknown_unknown` to an
+unwrapped clang + `llvm-ar` (the wrapped clang's darwin flags break a wasm32
+target) and includes `binaryen`, so `wasm-opt` actually runs and the emitted
+`.wasm` is optimized. If you prefer to assemble the toolchain by hand, the exact
+requirements follow.
+
 ### Toolchain
 
 `build-wasm.sh` needs the following on `PATH` (it is intentionally hands-off
