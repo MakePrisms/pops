@@ -14,8 +14,8 @@ use cdk_common::amount::SplitTarget;
 use cdk_common::dhke::construct_proofs;
 use cdk_common::mint_url::MintUrl;
 use cdk_common::nuts::{
-    BlindSignature, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintRequest, MintResponse,
-    PreMintSecrets, Token,
+    BlindSignature, BlindedMessage, CurrencyUnit, Id, KeySet, KeySetInfo, Keys, MintRequest,
+    MintResponse, PreMintSecrets, Proof, Proofs, SwapRequest, SwapResponse, Token,
 };
 use cdk_common::{Amount as CdkAmount, SecretKey as CdkSecretKey};
 
@@ -244,16 +244,19 @@ pub async fn poll_until_paid(
     }
 }
 
-/// Fetches `/v1/keysets` and returns the single active keyset id for `unit`.
+/// Fetches `/v1/keysets` and returns the full list of [`KeySetInfo`].
+///
+/// The list is needed to resolve a token's SHORT (v2, 16-hex) keyset ids to
+/// their FULL (66-hex) ids ([`Token::proofs`] requires it), and to read the
+/// active keyset's `input_fee_ppk` for the swap fee math.
 ///
 /// # Errors
 ///
-/// Errors if zero or multiple active keysets match the unit.
-pub async fn active_keyset_for_unit(
+/// Propagates HTTP and parse errors.
+pub async fn fetch_keyset_infos(
     http: &reqwest::Client,
     base: &str,
-    unit: &CurrencyUnit,
-) -> Result<Id, Box<dyn std::error::Error>> {
+) -> Result<Vec<KeySetInfo>, Box<dyn std::error::Error>> {
     let base = base.trim_end_matches('/');
     let url = format!("{base}/v1/keysets");
     let resp = http.get(&url).send().await.map_err(|e| {
@@ -273,18 +276,42 @@ pub async fn active_keyset_for_unit(
     }
     let list: KeysetListResponse = serde_json::from_str(&text)
         .map_err(|e| format!("/v1/keysets parse failed: {e}\nbody: {text}"))?;
+    Ok(list.keysets)
+}
 
-    let mut matches = list
-        .keysets
-        .into_iter()
-        .filter(|k| k.active && &k.unit == unit);
+/// Selects the single ACTIVE [`KeySetInfo`] for `unit` from a fetched list.
+///
+/// # Errors
+///
+/// Errors if zero or multiple active keysets match the unit.
+pub fn select_active_keyset<'a>(
+    keysets: &'a [KeySetInfo],
+    unit: &CurrencyUnit,
+) -> Result<&'a KeySetInfo, Box<dyn std::error::Error>> {
+    let mut matches = keysets.iter().filter(|k| k.active && &k.unit == unit);
     let chosen = matches
         .next()
         .ok_or_else(|| format!("no active keyset for unit `{unit}`"))?;
     if matches.next().is_some() {
-        return Err(format!("multiple active keysets for unit `{unit}`; cannot disambiguate").into());
+        return Err(
+            format!("multiple active keysets for unit `{unit}`; cannot disambiguate").into(),
+        );
     }
-    Ok(chosen.id)
+    Ok(chosen)
+}
+
+/// Fetches `/v1/keysets` and returns the single active keyset id for `unit`.
+///
+/// # Errors
+///
+/// Errors if zero or multiple active keysets match the unit.
+pub async fn active_keyset_for_unit(
+    http: &reqwest::Client,
+    base: &str,
+    unit: &CurrencyUnit,
+) -> Result<Id, Box<dyn std::error::Error>> {
+    let keysets = fetch_keyset_infos(http, base).await?;
+    Ok(select_active_keyset(&keysets, unit)?.id)
 }
 
 /// Fetches `/v1/keys/<keyset_id>` and returns its amount -> pubkey map.
@@ -326,7 +353,12 @@ pub async fn fetch_keys(
 
 /// Best-effort DLEQ check on returned blind signatures (missing proof
 /// tolerated, present-but-invalid aborts). Mirrors `pop_test_tool`.
-fn verify_blind_signatures(
+///
+/// Shared by the issuance ([`mint_token`]) and swap ([`swap`]) paths: a
+/// present-but-invalid DLEQ proof means the mint signed with a key other than
+/// the one it advertised, so the unblinded ecash would be worthless — abort
+/// before treating the signatures as money.
+pub(crate) fn verify_blind_signatures(
     signatures: &[BlindSignature],
     premint_secrets: &PreMintSecrets,
     keys: &Keys,
@@ -392,12 +424,17 @@ pub async fn mint_token(
 
     // POST /v1/mint/pop.
     let mint_url = format!("{base}/v1/mint/pop");
-    let resp = http.post(&mint_url).json(&request).send().await.map_err(|e| {
-        eprintln!("POST {mint_url} failed: {e}");
-        PopError::MintUnreachable {
-            mint_url: base.to_string(),
-        }
-    })?;
+    let resp = http
+        .post(&mint_url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| {
+            eprintln!("POST {mint_url} failed: {e}");
+            PopError::MintUnreachable {
+                mint_url: base.to_string(),
+            }
+        })?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -424,6 +461,97 @@ pub async fn mint_token(
         .map_err(|e| format!("mint url `{base}` is not a valid MintUrl: {e}"))?;
     let token = Token::new(mint_url_typed, proofs, None, unit.clone());
     Ok(token)
+}
+
+/// Performs a NUT-03 swap (`POST /v1/swap`) and unblinds the result into one
+/// proof set PER output bucket, preserving bucket order.
+///
+/// `inputs` are the proofs being spent; `output_buckets` is an ordered list of
+/// [`PreMintSecrets`] whose concatenated blinded messages form the swap
+/// `outputs` (e.g. `[send_premint, change_premint]`). The mint returns blind
+/// signatures in the SAME order as the outputs, so this splits them back per
+/// bucket by length, DLEQ-verifies each bucket against its own secrets, and
+/// unblinds each bucket SEPARATELY with its own `rs`/`secrets` — yielding one
+/// `Proofs` per bucket (e.g. `[send_proofs, change_proofs]`).
+///
+/// Swap is UNSIGNED NUT-03: there is no NUT-20 funder signature on a swap
+/// (that is a NUT-04 *mint*/issuance concept), so this takes no signer and the
+/// `pay` flow never loads the wallet seed.
+///
+/// This is a pure wire+crypto primitive — it does NOT enforce the exact-amount
+/// money invariant. The caller ([`crate::commands::pay`]) constructs the buckets
+/// and asserts the send-set sum before treating the output as spendable.
+///
+/// # Errors
+///
+/// - [`PopError::MintUnreachable`] / [`PopError::MintError`] on the swap HTTP.
+/// - an error if the mint returns the wrong number of signatures, a DLEQ proof
+///   fails, or unblinding fails.
+pub async fn swap(
+    http: &reqwest::Client,
+    base: &str,
+    inputs: Proofs,
+    output_buckets: &[PreMintSecrets],
+    keys: &Keys,
+) -> Result<Vec<Proofs>, Box<dyn std::error::Error>> {
+    let base = base.trim_end_matches('/');
+
+    // Concatenate every bucket's blinded messages, in bucket order, into the
+    // single `outputs` vector the mint signs.
+    let outputs: Vec<BlindedMessage> = output_buckets
+        .iter()
+        .flat_map(|b| b.blinded_messages())
+        .collect();
+    let expected_sigs = outputs.len();
+
+    let request = SwapRequest::new(inputs, outputs);
+
+    let url = format!("{base}/v1/swap");
+    let resp = http.post(&url).json(&request).send().await.map_err(|e| {
+        eprintln!("POST {url} failed: {e}");
+        PopError::MintUnreachable {
+            mint_url: base.to_string(),
+        }
+    })?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(PopError::MintError {
+            status: Some(status.as_u16()),
+            mint_message: text,
+        }
+        .into());
+    }
+    let swap_response: SwapResponse = serde_json::from_str(&text)
+        .map_err(|e| format!("swap response parse failed: {e}\nbody: {text}"))?;
+
+    if swap_response.signatures.len() != expected_sigs {
+        return Err(format!(
+            "swap returned {} signatures, expected {expected_sigs} (one per blinded output)",
+            swap_response.signatures.len()
+        )
+        .into());
+    }
+
+    // Split the signatures back into per-bucket slices (same order as outputs),
+    // DLEQ-verify each against its own premint, and unblind each separately.
+    let mut sigs = swap_response.signatures.into_iter();
+    let mut out: Vec<Proofs> = Vec::with_capacity(output_buckets.len());
+    for bucket in output_buckets {
+        let n = bucket.blinded_messages().len();
+        let bucket_sigs: Vec<BlindSignature> = (&mut sigs).take(n).collect();
+        verify_blind_signatures(&bucket_sigs, bucket, keys)?;
+        let proofs = construct_proofs(bucket_sigs, bucket.rs(), bucket.secrets(), keys)
+            .map_err(|e| format!("swap unblind (construct_proofs) failed: {e}"))?;
+        out.push(proofs);
+    }
+    Ok(out)
+}
+
+/// Sums the sat value of a proof set (saturating — proof amounts are u64 sats
+/// and a PoP token's total is far below `u64::MAX`).
+pub fn proofs_value(proofs: &[Proof]) -> u64 {
+    proofs.iter().map(|p| p.amount.to_u64()).sum()
 }
 
 /// Parse a 64-hex funder secret into a `cdk_common` secret key (NUT-20 key).

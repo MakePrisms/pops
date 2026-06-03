@@ -198,6 +198,88 @@ pub enum PopError {
         /// The service's reason, if any.
         reason: Option<String>,
     },
+
+    // ---- pay path (the `pop pay` HTTP-402 client dance) ----
+    /// The resource returned HTTP 402 but carried no parseable
+    /// `WWW-Authenticate: Payment …` challenge (or its params were malformed),
+    /// so there is nothing to satisfy. (`no_payment_challenge`)
+    NoPaymentChallenge {
+        /// The URL that was probed.
+        url: String,
+        /// Why the challenge could not be parsed (header absent / malformed).
+        reason: String,
+    },
+    /// A 402 `Payment` challenge was present but could not be decoded into a
+    /// concrete charge (bad request envelope or `creqA` payment request, or a
+    /// charge missing its required amount). (`challenge_parse_failed`)
+    ChallengeParseFailed {
+        /// What specifically failed to decode.
+        reason: String,
+    },
+    /// The held token's unit does not match the unit the charge requires; paying
+    /// it would be wrong-currency. Send nothing. (`token_unit_mismatch`)
+    TokenUnitMismatch {
+        /// The unit the charge requires.
+        required: String,
+        /// The unit the held token carries.
+        got: String,
+    },
+    /// The held token is from a mint the charge does not accept. Send nothing.
+    /// (`token_mint_mismatch`)
+    TokenMintMismatch {
+        /// The mint URL the held token is from.
+        token_mint: String,
+        /// The set of mint URLs the charge accepts (empty ⟹ the charge named no
+        /// mints, which this wallet treats as "must be explicit" and rejects).
+        accepted_mints: Vec<String>,
+    },
+    /// The held token is worth less than the charge requires. Send nothing.
+    /// (`insufficient_token_value`)
+    InsufficientTokenValue {
+        /// Sats the held token is worth.
+        have: u64,
+        /// Sats the charge requires.
+        need: u64,
+    },
+    /// The charge's amount exceeds the caller's `--max-amount` safety cap; refuse
+    /// so a malicious 402 cannot trick an agent into overspending. Send nothing.
+    /// (`amount_exceeds_cap`)
+    AmountExceedsCap {
+        /// Sats the charge required.
+        amount: u64,
+        /// The `--max-amount` cap, in sats.
+        cap: u64,
+    },
+    /// The NUT-03 swap-to-exact failed (mint rejected it, or the unblind/DLEQ
+    /// check failed). The held token may be partially spent — surface the change
+    /// if any was produced. (`swap_failed`)
+    SwapFailed {
+        /// The swap failure detail.
+        reason: String,
+    },
+    /// INTERNAL money-safety gate: the constructed send set did not sum to
+    /// EXACTLY the charge amount. This must never fire in practice — it means a
+    /// split/selection bug, and the payment is aborted before anything is sent.
+    /// (`exact_amount_assertion_failed`)
+    ExactAmountAssertionFailed {
+        /// The amount the send set was required to equal.
+        required: u64,
+        /// What the send set actually summed to.
+        got: u64,
+    },
+    /// The gateway rejected the presented payment on retry (it answered 402
+    /// again). Carries the gateway's response body and the change token (if the
+    /// swap already produced one) so no value is silently lost.
+    /// (`gateway_rejected_payment`)
+    GatewayRejectedPayment {
+        /// The HTTP status the retry returned (typically 402).
+        status: u16,
+        /// The gateway's response body verbatim (intelligible rejection reason).
+        body: String,
+        /// The change `cashuB` token, if a swap produced one before the retry —
+        /// it is spendable and must not be lost.
+        change_token: Option<String>,
+    },
 }
 
 impl PopError {
@@ -224,6 +306,15 @@ impl PopError {
             PopError::Internal { .. } => "internal_error",
             PopError::Not402 { .. } => "not_402",
             PopError::PaymentRejected { .. } => "payment_rejected",
+            PopError::NoPaymentChallenge { .. } => "no_payment_challenge",
+            PopError::ChallengeParseFailed { .. } => "challenge_parse_failed",
+            PopError::TokenUnitMismatch { .. } => "token_unit_mismatch",
+            PopError::TokenMintMismatch { .. } => "token_mint_mismatch",
+            PopError::InsufficientTokenValue { .. } => "insufficient_token_value",
+            PopError::AmountExceedsCap { .. } => "amount_exceeds_cap",
+            PopError::SwapFailed { .. } => "swap_failed",
+            PopError::ExactAmountAssertionFailed { .. } => "exact_amount_assertion_failed",
+            PopError::GatewayRejectedPayment { .. } => "gateway_rejected_payment",
         }
     }
 
@@ -377,6 +468,54 @@ impl PopError {
                     Some(o)
                 }
             }
+            PopError::NoPaymentChallenge { url, reason } => Some(json!({
+                "url": url,
+                "reason": reason,
+            })),
+            PopError::ChallengeParseFailed { reason } => Some(json!({
+                "reason": reason,
+            })),
+            PopError::TokenUnitMismatch { required, got } => Some(json!({
+                "required": required,
+                "got": got,
+            })),
+            PopError::TokenMintMismatch {
+                token_mint,
+                accepted_mints,
+            } => Some(json!({
+                "token_mint": token_mint,
+                "accepted_mints": accepted_mints,
+            })),
+            PopError::InsufficientTokenValue { have, need } => Some(json!({
+                "have": have,
+                "need": need,
+            })),
+            PopError::AmountExceedsCap { amount, cap } => Some(json!({
+                "amount": amount,
+                "cap": cap,
+            })),
+            PopError::SwapFailed { reason } => Some(json!({
+                "reason": reason,
+            })),
+            PopError::ExactAmountAssertionFailed { required, got } => Some(json!({
+                "required": required,
+                "got": got,
+            })),
+            PopError::GatewayRejectedPayment {
+                status,
+                body,
+                change_token,
+            } => {
+                let mut o = json!({
+                    "status": status,
+                    "body": body,
+                });
+                // Surface the change token so a partially-spent pop is never lost.
+                if let Some(ct) = change_token {
+                    o["change_token"] = json!(ct);
+                }
+                Some(o)
+            }
             // Message-only codes carry no details object.
             PopError::WalletNotInitialized { .. }
             | PopError::WalletExists { .. }
@@ -473,6 +612,58 @@ impl PopError {
                 Some(r) => format!("payment rejected: {r}"),
                 None => "payment rejected by the service".to_string(),
             },
+            PopError::NoPaymentChallenge { url, reason } => format!(
+                "{url} returned 402 but carried no usable `WWW-Authenticate: Payment` challenge: {reason}"
+            ),
+            PopError::ChallengeParseFailed { reason } => {
+                format!("could not decode the 402 payment challenge into a charge: {reason}")
+            }
+            PopError::TokenUnitMismatch { required, got } => format!(
+                "the held token's unit `{got}` does not match the charge's required unit `{required}`; \
+                 not paying (wrong currency). Present a token in `{required}`."
+            ),
+            PopError::TokenMintMismatch {
+                token_mint,
+                accepted_mints,
+            } => {
+                if accepted_mints.is_empty() {
+                    format!(
+                        "the charge named no accepted mints, so this wallet cannot confirm the held \
+                         token's mint ({token_mint}) is acceptable; not paying"
+                    )
+                } else {
+                    format!(
+                        "the held token is from {token_mint}, which is not in the charge's accepted \
+                         mints {accepted_mints:?}; not paying"
+                    )
+                }
+            }
+            PopError::InsufficientTokenValue { have, need } => format!(
+                "the held token is worth {have} sat but the charge requires {need} sat; \
+                 present a token worth at least the charge"
+            ),
+            PopError::AmountExceedsCap { amount, cap } => format!(
+                "the charge requires {amount} sat, which exceeds the --max-amount cap of {cap} sat; \
+                 refusing to pay (raise --max-amount only if you trust this charge)"
+            ),
+            PopError::SwapFailed { reason } => {
+                format!("the swap-to-exact-amount failed: {reason}")
+            }
+            PopError::ExactAmountAssertionFailed { required, got } => format!(
+                "INTERNAL money-safety abort: the send set summed to {got} sat, not the required \
+                 {required} sat; nothing was sent (this indicates a split bug — please report it)"
+            ),
+            PopError::GatewayRejectedPayment {
+                status,
+                body,
+                change_token,
+            } => {
+                let ct = match change_token {
+                    Some(_) => " (a change token was produced and is in `details.change_token` — keep it)",
+                    None => "",
+                };
+                format!("the gateway rejected the payment (HTTP {status}): {body}{ct}")
+            }
         }
     }
 
@@ -550,7 +741,8 @@ mod tests {
             let code = e.code();
             assert!(!code.is_empty());
             assert!(
-                code.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                code.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
                 "code `{code}` is not lower snake_case"
             );
             assert!(!e.message().is_empty(), "empty message for {code}");
@@ -636,7 +828,10 @@ mod tests {
         );
         // Required details still present.
         assert_eq!(env["error"]["details"]["address"], json!("tb1pexample"));
-        assert_eq!(env["error"]["details"]["expires_at"], json!(1_788_000_000u64));
+        assert_eq!(
+            env["error"]["details"]["expires_at"],
+            json!(1_788_000_000u64)
+        );
 
         // Mainnet-style: no faucet_hint key.
         let e = PopError::FundingPending {
@@ -710,10 +905,18 @@ mod tests {
                 value_sats: 1,
                 fee_sats: 2,
             },
-            PopError::WalletNotInitialized { message: "m".into() },
-            PopError::WalletExists { message: "m".into() },
-            PopError::InvalidMnemonic { message: "m".into() },
-            PopError::InvalidInput { message: "m".into() },
+            PopError::WalletNotInitialized {
+                message: "m".into(),
+            },
+            PopError::WalletExists {
+                message: "m".into(),
+            },
+            PopError::InvalidMnemonic {
+                message: "m".into(),
+            },
+            PopError::InvalidInput {
+                message: "m".into(),
+            },
             PopError::MintUnreachable {
                 mint_url: "u".into(),
             },
@@ -744,7 +947,9 @@ mod tests {
                 expected: "e".into(),
                 got: "g".into(),
             },
-            PopError::Internal { message: "m".into() },
+            PopError::Internal {
+                message: "m".into(),
+            },
             PopError::Not402 {
                 url: "u".into(),
                 status_got: 200,
@@ -753,6 +958,38 @@ mod tests {
                 required_amount: Some(1),
                 unit: Some("pop_1".into()),
                 reason: None,
+            },
+            PopError::NoPaymentChallenge {
+                url: "https://x".into(),
+                reason: "no header".into(),
+            },
+            PopError::ChallengeParseFailed {
+                reason: "bad creqA".into(),
+            },
+            PopError::TokenUnitMismatch {
+                required: "pop_2".into(),
+                got: "pop_1".into(),
+            },
+            PopError::TokenMintMismatch {
+                token_mint: "https://m1".into(),
+                accepted_mints: vec!["https://m2".into()],
+            },
+            PopError::InsufficientTokenValue { have: 1, need: 2 },
+            PopError::AmountExceedsCap {
+                amount: 100,
+                cap: 50,
+            },
+            PopError::SwapFailed {
+                reason: "rejected".into(),
+            },
+            PopError::ExactAmountAssertionFailed {
+                required: 10,
+                got: 9,
+            },
+            PopError::GatewayRejectedPayment {
+                status: 402,
+                body: "still owe".into(),
+                change_token: Some("cashuBchange".into()),
             },
         ]
     }

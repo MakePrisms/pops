@@ -18,6 +18,7 @@ mod config;
 mod db;
 mod derive;
 mod error;
+mod http402;
 mod mint_client;
 mod network;
 mod recovery;
@@ -83,6 +84,8 @@ enum Cmd {
     Status(commands::list::StatusArgs),
     /// Summarize the ledger: total locked, per-state counts/sats, mintable/recoverable now.
     Balance(commands::balance::BalanceArgs),
+    /// Pay an HTTP-402-gated resource by presenting a cashu token worth EXACTLY the charge.
+    Pay(commands::pay::PayArgs),
 }
 
 #[tokio::main]
@@ -148,5 +151,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::List(args) => commands::list::run_list(args, &wallet_dir, json),
         Cmd::Status(args) => commands::list::run_status(args, &wallet_dir, json).await,
         Cmd::Balance(args) => commands::balance::run(args, &wallet_dir, json).await,
+        Cmd::Pay(args) => commands::pay::run(args, &wallet_dir, json).await,
     }
 }

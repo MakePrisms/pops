@@ -412,14 +412,17 @@ fn unknown_subcommand_is_exit_2() {
     assert_eq!(out.code, 2);
 }
 
-/// (item 11) `pay` is an unbuilt phase-2 verb and must NOT present as an exit-0
-/// command: `pop pay` is an unknown subcommand (clap exit 2). (No stub exists in
-/// the Cmd enum, so this holds without code removal.)
+/// `pop pay` is now a real subcommand (the HTTP-402 client dance): `--help`
+/// succeeds (exit 0), and the bare form WITHOUT a `<URL>` is a clap usage error
+/// (exit 2 — a missing required positional, not our envelope). It reads no
+/// wallet state, so it does not need `init`.
 #[test]
-fn pay_subcommand_is_unknown_exit_2() {
+fn pay_subcommand_exists_help_ok_missing_url_is_exit_2() {
     let dir = tempfile::tempdir().unwrap();
+    // `--help` exits 0 now that the command exists.
+    assert_eq!(run_pop(dir.path(), &["pay", "--help"]).code, 0);
+    // Bare `pop pay` is missing the required <URL> positional → clap exit 2.
     assert_eq!(run_pop(dir.path(), &["pay"]).code, 2);
-    assert_eq!(run_pop(dir.path(), &["pay", "--help"]).code, 2);
 }
 
 /// (item 2) `pop mint --resume <id>` parses WITHOUT --mint-url/--amount/--unit:

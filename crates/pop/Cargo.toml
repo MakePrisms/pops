@@ -20,8 +20,17 @@ path = "src/main.rs"
 # (cannot drift). Replaces the former cdk-pop git dep.
 pops-core-funder = { path = "../pops-core-funder" }
 
+# Reuse the cashu-FREE `Payment` auth-scheme codec (HTTP-402 client primitives:
+# parse_payment_params / decode_request_envelope / encode_payment_credentials +
+# their structs). `default-features = false` drops the crate's `native` surface
+# (cdk/axum/http/uuid) — `pay` only needs the envelope codec. The crate's
+# cashu-typed modules still compile, but on the SAME `cashu 0.16` cdk-common
+# already pulls, so there is no version conflict (the DEP NOTE's fallback is not
+# needed). See `crate::http402` for the thin re-export the pay command uses.
+pops-core-verify = { path = "../pops-core-verify", default-features = false }
+
 # cdk-common carries the Cashu primitives the mint/issue flow uses (NUT-04/20
-# MintRequest, proofs, keysets).
+# MintRequest, proofs, keysets; NUT-03 swap; NUT-18 PaymentRequest).
 cdk-common = { version = "0.16", default-features = false, features = ["wallet", "mint"] }
 
 # bitcoin 0.32.x MUST match pops-core-funder's bitcoin version so the kernel's

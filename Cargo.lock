@@ -1765,6 +1765,7 @@ dependencies = [
  "esplora-client",
  "hex",
  "pops-core-funder",
+ "pops-core-verify",
  "rand 0.9.4",
  "reqwest",
  "rusqlite",

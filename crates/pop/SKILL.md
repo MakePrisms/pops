@@ -87,6 +87,7 @@ pop recover (--deposit <id> | --all) --dest <addr> [--fee <sats> | --target <blo
 pop list    [--state unpaid|paid|minted|recovered|expired]
 pop status  [--deposit <id>]
 pop balance
+pop pay     <URL> [--token <cashuB> | --token-file <path> | <stdin>] [--max-amount <sats>] [--method GET]
 ```
 
 For a **fresh** `pop mint` (no `--resume`), `--mint-url`, `--amount`, and exactly
@@ -253,13 +254,66 @@ on-chain funds are safe — recover that deposit). See the code table.
 wallet.** Deliver it to the human (or, per an entry in `authorized_services`,
 hand it to the consumer that will spend it). Record the mint event in the log.
 
-### Paying with PoP ecash
+### Paying with PoP ecash (`pop pay`)
 
-The `pop` wallet itself does not spend ecash — it produces the `cashuB` token.
-"Paying with pops" means handing a minted token to a downstream consumer (e.g. a
-402-paying flow). Only do this for a service listed in `authorized_services`,
-respect any `max_amount_sats_per_payment`, and log it. If the human asks to pay a
-service that isn't authorized, confirm and add it to the state file first.
+`pop pay <URL>` performs the **HTTP-402 client dance**: it fetches a
+pops-gateway-protected resource, and if the resource answers `402 Payment` it
+satisfies the challenge by presenting a Cashu token worth **EXACTLY** the charge,
+then returns the resource. PoP charges are exact-amount (the mint gives no change
+on a redeem), so `pop pay` always sends the exact amount — never more.
+
+The wallet holds **no ecash of its own** (it reads no proofs from any DB — there
+are none). So `pay` is **token-in**: you supply the `cashuB` to pay WITH, and any
+leftover comes back OUT as a NEW change `cashuB` in the JSON for the human to
+keep. Supply the token by **`--token <cashuB>`**, **`--token-file <path>`**, or
+piped on **stdin** (in that precedence).
+
+Only pay a service listed in `authorized_services`; respect any
+`max_amount_sats_per_payment` and pass it as **`--max-amount <sats>`** (a hard
+cap — `pay` refuses a charge larger than it, so a malicious 402 cannot trick you
+into overspending). If the human asks to pay a service that isn't authorized,
+confirm and add it to the state file first.
+
+```
+pop pay https://app.example/resource --token cashuB... --max-amount 5000
+```
+
+**Three outcomes:**
+
+1. **Already accessible (no payment needed)** — the resource returned 2xx on the
+   first request:
+   ```json
+   { "schema_version": 1, "paid": false, "status": 200, "url": "https://…", "body": "…" }
+   ```
+   Exit 0. No token was spent.
+
+2. **Paid** — the resource answered 402, the exact-amount token was presented,
+   and the retry succeeded:
+   ```json
+   { "schema_version": 1, "paid": true, "status": 200, "url": "https://…",
+     "amount": 600, "unit": "pop_1788000000", "mint": "https://mint.example",
+     "change_token": "cashuB…or null", "body": "…" }
+   ```
+   Exit 0. **`amount`** sats of **`unit`** were spent at **`mint`**. If the held
+   token was worth more than the charge, **`change_token`** is a spendable
+   `cashuB` for the remainder — **deliver it to the human / save it; it is NOT
+   stored.** When the held token equalled the charge exactly, `change_token` is
+   `null`.
+
+3. **Failure** — the standard `{schema_version, error:{…}}` envelope on stdout,
+   exit 1. The pay-specific codes (see the table) tell you exactly what to fix.
+   Notably, **`gateway_rejected_payment`** carries `details.body` (the gateway's
+   reason) AND, if a swap already ran, `details.change_token` — **do not lose
+   that change token**, the pop is already partly spent.
+
+**Exactness is a money-safety invariant.** Internally, if the held token > the
+charge, `pay` does a NUT-03 swap that splits the proofs into a send set summing
+to EXACTLY the charge plus a change set; a hard assertion verifies the send set
+before anything leaves the wallet. You don't manage any of this — just present
+the token and read the result — but it's why `pay` never overspends.
+
+Log the payment (see ACTIVITY LOG): `action: "pay"`, the `amount_sats`, `unit`,
+the service, and whether a `change_token` came back.
 
 ### Recovering locked bitcoin (after the timelock)
 
@@ -321,8 +375,9 @@ median-time-past), and that degrades gracefully like `status`.
 > deposits this wallet tracks. It does **NOT** count spendable ecash: this wallet
 > mints-and-prints `cashuB` tokens and holds **no token custody**, so
 > already-minted spendable-pops are not in any number here — `balance` ≠ your
-> spendable ecash. (If a phase-2 `pay` command later gives the wallet ecash
-> custody, `balance` would surface spendable-pops then.)
+> spendable ecash. `pop pay` does not change this — it is token-IN / change-OUT
+> (you supply the `cashuB` to spend and it hands back any change), so the wallet
+> still custodies no ecash and `balance` still reflects only on-chain deposits.
 
 ```
 pop balance
@@ -474,7 +529,7 @@ Schema: `agent-state.schema.json` (next to this file). Filled example
 
 ---
 
-## ERROR CONTRACT — the 20 codes (FROZEN, additive-only)
+## ERROR CONTRACT — the 29 codes (FROZEN, additive-only)
 
 On failure, `pop` writes `{ "schema_version": 1, "error": { "code", "retriable",
 "message", "details"? } }` to **stdout** and exits **1**. Branch on `code` +
@@ -497,8 +552,17 @@ from them.
 | `quote_expired` | false | needs_input | `{quote_id, expired_at}` REQ | STOP polling + re-`quote`; funds sent are recoverable after CLTV |
 | `amount_mismatch` | false | needs_input | `{expected_sats, funded_sats}` REQ | PoP is exact-amount; funds are safe on-chain — `recover` that deposit |
 | `value_below_fee` | false | needs_input | `{value_sats, fee_sats}` REQ | UTXO uneconomical to sweep — lower `--fee` or wait for feerate |
-| `not_402` | false | terminal | `{url, status_got}` REQ | (phase-2 `pay`) the URL didn't ask for payment |
-| `payment_rejected` | false | terminal/needs_input | `{required_amount?, unit?, reason?}` REQ when the 402 told us | (phase-2 `pay`) service rejected the payment |
+| `not_402` | false | terminal | `{url, status_got}` REQ | (`pay`) the URL answered neither 2xx nor 402 — it isn't gating with payment; check the URL |
+| `payment_rejected` | false | terminal/needs_input | `{required_amount?, unit?, reason?}` REQ when the 402 told us | (`pay`) service rejected the payment |
+| `no_payment_challenge` | false | terminal | `{url, reason}` REQ | (`pay`) the 402 had no parseable `WWW-Authenticate: Payment` challenge; nothing to satisfy |
+| `challenge_parse_failed` | false | terminal | `{reason}` REQ | (`pay`) the challenge didn't decode into a charge (bad request envelope/`creqA`, or missing amount) |
+| `token_unit_mismatch` | false | needs_input | `{required, got}` REQ | (`pay`) `--token` unit ≠ the charge's unit; present a token in `required` — SENT NOTHING |
+| `token_mint_mismatch` | false | needs_input | `{token_mint, accepted_mints}` REQ | (`pay`) `--token`'s mint isn't accepted by the charge (or the charge named no mints); use an accepted-mint token — SENT NOTHING |
+| `insufficient_token_value` | false | needs_input | `{have, need}` REQ | (`pay`) `--token` is worth less than the charge (+ any swap fee, folded into `need`); present a bigger token — SENT NOTHING |
+| `amount_exceeds_cap` | false | needs_input | `{amount, cap}` REQ | (`pay`) the charge exceeds `--max-amount`; raise the cap only if you trust the charge — SENT NOTHING |
+| `swap_failed` | false | terminal | `{reason}` REQ | (`pay`) the NUT-03 swap-to-exact failed; the token may be unspent (verify) — nothing presented to the gateway |
+| `exact_amount_assertion_failed` | false | terminal | `{required, got}` REQ | (`pay`) INTERNAL money-safety abort — the send set didn't equal the charge; SENT NOTHING. Must never happen — report it |
+| `gateway_rejected_payment` | false | terminal | `{status, body, change_token?}` REQ(status, body) | (`pay`) the gateway answered 402 again after a valid payment; surface `body`. **If `change_token` is present, KEEP it — the pop is already partly spent** |
 | `address_mismatch` | false | terminal (security) | `{expected, got}` REQ | mint's address ≠ our reconstruction — do NOT fund; tell the human |
 | `network_mismatch` | false | needs_input | `{expected, got}` REQ | wrong-network `--dest`; supply a `expected`-network address |
 | `deposit_not_found` | false | needs_input | `{deposit_id}` REQ | no such deposit id — re-check `pop list` |
@@ -521,6 +585,13 @@ Notes:
   STOP + re-quote): do not loop forever on a dead quote.
 - `cltv_not_expired` is the **single**-`--deposit` immature signal; a `--all`
   sweep instead returns a per-deposit `"status":"immature"` row (see recover).
-- `not_402` / `payment_rejected` are defined now for the future `pay` command,
-  which is a separate follow-up feature not yet part of this surface. (`balance`
-  IS part of the surface — see "Checking the aggregate balance" above.)
+- **`pay`-path codes** (`not_402`, `payment_rejected`, `no_payment_challenge`,
+  `challenge_parse_failed`, `token_unit_mismatch`, `token_mint_mismatch`,
+  `insufficient_token_value`, `amount_exceeds_cap`, `swap_failed`,
+  `exact_amount_assertion_failed`, `gateway_rejected_payment`) all belong to `pop
+  pay`. The validation codes (`token_*`, `insufficient_token_value`,
+  `amount_exceeds_cap`) are raised BEFORE any spend — when you see them, **no
+  token was sent**. `swap_failed` and `gateway_rejected_payment` can occur AFTER a
+  swap has run, so heed any `change_token` in their details (the held pop may
+  already be partly spent). `exact_amount_assertion_failed` is the internal
+  money-safety gate and must never fire — if it does, it sent nothing; report it.

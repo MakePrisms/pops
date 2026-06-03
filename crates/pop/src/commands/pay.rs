@@ -1,0 +1,838 @@
+//! `pop pay` — the HTTP-402 client dance.
+//!
+//! `pop pay <URL> --token <cashuB>` fetches a pops-gateway-protected resource,
+//! satisfies its `402 Payment` challenge by presenting a Cashu token worth
+//! EXACTLY the charge, and returns the resource.
+//!
+//! ## Money-safety invariant (the whole point)
+//!
+//! PoP charges are **exact-amount** — the mint does not give change on a redeem.
+//! So `pay` must hand the gateway a token that sums to EXACTLY the charged
+//! `amount`, never more. The wallet is stateless re: ecash (it reads no proofs
+//! from the DB — there are none; see [`crate::db`]), so the token comes IN via
+//! `--token` and any leftover goes OUT as a NEW change `cashuB` the user keeps.
+//!
+//! The construction:
+//! - **token value == charge** → use the token's own proofs as the send set
+//!   (fast path, no swap).
+//! - **token value  > charge** → **swap-to-exact** (NUT-03): spend the held
+//!   proofs, request TWO output buckets — one summing to EXACTLY `amount` (the
+//!   send set), one for the change (`total - amount - fee`). The mint signs
+//!   both; we unblind each separately. The send bucket is the payment; the
+//!   change bucket is printed as a change token.
+//!
+//! Before anything is sent, a **HARD ASSERTION** checks the send set sums to
+//! EXACTLY `amount` ([`assert_send_is_exact`]); a mismatch aborts with
+//! [`PopError::ExactAmountAssertionFailed`] and sends NOTHING. A `--max-amount`
+//! cap refuses a charge bigger than the caller allows, so a malicious 402 cannot
+//! trick an agent into overspending.
+//!
+//! Swap is UNSIGNED NUT-03 (no NUT-20 funder signature), so `pay` never loads
+//! the wallet seed.
+
+use std::io::Read as _;
+use std::path::Path;
+use std::str::FromStr;
+
+use cdk_common::amount::SplitTarget;
+use cdk_common::mint_url::MintUrl;
+use cdk_common::nuts::nut18::PaymentRequest;
+use cdk_common::nuts::{CurrencyUnit, Id, KeySetInfo, Keys, PreMintSecrets, Proofs, Token};
+use cdk_common::Amount as CdkAmount;
+use clap::Parser;
+
+use crate::error::PopError;
+use crate::http402::{
+    decode_request_envelope, encode_payment_credentials, parse_payment_params, CashuPayload,
+    EchoedChallenge, PaymentCredentials, PaymentParams,
+};
+use crate::mint_client::{self, proofs_value};
+use crate::SCHEMA_VERSION;
+
+/// Arguments for `pop pay`.
+#[derive(Debug, Parser)]
+pub struct PayArgs {
+    /// The pops-gateway-protected resource URL to fetch (and pay if it 402s).
+    #[arg(value_name = "URL")]
+    pub url: String,
+
+    /// The `cashuB` token to pay WITH. If omitted, the token is read from
+    /// `--token-file`, else from stdin. The wallet holds no ecash of its own.
+    #[arg(long, value_name = "cashuB")]
+    pub token: Option<String>,
+
+    /// Read the `cashuB` token from this file (alternative to `--token`/stdin).
+    #[arg(long, value_name = "PATH", conflicts_with = "token")]
+    pub token_file: Option<std::path::PathBuf>,
+
+    /// HTTP method (v1 only really needs GET).
+    #[arg(long, value_name = "METHOD", default_value = "GET")]
+    pub method: String,
+
+    /// Safety cap: refuse to pay if the charge exceeds this many sats. An agent
+    /// must not be tricked by a malicious 402 into overspending.
+    #[arg(long, value_name = "SATS")]
+    pub max_amount: Option<u64>,
+}
+
+/// The concrete charge decoded from a 402's `creqA` payment request: the EXACT
+/// amount, the unit, and the accepted mints.
+#[derive(Debug, Clone)]
+pub struct Charge {
+    /// Exact sat amount the holder must present (REQUIRED on the wire).
+    pub amount: u64,
+    /// Unit the proofs must carry (e.g. `pop_<ts>`).
+    pub unit: CurrencyUnit,
+    /// Mints the gateway accepts (empty ⟹ the charge named none).
+    pub mints: Vec<MintUrl>,
+}
+
+/// The exact-split plan for a swap: how many sats go to the send set vs change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Split {
+    /// Sats in the send set — ALWAYS exactly the charge amount.
+    pub send: u64,
+    /// Sats in the change set (`total - amount - fee`).
+    pub change: u64,
+}
+
+/// Runs `pop pay`.
+///
+/// `wallet_dir` is accepted for signature symmetry with the other commands but
+/// is unused: `pay` reads no wallet state (no seed, no DB proofs) — the token
+/// comes in via `--token`/stdin and change goes out in the JSON.
+///
+/// # Errors
+///
+/// Propagates the HTTP-402 dance errors (see the `pay`-path [`PopError`]
+/// variants); on any validation or exactness failure it sends NOTHING.
+pub async fn run(
+    args: &PayArgs,
+    _wallet_dir: &Path,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let http = reqwest::Client::new();
+
+    // ---- 1. Initial request. ----
+    let method = parse_method(&args.method)?;
+    eprintln!("{} {} ...", args.method.to_uppercase(), args.url);
+    let resp = http
+        .request(method.clone(), &args.url)
+        .send()
+        .await
+        .map_err(|e| {
+            eprintln!("request to {} failed: {e}", args.url);
+            PopError::MintUnreachable {
+                mint_url: args.url.clone(),
+            }
+        })?;
+    let status = resp.status();
+
+    // ---- 2. Already satisfied → no payment needed. ----
+    if status.is_success() {
+        eprintln!(
+            "{} returned {} — no payment needed.",
+            args.url,
+            status.as_u16()
+        );
+        let body = resp.text().await.unwrap_or_default();
+        emit_unpaid(args, status.as_u16(), &body, json)?;
+        return Ok(());
+    }
+
+    // ---- 3. Must be a 402 to proceed; anything else isn't a payment ask. ----
+    if status.as_u16() != 402 {
+        return Err(PopError::Not402 {
+            url: args.url.clone(),
+            status_got: status.as_u16(),
+        }
+        .into());
+    }
+
+    // ---- 3a. Parse the `WWW-Authenticate: Payment …` challenge. ----
+    let www_auth = resp
+        .headers()
+        .get(reqwest::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let www_auth = www_auth.ok_or_else(|| PopError::NoPaymentChallenge {
+        url: args.url.clone(),
+        reason: "no WWW-Authenticate header on the 402 response".to_string(),
+    })?;
+    let params = parse_payment_params(&www_auth).map_err(|e| PopError::NoPaymentChallenge {
+        url: args.url.clone(),
+        reason: format!("WWW-Authenticate Payment params did not parse: {e}"),
+    })?;
+
+    // ---- 3b/3c. Unwrap the request envelope → creqA → the concrete charge. ----
+    let charge = decode_charge_from_params(&params)?;
+    eprintln!(
+        "Charge: {} sat of {} (mints: {})",
+        charge.amount,
+        charge.unit,
+        if charge.mints.is_empty() {
+            "<none named>".to_string()
+        } else {
+            charge
+                .mints
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    );
+
+    // ---- 4a. Safety cap FIRST (before touching the token or the mint). ----
+    if let Some(cap) = args.max_amount {
+        if charge.amount > cap {
+            return Err(PopError::AmountExceedsCap {
+                amount: charge.amount,
+                cap,
+            }
+            .into());
+        }
+    }
+
+    // ---- 4b. Decode + validate the held token against the charge. ----
+    let token_str = read_token(args)?;
+    let token = Token::from_str(token_str.trim())
+        .map_err(|e| PopError::invalid_input(format!("--token is not a valid cashu token: {e}")))?;
+    let token_unit = token
+        .unit()
+        .ok_or_else(|| PopError::invalid_input("--token has no unit".to_string()))?;
+    let token_mint = token
+        .mint_url()
+        .map_err(|e| PopError::invalid_input(format!("--token has no single mint url: {e}")))?;
+    let token_total = token
+        .value()
+        .map_err(|e| PopError::invalid_input(format!("--token value is unreadable: {e}")))?
+        .to_u64();
+    validate_token(token_total, &token_unit, &token_mint, &charge)?;
+
+    // ---- 5/6/7. Build the EXACT-amount send token (fast path or swap). ----
+    let base = token_mint.to_string();
+    let base = base.trim_end_matches('/');
+    let keyset_infos = mint_client::fetch_keyset_infos(&http, base).await?;
+    let token_proofs = token
+        .proofs(&keyset_infos)
+        .map_err(|e| PopError::invalid_input(format!("--token proofs are unreadable: {e}")))?;
+
+    let Outcome {
+        send_token,
+        change_token,
+    } = build_exact_payment(
+        &http,
+        base,
+        &charge,
+        token_proofs,
+        token_total,
+        &token_unit,
+        &keyset_infos,
+    )
+    .await?;
+
+    // ---- 8/9. Build credentials + retry the SAME request with payment. ----
+    let creds = build_credentials(&params, &send_token);
+    let blob = encode_payment_credentials(&creds);
+    eprintln!(
+        "Presenting payment ({} sat) and retrying ...",
+        charge.amount
+    );
+    let retry = http
+        .request(method, &args.url)
+        .header(reqwest::header::AUTHORIZATION, format!("Payment {blob}"))
+        .send()
+        .await
+        .map_err(|e| {
+            eprintln!("payment retry to {} failed: {e}", args.url);
+            PopError::MintUnreachable {
+                mint_url: args.url.clone(),
+            }
+        })?;
+    let retry_status = retry.status();
+    let retry_body = retry.text().await.unwrap_or_default();
+
+    if retry_status.is_success() {
+        emit_paid(
+            args,
+            retry_status.as_u16(),
+            &charge,
+            base,
+            change_token.as_deref(),
+            &retry_body,
+            json,
+        )?;
+        Ok(())
+    } else {
+        // Gateway rejected the (exact) payment. Surface its body AND the change
+        // token (the pop is already partly spent via the swap) so no value is lost.
+        Err(PopError::GatewayRejectedPayment {
+            status: retry_status.as_u16(),
+            body: retry_body,
+            change_token,
+        }
+        .into())
+    }
+}
+
+/// The two tokens produced by the exact-amount construction.
+struct Outcome {
+    /// The token worth EXACTLY the charge — this is what is presented.
+    send_token: String,
+    /// The leftover change token (`None` when the held token equalled the charge).
+    change_token: Option<String>,
+}
+
+/// Builds the exact-amount send token (and any change) from the held proofs.
+///
+/// Fast path when `token_total == charge.amount` (send the held proofs as-is);
+/// otherwise swap-to-exact. Either way the send set is asserted to equal the
+/// charge before it is returned.
+#[allow(clippy::too_many_arguments)]
+async fn build_exact_payment(
+    http: &reqwest::Client,
+    base: &str,
+    charge: &Charge,
+    token_proofs: Proofs,
+    token_total: u64,
+    unit: &CurrencyUnit,
+    keyset_infos: &[KeySetInfo],
+) -> Result<Outcome, Box<dyn std::error::Error>> {
+    let mint_url_typed = MintUrl::from_str(base)
+        .map_err(|e| PopError::invalid_input(format!("mint url `{base}` is invalid: {e}")))?;
+
+    // FAST PATH: the held token already equals the charge exactly.
+    if token_total == charge.amount {
+        let send_sum = proofs_value(&token_proofs);
+        assert_send_is_exact(send_sum, charge.amount)?;
+        let send_token = Token::new(mint_url_typed, token_proofs, None, unit.clone()).to_string();
+        return Ok(Outcome {
+            send_token,
+            change_token: None,
+        });
+    }
+
+    // SWAP-TO-EXACT: token_total > charge.amount (validate_token guaranteed >=,
+    // and == was handled above, so this is strictly >).
+    let active = mint_client::select_active_keyset(keyset_infos, unit)?;
+    let keyset_id: Id = active.id;
+    let input_fee_ppk = active.input_fee_ppk;
+
+    // pop keysets are expected 0-fee; if not, the fee is absorbed by CHANGE so
+    // the SEND set stays EXACTLY `amount` (inputs == outputs + fee).
+    let fee = swap_fee_sats(input_fee_ppk, token_proofs.len());
+    let split = plan_split(token_total, charge.amount, fee)?;
+
+    let keys = mint_client::fetch_keys(http, base, &keyset_id).await?;
+
+    // Build the two output buckets: send == amount, change == total-amount-fee.
+    let send_premint = build_premint(keyset_id, split.send, &keys)?;
+    let mut buckets = vec![send_premint];
+    if split.change > 0 {
+        buckets.push(build_premint(keyset_id, split.change, &keys)?);
+    }
+
+    let mut proof_sets = mint_client::swap(http, base, token_proofs, &buckets, &keys)
+        .await
+        .map_err(|e| PopError::SwapFailed {
+            reason: e.to_string(),
+        })?;
+
+    // proof_sets is in bucket order: [send, change?].
+    let send_proofs = proof_sets.remove(0);
+    let change_proofs = if split.change > 0 {
+        Some(proof_sets.remove(0))
+    } else {
+        None
+    };
+
+    // ---- HARD ASSERTION: the send set must sum to EXACTLY the charge. ----
+    let send_sum = proofs_value(&send_proofs);
+    assert_send_is_exact(send_sum, charge.amount)?;
+
+    let send_token =
+        Token::new(mint_url_typed.clone(), send_proofs, None, unit.clone()).to_string();
+    let change_token =
+        change_proofs.map(|cp| Token::new(mint_url_typed, cp, None, unit.clone()).to_string());
+
+    Ok(Outcome {
+        send_token,
+        change_token,
+    })
+}
+
+/// Decodes the concrete [`Charge`] from parsed 402 params: unwrap the request
+/// envelope → `creqA` → NUT-18 [`PaymentRequest`], requiring the amount.
+fn decode_charge_from_params(params: &PaymentParams) -> Result<Charge, Box<dyn std::error::Error>> {
+    let creq_a =
+        decode_request_envelope(&params.request).map_err(|e| PopError::ChallengeParseFailed {
+            reason: format!("request envelope did not decode: {e}"),
+        })?;
+    decode_charge(&creq_a)
+}
+
+/// Parses a `creqA…` payment-request string into a [`Charge`], requiring the
+/// amount (a charge with no amount is unusable — we will not guess).
+pub fn decode_charge(creq_a: &str) -> Result<Charge, Box<dyn std::error::Error>> {
+    let pr = PaymentRequest::from_str(creq_a).map_err(|e| PopError::ChallengeParseFailed {
+        reason: format!("creqA payment request did not decode: {e}"),
+    })?;
+    let amount = pr
+        .amount
+        .ok_or_else(|| PopError::ChallengeParseFailed {
+            reason: "payment request has no amount (PoP charges are exact-amount)".to_string(),
+        })?
+        .to_u64();
+    let unit = pr.unit.ok_or_else(|| PopError::ChallengeParseFailed {
+        reason: "payment request has no unit".to_string(),
+    })?;
+    Ok(Charge {
+        amount,
+        unit,
+        mints: pr.mints,
+    })
+}
+
+/// Validates the held token against the charge BEFORE any spend: matching unit,
+/// an accepted mint, and enough value. Any mismatch → a structured error and
+/// (at the call site) SEND NOTHING.
+pub fn validate_token(
+    token_total: u64,
+    token_unit: &CurrencyUnit,
+    token_mint: &MintUrl,
+    charge: &Charge,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if token_unit != &charge.unit {
+        return Err(PopError::TokenUnitMismatch {
+            required: charge.unit.to_string(),
+            got: token_unit.to_string(),
+        }
+        .into());
+    }
+    // The charge MUST name the mint(s) it accepts; an empty set is rejected
+    // (we will not silently pay an unconstrained charge from an arbitrary mint).
+    if !charge.mints.iter().any(|m| m == token_mint) {
+        return Err(PopError::TokenMintMismatch {
+            token_mint: token_mint.to_string(),
+            accepted_mints: charge.mints.iter().map(ToString::to_string).collect(),
+        }
+        .into());
+    }
+    if token_total < charge.amount {
+        return Err(PopError::InsufficientTokenValue {
+            have: token_total,
+            need: charge.amount,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// The per-swap input fee in sats: `ceil(n_inputs * input_fee_ppk / 1000)`
+/// (NUT-02 fee model). For 0-fee pop keysets this is 0.
+pub fn swap_fee_sats(input_fee_ppk: u64, n_inputs: usize) -> u64 {
+    let total_ppk = input_fee_ppk.saturating_mul(n_inputs as u64);
+    total_ppk.div_ceil(1000)
+}
+
+/// Plans the exact split: send == amount, change == total - amount - fee.
+///
+/// Errors if `total < amount + fee` (the token cannot cover the charge once the
+/// swap fee is taken) — surfaced as [`PopError::InsufficientTokenValue`] with
+/// the fee folded into `need` so the caller sees the true requirement.
+pub fn plan_split(total: u64, amount: u64, fee: u64) -> Result<Split, Box<dyn std::error::Error>> {
+    let need = amount
+        .checked_add(fee)
+        .ok_or_else(|| PopError::internal("amount + fee overflowed u64"))?;
+    if total < need {
+        return Err(PopError::InsufficientTokenValue { have: total, need }.into());
+    }
+    Ok(Split {
+        send: amount,
+        change: total - need,
+    })
+}
+
+/// The money-safety gate: the send set MUST sum to EXACTLY the charge amount.
+///
+/// Returns [`PopError::ExactAmountAssertionFailed`] (sends nothing) on any
+/// deviation. This must never fire in practice — it guards against a split or
+/// unblind bug ever letting a non-exact set reach the gateway.
+pub fn assert_send_is_exact(send_sum: u64, amount: u64) -> Result<(), Box<dyn std::error::Error>> {
+    if send_sum != amount {
+        return Err(PopError::ExactAmountAssertionFailed {
+            required: amount,
+            got: send_sum,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Builds a [`PreMintSecrets`] for `amount` on `keyset_id` (least-proofs
+/// power-of-2 split, no swap fee folded into the OUTPUT split — outputs are
+/// 0-fee; the input fee is handled by the change bucket).
+fn build_premint(
+    keyset_id: Id,
+    amount: u64,
+    keys: &Keys,
+) -> Result<PreMintSecrets, Box<dyn std::error::Error>> {
+    let amounts: Vec<u64> = keys.keys().keys().map(|a| a.to_u64()).collect();
+    let fee_and_amounts = (0u64, amounts).into();
+    PreMintSecrets::random(
+        keyset_id,
+        CdkAmount::from(amount),
+        &SplitTarget::None,
+        &fee_and_amounts,
+    )
+    .map_err(|e| format!("failed to build premint secrets for {amount} sat: {e}").into())
+}
+
+/// Builds the `Authorization: Payment` credentials: a VERBATIM echo of the
+/// parsed challenge params, plus the exact-amount token as the cashu payload.
+pub fn build_credentials(params: &PaymentParams, cashu_token: &str) -> PaymentCredentials {
+    PaymentCredentials {
+        challenge: EchoedChallenge {
+            id: params.id.clone(),
+            realm: params.realm.clone(),
+            method: params.method.clone(),
+            intent: params.intent.clone(),
+            request: params.request.clone(),
+        },
+        payload: CashuPayload {
+            cashu_token: cashu_token.to_string(),
+        },
+    }
+}
+
+/// Reads the `cashuB` token from `--token`, else `--token-file`, else stdin.
+fn read_token(args: &PayArgs) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(t) = &args.token {
+        return Ok(t.clone());
+    }
+    if let Some(path) = &args.token_file {
+        return std::fs::read_to_string(path).map_err(|e| {
+            PopError::invalid_input(format!(
+                "failed to read --token-file {}: {e}",
+                path.display()
+            ))
+            .into()
+        });
+    }
+    // Fall back to stdin.
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| PopError::invalid_input(format!("failed to read token from stdin: {e}")))?;
+    if buf.trim().is_empty() {
+        return Err(PopError::invalid_input(
+            "no token supplied: pass --token <cashuB>, --token-file <path>, or pipe it on stdin",
+        )
+        .into());
+    }
+    Ok(buf)
+}
+
+/// Parses the `--method` string into a reqwest [`Method`].
+fn parse_method(m: &str) -> Result<reqwest::Method, Box<dyn std::error::Error>> {
+    reqwest::Method::from_bytes(m.to_uppercase().as_bytes())
+        .map_err(|e| PopError::invalid_input(format!("invalid --method `{m}`: {e}")).into())
+}
+
+/// Emits the success-without-payment JSON (`paid:false`) on a 2xx first hit.
+fn emit_unpaid(
+    args: &PayArgs,
+    status: u16,
+    body: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        let out = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "paid": false,
+            "status": status,
+            "url": args.url,
+            "body": body,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!("{status} (no payment needed)\n{body}");
+    }
+    Ok(())
+}
+
+/// Emits the paid-success JSON after a satisfied retry.
+#[allow(clippy::too_many_arguments)]
+fn emit_paid(
+    args: &PayArgs,
+    status: u16,
+    charge: &Charge,
+    mint: &str,
+    change_token: Option<&str>,
+    body: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        let out = serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "paid": true,
+            "status": status,
+            "url": args.url,
+            "amount": charge.amount,
+            "unit": charge.unit.to_string(),
+            "mint": mint,
+            "change_token": change_token,
+            "body": body,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "PAID {} sat of {} to {}",
+            charge.amount, charge.unit, args.url
+        );
+        if let Some(ct) = change_token {
+            println!("\nChange token (NOT stored — save it):\n{ct}");
+        }
+        println!("\n---- resource ----\n{body}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http402::encode_payment_credentials;
+    use pops_core_verify::challenge::{encode_challenge, CashuRequirement};
+    use pops_core_verify::envelope::{encode_request_envelope, parse_payment_authorization};
+
+    fn pop_unit() -> CurrencyUnit {
+        CurrencyUnit::Custom("pop_1782668279".to_string())
+    }
+
+    fn mint_a() -> MintUrl {
+        MintUrl::from_str("https://mint.example").unwrap()
+    }
+
+    fn charge(amount: u64) -> Charge {
+        Charge {
+            amount,
+            unit: pop_unit(),
+            mints: vec![mint_a()],
+        }
+    }
+
+    // ---- exact-split math ------------------------------------------------
+
+    #[test]
+    fn plan_split_zero_fee_change_is_total_minus_amount() {
+        let s = plan_split(1000, 600, 0).unwrap();
+        assert_eq!(s.send, 600);
+        assert_eq!(s.change, 400);
+        // send + change == total when fee is 0.
+        assert_eq!(s.send + s.change, 1000);
+    }
+
+    #[test]
+    fn plan_split_exact_token_has_zero_change() {
+        let s = plan_split(600, 600, 0).unwrap();
+        assert_eq!(s.send, 600);
+        assert_eq!(s.change, 0);
+    }
+
+    #[test]
+    fn plan_split_fee_is_absorbed_by_change_send_stays_exact() {
+        // With a non-zero fee, the SEND set is still exactly `amount`; the fee
+        // comes out of CHANGE so inputs (1000) == outputs (600+397) + fee (3).
+        let s = plan_split(1000, 600, 3).unwrap();
+        assert_eq!(s.send, 600, "send must stay EXACTLY the charge");
+        assert_eq!(s.change, 397);
+        assert_eq!(s.send + s.change + 3, 1000, "inputs == outputs + fee");
+    }
+
+    #[test]
+    fn plan_split_insufficient_after_fee_errors() {
+        // total just covers amount but not amount+fee.
+        let err = plan_split(600, 600, 1).unwrap_err();
+        let pe = crate::error::from_boxed(err);
+        assert_eq!(pe.code(), "insufficient_token_value");
+        let d = pe.details().unwrap();
+        assert_eq!(d["have"], serde_json::json!(600));
+        assert_eq!(d["need"], serde_json::json!(601));
+    }
+
+    #[test]
+    fn swap_fee_sats_zero_keyset_is_free() {
+        assert_eq!(swap_fee_sats(0, 5), 0);
+    }
+
+    #[test]
+    fn swap_fee_sats_rounds_up() {
+        // 3 inputs * 100 ppk = 300 ppk -> ceil(300/1000) = 1 sat.
+        assert_eq!(swap_fee_sats(100, 3), 1);
+        // 10 inputs * 100 ppk = 1000 ppk -> exactly 1 sat.
+        assert_eq!(swap_fee_sats(100, 10), 1);
+        // 11 inputs * 100 ppk = 1100 ppk -> ceil -> 2 sat.
+        assert_eq!(swap_fee_sats(100, 11), 2);
+    }
+
+    // ---- the hard assertion fires on a bad split -------------------------
+
+    #[test]
+    fn assert_send_is_exact_passes_on_match() {
+        assert!(assert_send_is_exact(600, 600).is_ok());
+    }
+
+    #[test]
+    fn assert_send_is_exact_fires_when_over() {
+        let err = assert_send_is_exact(601, 600).unwrap_err();
+        let pe = crate::error::from_boxed(err);
+        assert_eq!(pe.code(), "exact_amount_assertion_failed");
+        let d = pe.details().unwrap();
+        assert_eq!(d["required"], serde_json::json!(600));
+        assert_eq!(d["got"], serde_json::json!(601));
+    }
+
+    #[test]
+    fn assert_send_is_exact_fires_when_under() {
+        let err = assert_send_is_exact(599, 600).unwrap_err();
+        assert_eq!(
+            crate::error::from_boxed(err).code(),
+            "exact_amount_assertion_failed"
+        );
+    }
+
+    // ---- unit / mint / value validations ---------------------------------
+
+    #[test]
+    fn validate_token_ok_when_unit_mint_value_match() {
+        assert!(validate_token(1000, &pop_unit(), &mint_a(), &charge(600)).is_ok());
+        // Exact value also passes.
+        assert!(validate_token(600, &pop_unit(), &mint_a(), &charge(600)).is_ok());
+    }
+
+    #[test]
+    fn validate_token_rejects_unit_mismatch() {
+        let other = CurrencyUnit::Custom("pop_9999999999".to_string());
+        let err = validate_token(1000, &other, &mint_a(), &charge(600)).unwrap_err();
+        assert_eq!(crate::error::from_boxed(err).code(), "token_unit_mismatch");
+    }
+
+    #[test]
+    fn validate_token_rejects_mint_mismatch() {
+        let other_mint = MintUrl::from_str("https://other.example").unwrap();
+        let err = validate_token(1000, &pop_unit(), &other_mint, &charge(600)).unwrap_err();
+        assert_eq!(crate::error::from_boxed(err).code(), "token_mint_mismatch");
+    }
+
+    #[test]
+    fn validate_token_rejects_when_charge_names_no_mints() {
+        // An empty accepted-mints set is rejected — we won't pay an unconstrained
+        // charge from an arbitrary mint.
+        let c = Charge {
+            amount: 600,
+            unit: pop_unit(),
+            mints: vec![],
+        };
+        let err = validate_token(1000, &pop_unit(), &mint_a(), &c).unwrap_err();
+        assert_eq!(crate::error::from_boxed(err).code(), "token_mint_mismatch");
+    }
+
+    #[test]
+    fn validate_token_rejects_insufficient_value() {
+        let err = validate_token(599, &pop_unit(), &mint_a(), &charge(600)).unwrap_err();
+        let pe = crate::error::from_boxed(err);
+        assert_eq!(pe.code(), "insufficient_token_value");
+        let d = pe.details().unwrap();
+        assert_eq!(d["have"], serde_json::json!(599));
+        assert_eq!(d["need"], serde_json::json!(600));
+    }
+
+    // ---- charge decode requires an amount --------------------------------
+
+    #[test]
+    fn decode_charge_reads_amount_unit_mints() {
+        let req = CashuRequirement {
+            unit: pop_unit(),
+            mints: vec![mint_a()],
+            amount: cdk_common::Amount::from(777),
+            payment_id: Some("ch-1".to_string()),
+            description: None,
+            single_use: true,
+        };
+        let creq = encode_challenge(&req);
+        let c = decode_charge(&creq).unwrap();
+        assert_eq!(c.amount, 777);
+        assert_eq!(c.unit, pop_unit());
+        assert_eq!(c.mints, vec![mint_a()]);
+    }
+
+    #[test]
+    fn decode_charge_rejects_missing_amount() {
+        // Build a creqA with no amount via the cashu builder directly.
+        let pr = PaymentRequest {
+            payment_id: None,
+            amount: None,
+            unit: Some(pop_unit()),
+            single_use: Some(false),
+            mints: vec![mint_a()],
+            description: None,
+            transports: vec![],
+            nut10: None,
+        };
+        let creq = pr.to_string();
+        let err = decode_charge(&creq).unwrap_err();
+        assert_eq!(
+            crate::error::from_boxed(err).code(),
+            "challenge_parse_failed"
+        );
+    }
+
+    // ---- envelope round-trip: 402 header -> params -> creqA -> credentials -
+
+    #[test]
+    fn full_envelope_roundtrip_402_to_credentials() {
+        // 1. Server side: build a creqA, wrap it in the request envelope, form a
+        //    WWW-Authenticate Payment header.
+        let req = CashuRequirement {
+            unit: pop_unit(),
+            mints: vec![mint_a()],
+            amount: cdk_common::Amount::from(1234),
+            payment_id: Some("ch-42".to_string()),
+            description: None,
+            single_use: true,
+        };
+        let creq = encode_challenge(&req);
+        let env = encode_request_envelope(&creq);
+        let header = format!(
+            r#"Payment id="ch-42", realm="pops", method="cashu", intent="charge", request="{env}""#
+        );
+
+        // 2. Client side: parse the params back out.
+        let params = parse_payment_params(&header).expect("parses params");
+        assert_eq!(params.id, "ch-42");
+        assert_eq!(params.method, "cashu");
+
+        // 3. Decode the charge from those params.
+        let charge = decode_charge_from_params(&params).expect("charge decodes");
+        assert_eq!(charge.amount, 1234);
+        assert_eq!(charge.unit, pop_unit());
+        assert_eq!(charge.mints, vec![mint_a()]);
+
+        // 4. Build credentials echoing the challenge verbatim + a token payload.
+        let creds = build_credentials(&params, "cashuBexampletoken");
+        assert_eq!(creds.challenge.id, "ch-42");
+        assert_eq!(creds.challenge.realm, "pops");
+        assert_eq!(creds.challenge.method, "cashu");
+        assert_eq!(creds.challenge.intent, "charge");
+        assert_eq!(creds.challenge.request, env, "request echoed verbatim");
+        assert_eq!(creds.payload.cashu_token, "cashuBexampletoken");
+
+        // 5. Encode to the Authorization blob and parse it as the GATEWAY would
+        //    (proves the wire round-trips through the real verifier codec).
+        let blob = encode_payment_credentials(&creds);
+        let auth = format!("Payment {blob}");
+        let parsed = parse_payment_authorization(&auth).expect("gateway parses our credentials");
+        assert_eq!(parsed.challenge.id, "ch-42");
+        assert_eq!(parsed.payload.cashu_token, "cashuBexampletoken");
+    }
+}
