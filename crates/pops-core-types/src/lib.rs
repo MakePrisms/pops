@@ -42,8 +42,21 @@ pub enum TypesError {
 ///
 /// Wire shape is `pop_<ts_expiry>` where `ts_expiry` is the Unix-seconds
 /// value embedded in the CLTV. Returns [`TypesError::InvalidUnitFormat`] for
-/// anything that is not exactly the `pop_` prefix followed by a parseable
-/// `u64`.
+/// anything that is not exactly the `pop_` prefix followed by the **canonical
+/// decimal form** of a parseable `u64`.
+///
+/// "Canonical decimal form" is the load-bearing tightening: the remainder must
+/// be byte-for-byte equal to `ts_expiry.to_string()` — i.e. exactly what
+/// [`format_pop_unit`] emits. `u64::from_str` is otherwise lenient: it accepts a
+/// leading `+` sign (`pop_+500000000`) and leading zeros (`pop_0500000000`),
+/// both of which parse to the SAME integer as the canonical unit yet are a
+/// DIFFERENT string. Because the unit string IS the currency identity
+/// downstream (`CurrencyUnit::Custom(unit)`), letting a non-canonical spelling
+/// through would silently mint a credential whose unit never matches the
+/// canonical challenge unit — a permanent `WrongUnit`/402. Rejecting any
+/// non-canonical spelling here (the single source of truth all consumers route
+/// through) lets the gateway/verify/wallet/cdk-pop drop their own front gates.
+/// (`from_str_radix` is ASCII-only, so no Unicode-digit case exists to guard.)
 ///
 /// After parsing, `ts_expiry` is range-checked against the closed interval
 /// `500_000_000 ..= 4_294_967_295` (`u32::MAX`); both bounds are intentional:
@@ -67,6 +80,14 @@ pub fn parse_pop_unit(unit_str: &str) -> Result<u64, TypesError> {
     let ts_expiry = rest
         .parse::<u64>()
         .map_err(|_| TypesError::InvalidUnitFormat(unit_str.to_string()))?;
+    // Reject any non-canonical spelling (leading `+`, leading zeros, etc.):
+    // `u64::from_str` is lenient, but the unit string IS the currency identity,
+    // so it must round-trip `format_pop_unit` exactly or it would mint a
+    // distinct-string/same-value unit that never matches the canonical
+    // challenge unit (a silent permanent WrongUnit/402).
+    if rest != ts_expiry.to_string() {
+        return Err(TypesError::InvalidUnitFormat(unit_str.to_string()));
+    }
     if ts_expiry < TS_EXPIRY_FLOOR {
         return Err(TypesError::TsExpiryTooSmall(ts_expiry, TS_EXPIRY_FLOOR));
     }
@@ -114,6 +135,81 @@ mod tests {
             parse_pop_unit("pop_notanumber"),
             Err(TypesError::InvalidUnitFormat(_))
         ));
+    }
+
+    #[test]
+    fn parse_pop_unit_rejects_leading_zero() {
+        // `u64::from_str` parses "0500000000" to 500_000_000, but the unit
+        // string differs from the canonical `format_pop_unit` output, so the
+        // currency identity would silently diverge → reject as malformed, NOT
+        // accept as the in-range floor value.
+        assert!(matches!(
+            parse_pop_unit("pop_0500000000"),
+            Err(TypesError::InvalidUnitFormat(_))
+        ));
+        // A single leading zero on an otherwise-valid value.
+        assert!(matches!(
+            parse_pop_unit("pop_01782259200"),
+            Err(TypesError::InvalidUnitFormat(_))
+        ));
+        // "pop_0" alone (zero is below the floor anyway, but the canonical-form
+        // gate must not be tricked into a TsExpiryTooSmall numeric error here:
+        // "0" IS canonical for 0, so this one legitimately falls through to the
+        // floor check — assert that exact behavior).
+        assert_eq!(
+            parse_pop_unit("pop_0"),
+            Err(TypesError::TsExpiryTooSmall(0, 500_000_000))
+        );
+        // "pop_00" is non-canonical (two zeros) → InvalidUnitFormat, NOT floor.
+        assert!(matches!(
+            parse_pop_unit("pop_00"),
+            Err(TypesError::InvalidUnitFormat(_))
+        ));
+    }
+
+    #[test]
+    fn parse_pop_unit_rejects_leading_plus() {
+        // `u64::from_str` accepts a leading '+'; the canonical form never has
+        // one, so a `pop_+...` unit must be rejected as malformed.
+        assert!(matches!(
+            parse_pop_unit("pop_+500000000"),
+            Err(TypesError::InvalidUnitFormat(_))
+        ));
+        assert!(matches!(
+            parse_pop_unit("pop_+1782259200"),
+            Err(TypesError::InvalidUnitFormat(_))
+        ));
+    }
+
+    #[test]
+    fn parse_pop_unit_rejects_surrounding_whitespace() {
+        // Internal/leading/trailing whitespace is not canonical. (Callers that
+        // want to tolerate operator whitespace must `.trim()` BEFORE calling —
+        // the gateway does; the grammar itself stays strict.)
+        assert!(matches!(
+            parse_pop_unit("pop_ 1782259200"),
+            Err(TypesError::InvalidUnitFormat(_))
+        ));
+        assert!(matches!(
+            parse_pop_unit("pop_1782259200 "),
+            Err(TypesError::InvalidUnitFormat(_))
+        ));
+    }
+
+    #[test]
+    fn parse_pop_unit_accepts_canonical_only() {
+        // The canonical decimal spelling (exactly what `format_pop_unit`
+        // emits) is the ONLY accepted form for a given value, and it parses.
+        let ts = 1_782_259_200u64;
+        let canonical = format_pop_unit(ts);
+        assert_eq!(canonical, "pop_1782259200");
+        assert_eq!(parse_pop_unit(&canonical), Ok(ts));
+        // Property: for every in-range ts, format → parse round-trips, and the
+        // formatted string is the unique accepted spelling.
+        for ts in [500_000_000u64, 1_782_259_200, 4_294_967_295] {
+            let s = format_pop_unit(ts);
+            assert_eq!(parse_pop_unit(&s), Ok(ts), "canonical {s} must parse");
+        }
     }
 
     #[test]

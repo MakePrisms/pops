@@ -24,7 +24,17 @@
 /// must keep distinct (the load-bearing invariant):
 ///   (A) TRANSPORT failure          -> 503, token NOT consumed, RETRYABLE same token
 ///   (B) client-re-pay VERIFICATION -> 402 + fresh challenge, terminal for THIS token
-///   (C) MALFORMED request/credential -> 400, framework status, NOT 402
+///   (C) MALFORMED request/credential -> 400 OR 402, depending on WHAT is malformed
+///
+/// The per-variant docs below are AUTHORITATIVE on each variant's status; this
+/// banner summarizes. Note (C) is NOT a blanket 400: only a malformed *request*
+/// frame (`MalformedRequest` — unsupported method / multi-credential) is the
+/// framework `400`; a malformed *credential* (`MalformedCredential`,
+/// `TooManyProofs`) is a `402` problem-type `malformed-credential`, because a
+/// bad credential is still a payment attempt the client should re-make with a
+/// good token (spec §Errors `malformed-credential`). This matches the envelope
+/// mapping: `MintUnreachable` -> 503, `MalformedRequest` -> 400, EVERY other
+/// variant (verification + malformed-credential) -> 402.
 ///
 /// A mint-unreachable / timeout MUST NEVER collapse into a 402: a 402 tells the
 /// client "your payment was wrong, re-pay"; a 503 tells it "we couldn't check —
@@ -73,7 +83,6 @@ pub enum ChargeError {
     //     variants so the envelope picks the precise problem-type. Terminal
     //     for THIS token (client must present a different/correct token).
     // ─────────────────────────────────────────────────────────────────────
-
     /// Presented value does not equal `amount + expected_swap_fee` (over- OR
     /// under-funded; the server makes no change). Carries both sides so the
     /// body can say exactly how far off.
@@ -130,8 +139,8 @@ pub enum ChargeError {
     /// proof is rejected BEFORE the swap.
     ///
     /// HTTP 402 · problem-type `verification-failed` · terminal.
-    /// (spec step 10, §Spending-Condition-Locked Tokens — see §"Locked-token
-    ///  status call" below for why 402 not 400.)
+    /// (spec step 10, §Spending-Condition-Locked Tokens — a locked token is a
+    ///  verification failure, hence 402 not 400; see the enum-level banner.)
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
 
@@ -205,10 +214,12 @@ pub enum ChargeError {
     InvalidChallenge,
 
     // ─────────────────────────────────────────────────────────────────────
-    // (C) MALFORMED — 400, framework status (NOT 402). The request/credential
-    //     is not a well-formed payment attempt at all.
+    // (C) MALFORMED — the request/credential is not a well-formed payment
+    //     attempt. STATUS SPLITS per variant (see each variant's doc, which is
+    //     authoritative): a malformed *request* frame (`MalformedRequest`) is
+    //     400 framework status; a malformed *credential* (`MalformedCredential`,
+    //     `TooManyProofs`) is 402 problem-type `malformed-credential`.
     // ─────────────────────────────────────────────────────────────────────
-
     /// The credential token could not be decoded / parsed: bad base64url, the
     /// JSON did not parse, a required field (`challenge`, `payload`,
     /// `payload.cashu_token`) is absent or wrong-typed, `cashu_token` does not
@@ -216,8 +227,9 @@ pub enum ChargeError {
     /// serialization (this intent is cashuB/TokenV4 only — REJECT cashuA).
     ///
     /// HTTP 402 · problem-type `malformed-credential`. (spec §Errors
-    /// `malformed-credential` — note: the spec scopes THIS to 402, see
-    /// §"Status-code nuance" below.)
+    /// `malformed-credential` — note: the spec scopes a malformed *credential*
+    /// to 402, NOT the framework 400; see the enum-level banner for the (C)
+    /// request-vs-credential split.)
     #[error("malformed credential: {0}")]
     MalformedCredential(String),
 
