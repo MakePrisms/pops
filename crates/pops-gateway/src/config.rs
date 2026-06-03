@@ -34,6 +34,13 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// the `504 Gateway Timeout` path reachable.
 pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 30;
 
+/// Default cap on the number of proofs a single presented credential may carry.
+/// An exact-amount PoP token splits one `amount` across power-of-two
+/// denominations, so even a large amount needs only a handful of proofs; 64 is
+/// generous headroom while still bounding a swap-DoS by a token stuffed with
+/// thousands of tiny proofs. Over the cap → a pre-swap 402 `too many proofs`.
+pub const DEFAULT_MAX_PROOFS: usize = 64;
+
 /// Top-level gateway config, deserialized from the mounted TOML.
 ///
 /// Required fields are plain (no `Option`) so a missing key is a serde error
@@ -100,6 +107,13 @@ pub struct ChargeConfig {
     /// Optional human-readable description shown in the challenge.
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Maximum number of proofs a single presented credential may carry — a
+    /// pre-swap DoS guard. A token over this count is rejected with a 402
+    /// (`too many proofs`) BEFORE any mint swap. Defaults to
+    /// [`DEFAULT_MAX_PROOFS`]; must be > 0 when set.
+    #[serde(default = "default_max_proofs")]
+    pub max_proofs: usize,
 }
 
 /// A single `[[routes]]` rule.
@@ -126,6 +140,10 @@ fn default_max_body_bytes() -> usize {
 
 fn default_upstream_timeout_secs() -> u64 {
     DEFAULT_UPSTREAM_TIMEOUT_SECS
+}
+
+fn default_max_proofs() -> usize {
+    DEFAULT_MAX_PROOFS
 }
 
 /// A semantic config failure, naming the field and the human reason. Rendered
@@ -176,6 +194,8 @@ pub struct ValidatedConfig {
     /// The pre-built cashu requirement advertised on the 402 + enforced on
     /// retry. Built once at startup.
     pub requirement: CashuRequirement,
+    /// Per-token max proof count (pre-swap DoS guard; over → 402).
+    pub max_proofs: usize,
     /// Per-path gating rules (possibly empty ⇒ gate all).
     pub routes: Vec<RouteConfig>,
 }
@@ -239,6 +259,15 @@ impl Config {
             return Err(ConfigError::new("max_body_bytes", "must be greater than 0"));
         }
 
+        // charge.max_proofs — strictly positive (0 would reject EVERY token,
+        // since a valid token always carries ≥ 1 proof).
+        if self.charge.max_proofs == 0 {
+            return Err(ConfigError::new(
+                "charge.max_proofs",
+                "must be greater than 0",
+            ));
+        }
+
         // upstream_timeout_secs — 0 means "no timeout" (mapped to None).
         let upstream_timeout = if self.upstream_timeout_secs == 0 {
             None
@@ -282,6 +311,7 @@ impl Config {
             max_body_bytes: self.max_body_bytes,
             upstream_timeout,
             requirement,
+            max_proofs: self.charge.max_proofs,
             routes: self.routes,
         })
     }
@@ -572,6 +602,47 @@ amount = 1
                 DEFAULT_UPSTREAM_TIMEOUT_SECS
             ))
         );
+    }
+
+    #[test]
+    fn max_proofs_defaults_when_omitted() {
+        let cfg = Config::from_toml_str(&valid_toml("/tmp/pops-proofs.jsonl")).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(v.max_proofs, DEFAULT_MAX_PROOFS);
+    }
+
+    #[test]
+    fn explicit_max_proofs_overrides_default() {
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+max_proofs = 8
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(v.max_proofs, 8);
+    }
+
+    #[test]
+    fn zero_max_proofs_is_named_field_error() {
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+max_proofs = 0
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let err = cfg.validate().expect_err("max_proofs=0 must fail");
+        assert_eq!(err.field, "charge.max_proofs");
     }
 
     #[test]

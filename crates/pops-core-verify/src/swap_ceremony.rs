@@ -295,7 +295,21 @@ pub async fn swap_to_redeem<H: MintHttp + ?Sized>(
 
     let swap_request = SwapRequest::new(proofs, pre_mint.blinded_messages());
 
-    let response = http.post_swap(mint_url, swap_request).await?;
+    // The swap POST is the point of no return: once the inputs are submitted, a
+    // transport failure (5xx / read-timeout) leaves the outcome INDETERMINATE —
+    // the mint may have consumed the inputs even though we never read a
+    // response. Re-tag a determinate `Unreachable` from THIS call as
+    // `UnreachableIndeterminate` so the validator surfaces
+    // `indeterminate: true`. The pre-POST GETs above keep plain `Unreachable`
+    // (no inputs submitted yet → a retry is authoritative). `RejectedSwap` /
+    // `SwapOutputDleqInvalid` are definitive mint answers and pass through.
+    let response = http
+        .post_swap(mint_url, swap_request)
+        .await
+        .map_err(|e| match e {
+            MintClientError::Unreachable(msg) => MintClientError::UnreachableIndeterminate(msg),
+            other => other,
+        })?;
 
     // MONEY-SAFETY GATE (must precede construct_proofs): STRICTLY DLEQ-verify
     // every returned blind signature against the active keyset key. A missing
@@ -585,6 +599,91 @@ mod tests {
         assert!(
             matches!(err, MintClientError::SwapOutputDleqInvalid(_)),
             "expected SwapOutputDleqInvalid, got {err:?}"
+        );
+    }
+
+    /// A mock that drives the ceremony's keyset GETs successfully but lets a
+    /// chosen call fail with a transport `Unreachable`, to prove the ceremony
+    /// re-tags ONLY a `post_swap` transport failure as indeterminate.
+    struct TransportFailMint {
+        inner: MockMint,
+        fail_on_post_swap: bool,
+        fail_on_keysets: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl MintHttp for TransportFailMint {
+        async fn get_keysets(
+            &self,
+            mint_url: &MintUrl,
+        ) -> Result<KeysetResponse, MintClientError> {
+            if self.fail_on_keysets {
+                return Err(MintClientError::Unreachable("keysets down".into()));
+            }
+            self.inner.get_keysets(mint_url).await
+        }
+
+        async fn get_keyset_keys(
+            &self,
+            mint_url: &MintUrl,
+            keyset_id: Id,
+        ) -> Result<KeySet, MintClientError> {
+            self.inner.get_keyset_keys(mint_url, keyset_id).await
+        }
+
+        async fn post_swap(
+            &self,
+            mint_url: &MintUrl,
+            request: SwapRequest,
+        ) -> Result<SwapResponse, MintClientError> {
+            if self.fail_on_post_swap {
+                return Err(MintClientError::Unreachable("swap POST timed out".into()));
+            }
+            self.inner.post_swap(mint_url, request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn swap_post_transport_failure_is_retagged_indeterminate() {
+        // A transport `Unreachable` from the swap POST itself must surface as
+        // `UnreachableIndeterminate` — the inputs were submitted, so the
+        // outcome is unknown.
+        let inner = MockMint::new(DleqMode::Valid);
+        let proofs = inputs_for(&inner);
+        let mint = TransportFailMint {
+            inner,
+            fail_on_post_swap: true,
+            fail_on_keysets: false,
+        };
+
+        let err = swap_to_redeem(&mint, &mint_url(), proofs)
+            .await
+            .expect_err("a swap-POST transport failure must error");
+        assert!(
+            matches!(err, MintClientError::UnreachableIndeterminate(_)),
+            "a post_swap transport failure must be re-tagged indeterminate, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_pre_post_keysets_failure_stays_determinate() {
+        // A transport `Unreachable` from a PRE-POST keysets GET (no inputs
+        // submitted yet) must stay the plain determinate `Unreachable` — NOT
+        // re-tagged indeterminate.
+        let inner = MockMint::new(DleqMode::Valid);
+        let proofs = inputs_for(&inner);
+        let mint = TransportFailMint {
+            inner,
+            fail_on_post_swap: false,
+            fail_on_keysets: true,
+        };
+
+        let err = swap_to_redeem(&mint, &mint_url(), proofs)
+            .await
+            .expect_err("a pre-POST keysets failure must error");
+        assert!(
+            matches!(err, MintClientError::Unreachable(_)),
+            "a pre-POST transport failure must stay determinate, got {err:?}"
         );
     }
 

@@ -97,9 +97,26 @@ pub trait MintClient {
 /// Errors returned by [`MintClient`] implementations.
 #[derive(Debug, Error)]
 pub enum MintClientError {
-    /// The mint could not be reached (DNS, TCP, TLS, timeout, etc.).
+    /// The mint could not be reached (DNS, TCP, TLS, timeout, etc.) on a call
+    /// whose outcome is DETERMINATE — i.e. BEFORE the swap inputs were
+    /// submitted (a keysets/keys GET, or a connect failure on the swap POST that
+    /// never left our side). The token was NOT consumed; a retry with the SAME
+    /// token is safe and authoritative.
     #[error("mint unreachable: {0}")]
     Unreachable(String),
+
+    /// A transport failure on the swap POST ITSELF (5xx / read-timeout AFTER the
+    /// request was sent), so the swap outcome is INDETERMINATE: the mint MAY
+    /// have already consumed the inputs even though we never read a response.
+    ///
+    /// Distinct from [`Self::Unreachable`] (a pre-submit/determinate failure) so
+    /// the validator can surface the contract's
+    /// `ChargeError::MintUnreachable { indeterminate: true }` — same 503+retry,
+    /// but the operator MUST NOT assume the token is still good without a
+    /// checkstate (spec §Durability). Raised ONLY by the swap ceremony around
+    /// `post_swap`; the pre-POST GETs keep [`Self::Unreachable`].
+    #[error("mint unreachable (indeterminate swap outcome): {0}")]
+    UnreachableIndeterminate(String),
 
     /// The mint reached us but refused the swap (expired credential,
     /// double-spent proof, invalid signature, keyset rotated, etc.).

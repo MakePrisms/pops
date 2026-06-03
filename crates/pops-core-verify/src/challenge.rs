@@ -79,16 +79,33 @@ pub fn encode_challenge(req: &CashuRequirement) -> String {
     req.to_payment_request().to_string()
 }
 
-/// Decode the `cashuB.../cashuA...` token string the client returns in
-/// the credentials payload on a retry.
+/// Decode the `cashuB...` token string the client returns in the credentials
+/// payload on a retry.
 ///
-/// Returns `InvalidHeader` when the value lacks a recognized cashu token
-/// prefix, `DecodeFailed` when the payload itself is malformed.
+/// CONTRACT: this intent is **cashuB / TokenV4 ONLY**. A `cashuA…` (TokenV3)
+/// serialization is REJECTED with `InvalidHeader` even though it is a
+/// well-formed cashu token — V3 makes the unit optional on the wire and lacks
+/// the V4 keyset framing the swap ceremony relies on, so the verifier never
+/// accepts one. (The `cashu` crate would otherwise happily parse a `cashuA`
+/// string into a `Token::TokenV3`; we gate it at the prefix here, before the
+/// parse, so no V3 token ever reaches the validator.)
+///
+/// Returns `InvalidHeader` when the value lacks the `cashuB` prefix (including
+/// a `cashuA`/V3 token), `DecodeFailed` when the `cashuB` payload itself is
+/// malformed.
 pub fn decode_token(token_str: &str) -> Result<Token, Error> {
     let trimmed = token_str.trim();
-    if !(trimmed.starts_with("cashuA") || trimmed.starts_with("cashuB")) {
+    if trimmed.starts_with("cashuA") {
+        // A structurally-valid TokenV3 — but out of contract. Reject explicitly
+        // so the caller's `MalformedCredential` body names the cashuB-only rule
+        // rather than failing later for a missing unit.
+        return Err(Error::InvalidHeader(
+            "cashuA (TokenV3) is not accepted; this intent is cashuB/TokenV4 only".to_string(),
+        ));
+    }
+    if !trimmed.starts_with("cashuB") {
         return Err(Error::InvalidHeader(format!(
-            "expected cashuA/cashuB prefix, got {:?}",
+            "expected cashuB prefix, got {:?}",
             trimmed.chars().take(8).collect::<String>()
         )));
     }
@@ -194,6 +211,40 @@ mod tests {
             matches!(err, Error::InvalidHeader(_)),
             "expected InvalidHeader, got {err:?}"
         );
+    }
+
+    /// A real, well-formed `cashuA` (TokenV3) string lifted from
+    /// cashu-0.16.0 `nuts::nut00::token::tests`. The `cashu` crate parses it
+    /// fine, but the charge contract is cashuB/TokenV4 ONLY, so `decode_token`
+    /// must reject it at the prefix — BEFORE attempting the parse — with
+    /// `InvalidHeader`.
+    const VALID_CASHU_A_V3: &str = "cashuAeyJ0b2tlbiI6W3sibWludCI6Imh0dHBzOi8vODMzMy5zcGFjZTozMzM4IiwicHJvb2ZzIjpbeyJhbW91bnQiOjIsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6IjQwNzkxNWJjMjEyYmU2MWE3N2UzZTZkMmFlYjRjNzI3OTgwYmRhNTFjZDA2YTZhZmMyOWUyODYxNzY4YTc4MzciLCJDIjoiMDJiYzkwOTc5OTdkODFhZmIyY2M3MzQ2YjVlNDM0NWE5MzQ2YmQyYTUwNmViNzk1ODU5OGE3MmYwY2Y4NTE2M2VhIn0seyJhbW91bnQiOjgsImlkIjoiMDA5YTFmMjkzMjUzZTQxZSIsInNlY3JldCI6ImZlMTUxMDkzMTRlNjFkNzc1NmIwZjhlZTBmMjNhNjI0YWNhYTNmNGUwNDJmNjE0MzNjNzI4YzcwNTdiOTMxYmUiLCJDIjoiMDI5ZThlNTA1MGI4OTBhN2Q2YzA5NjhkYjE2YmMxZDVkNWZhMDQwZWExZGUyODRmNmVjNjlkNjEyOTlmNjcxMDU5In1dfV0sInVuaXQiOiJzYXQiLCJtZW1vIjoiVGhhbmsgeW91IHZlcnkgbXVjaC4ifQ==";
+
+    #[test]
+    fn decode_token_rejects_cashu_a_v3() {
+        // Contract is cashuB/TokenV4 only. A structurally-valid cashuA/TokenV3
+        // must be rejected at the prefix with InvalidHeader (NOT decoded into a
+        // TokenV3, NOT surfaced as a DecodeFailed).
+        let err = decode_token(VALID_CASHU_A_V3).expect_err("cashuA must be rejected");
+        match err {
+            Error::InvalidHeader(msg) => {
+                assert!(
+                    msg.to_ascii_lowercase().contains("cashua")
+                        || msg.contains("TokenV3")
+                        || msg.contains("cashuB"),
+                    "rejection should name the cashuB-only rule, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidHeader for cashuA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_token_rejects_cashu_a_even_with_whitespace() {
+        // The prefix gate runs after trim, so a padded cashuA is still rejected.
+        let padded = format!("  {VALID_CASHU_A_V3}\n");
+        let err = decode_token(&padded).expect_err("padded cashuA must be rejected");
+        assert!(matches!(err, Error::InvalidHeader(_)), "got {err:?}");
     }
 
     #[test]
