@@ -6,9 +6,19 @@
 #
 # Build context = the WORKSPACE ROOT (the gateway depends on the sibling
 # path-crates pops-core-verify / pops-core-types, and on cdk as a git dep, so
-# the whole workspace + .cargo/config.toml must be in context):
+# the whole workspace + .cargo/config.toml must be in context).
 #
-#   docker build -f crates/pops-gateway/Dockerfile -t pops-gateway .
+# The cdk git dep (MakePrisms/cdk, branch feat/cdk-pop-readonly) is a PRIVATE
+# repo, so the builder needs a read credential. It is supplied as a BuildKit
+# secret (never baked into a layer). Working build command:
+#
+#   DOCKER_BUILDKIT=1 docker build \
+#     --secret id=ghtoken,src=<(gh auth token) \
+#     -f crates/pops-gateway/Dockerfile -t pops-gateway .
+#
+# (`gh auth token` must print a token with `repo` read on MakePrisms/cdk.)
+# In CI the secret src is a file/env holding a token (or deploy key) with the
+# same read access — see ghcr publish notes.
 #
 # (The published image — ghcr.io/makeprisms/pops-gateway — is produced by
 # CI/release; this Dockerfile is the buildable shape, no local build for the
@@ -32,7 +42,14 @@ WORKDIR /build
 # CLI fetcher). A release build of just the gateway binary.
 COPY . .
 
-RUN cargo build --release --locked -p pops-gateway
+# The cdk git dep is private: mount the read token as a BuildKit secret and rewrite
+# https://github.com/ -> token-authenticated HTTPS for the duration of this RUN.
+# The token lives only in the build secret tmpfs (not in any image layer), and the
+# git insteadOf rewrite is set on a throwaway global config in this layer.
+# Relies on .cargo/config.toml `git-fetch-with-cli = true` (cargo's libgit2
+# fetcher would ignore this insteadOf; only the git CLI honors it).
+RUN --mount=type=secret,id=ghtoken \
+    sh -c 'git config --global url."https://$(cat /run/secrets/ghtoken)@github.com/".insteadOf "https://github.com/" && cargo build --release --locked -p pops-gateway'
 
 # ── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
