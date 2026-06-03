@@ -33,30 +33,54 @@ use crate::SCHEMA_VERSION;
 const SECS_PER_DAY: u64 = 86_400;
 
 /// Arguments for `pop mint`.
+///
+/// `--mint-url`, `--amount`, and exactly one of `{--duration, --unit}` are
+/// REQUIRED for a fresh `pop mint` (quote + poll + mint in one), but all are
+/// OPTIONAL with `--resume <id>`: a resume reloads the mint URL, amount, and unit
+/// from the persisted deposit, so `pop mint --resume <id>` works bare (the form
+/// every doc/example shows).
 #[derive(Debug, Parser)]
+#[command(group(
+    // Exactly one of duration|unit picks the credential's lifetime/unit (mutual
+    // exclusion). It is NOT marked required at the group level because clap's
+    // ArgGroup can't express "required UNLESS --resume"; the conditional
+    // "required for a fresh mint" check lives in `validate_mint_unit_group`
+    // (called from `main`), which raises a clap usage error (exit 2) — matching
+    // `quote`'s required group and avoiding the cryptic mint-side
+    // "Unit unsupported" (11013).
+    clap::ArgGroup::new("unit_or_duration")
+        .args(["duration", "unit"])
+        .required(false)
+        .multiple(false)
+))]
 pub struct MintArgs {
-    /// Mint base URL (e.g. `https://mint.example`).
-    #[arg(long, value_name = "URL")]
-    pub mint_url: String,
+    /// Mint base URL (e.g. `https://mint.example`). Required for a fresh mint;
+    /// loaded from the deposit with `--resume`.
+    #[arg(long, value_name = "URL", required_unless_present = "resume")]
+    pub mint_url: Option<String>,
 
-    /// Amount to lock + mint, in sats.
-    #[arg(long, value_name = "SATS")]
-    pub amount: u64,
+    /// Amount to lock + mint, in sats. Required for a fresh mint; loaded from the
+    /// deposit with `--resume`.
+    #[arg(long, value_name = "SATS", required_unless_present = "resume")]
+    pub amount: Option<u64>,
 
     /// Credential lifetime as a duration (e.g. `30d`, `12h`). `ts = now + dur`.
-    /// Mutually exclusive with `--unit`.
+    /// Mutually exclusive with `--unit`; one of the two is required for a fresh
+    /// mint (loaded from the deposit with `--resume`).
     #[arg(long, value_name = "DUR", conflicts_with = "unit")]
     pub duration: Option<String>,
 
-    /// Explicit unit `pop_<ts_expiry>`. Mutually exclusive with `--duration`.
+    /// Explicit unit `pop_<ts_expiry>`. Mutually exclusive with `--duration`; one
+    /// of the two is required for a fresh mint (loaded from the deposit with
+    /// `--resume`).
     #[arg(long, value_name = "pop_<ts>")]
     pub unit: Option<String>,
 
-    /// The mint's 33-byte compressed identity pubkey (hex). REQUIRED on first
-    /// use of a mint (TOFU-pinned into config.toml); it is the value committed
-    /// into `cm` and is needed to independently verify the funding address.
-    /// On later mints to the same mint it must match the pin or it's a hard
-    /// error.
+    /// The mint's 33-byte compressed identity pubkey (66 hex chars), available
+    /// from the mint's `GET /v1/info` endpoint. REQUIRED on first use of a mint
+    /// (TOFU-pinned into config.toml); it is the value committed into `cm` and is
+    /// needed to independently verify the funding address. On later mints to the
+    /// same mint it must match the pin or it's a hard error.
     #[arg(long, value_name = "HEX33")]
     pub mint_pubkey: Option<String>,
 
@@ -76,9 +100,29 @@ pub struct MintArgs {
     #[arg(long, value_name = "PATH")]
     pub token_out: Option<std::path::PathBuf>,
 
-    /// Resume an existing open deposit by id (skip quote-create; reattach).
+    /// Resume an existing open deposit by id (skip quote-create; reattach). When
+    /// set, `--mint-url`/`--amount`/`--duration`/`--unit` are all optional and
+    /// reloaded from the persisted deposit.
     #[arg(long, value_name = "DEPOSIT_ID")]
     pub resume: Option<String>,
+}
+
+impl MintArgs {
+    /// The amount for a FRESH mint. Clap requires `--amount` unless `--resume` is
+    /// present, so on the fresh path it is always `Some`; a `None` here is an
+    /// internal invariant break (the resume path never calls this).
+    fn required_amount(&self) -> Result<u64, Box<dyn std::error::Error>> {
+        self.amount.ok_or_else(|| {
+            PopError::internal("--amount missing on a fresh mint (clap should have required it)").into()
+        })
+    }
+
+    /// True iff this is a FRESH mint (no `--resume`) that supplied NEITHER
+    /// `--duration` nor `--unit` — the case that would otherwise reach the mint
+    /// and fail with the cryptic "Unit unsupported" (11013).
+    pub fn missing_required_unit_group(&self) -> bool {
+        self.resume.is_none() && self.duration.is_none() && self.unit.is_none()
+    }
 }
 
 /// The product of the shared pre-poll half of the flow: the quote has been
@@ -138,6 +182,9 @@ pub async fn create_and_persist_quote(
 ) -> Result<QuoteOutcome, Box<dyn std::error::Error>> {
     let network = wallet.network();
 
+    // ---- Resolve the required fresh-mint amount (clap-guaranteed Some here). ----
+    let amount = args.required_amount()?;
+
     // ---- Resolve the unit. ----
     let unit_str = resolve_unit(args)?;
     let ts_expiry = parse_unit_ts(&unit_str)?;
@@ -155,8 +202,8 @@ pub async fn create_and_persist_quote(
     let funder_cdk = mint_client::parse_cdk_secret(&funder_secret_hex)?;
 
     // ---- Create the quote. ----
-    eprintln!("Creating quote at {base} for {} sats ...", args.amount);
-    let quote = mint_client::create_quote(http, base, args.amount, &unit_str, &funder_cdk).await?;
+    eprintln!("Creating quote at {base} for {amount} sats ...");
+    let quote = mint_client::create_quote(http, base, amount, &unit_str, &funder_cdk).await?;
 
     // ---- Pin the mint identity key (TOFU) + INDEPENDENTLY verify the address.
     let nonce = require_nonce(&quote)?;
@@ -184,7 +231,7 @@ pub async fn create_and_persist_quote(
         mint_url: base.to_string(),
         unit: unit_str.clone(),
         ts_expiry,
-        amount: args.amount,
+        amount,
         funder_index: index,
         funder_pubkey: hex::encode(funder.xonly.serialize()),
         quote_lock_pubkey: funder_cdk.public_key().to_hex(),
@@ -206,7 +253,7 @@ pub async fn create_and_persist_quote(
         &deposit_id,
         args.label.as_deref(),
         base,
-        args.amount,
+        amount,
         &unit_str,
         &params,
         &derivation_path,
@@ -219,7 +266,7 @@ pub async fn create_and_persist_quote(
         deposit_id,
         unit_str,
         ts_expiry,
-        amount: args.amount,
+        amount,
         construction,
         derivation_path,
         quote_id: quote.quote,
@@ -238,15 +285,26 @@ pub async fn run(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut wallet = Wallet::open(wallet_dir)?;
-    let base = args.mint_url.trim_end_matches('/').to_string();
     let http = reqwest::Client::new();
 
     // Load the seed up front (mint always needs the funder key).
     let seed = wallet.load_seed()?;
 
     if let Some(deposit_id) = &args.resume {
-        return resume(&mut wallet, &http, &base, deposit_id, &seed, args, json).await;
+        // Resume reloads mint_url + amount + unit from the persisted deposit, so
+        // `pop mint --resume <id>` works WITHOUT --mint-url/--amount/--unit.
+        return resume(&mut wallet, &http, deposit_id, &seed, args, json).await;
     }
+
+    // Fresh mint: --mint-url is clap-required here (required_unless_present resume).
+    let base = args
+        .mint_url
+        .as_deref()
+        .ok_or_else(|| {
+            PopError::internal("--mint-url missing on a fresh mint (clap should have required it)")
+        })?
+        .trim_end_matches('/')
+        .to_string();
 
     // ---- Shared pre-poll half: quote -> verify -> persist -> recovery file. ----
     let outcome =
@@ -267,11 +325,13 @@ pub async fn run(
         "\nWaiting for funding (poll every {}s, timeout {}s) ...",
         args.poll_interval, args.poll_timeout
     );
+    let network = wallet.network();
     let paid = mint_client::poll_until_paid(
         &http,
         &base,
         &outcome.quote_id,
         &outcome.construction.address,
+        network,
         Duration::from_secs(args.poll_interval),
         Duration::from_secs(args.poll_timeout),
     )
@@ -305,10 +365,15 @@ pub async fn run(
 
 /// `--resume` path: reattach to an open deposit and re-run from the funding
 /// poll (or directly mint if already PAID).
+///
+/// The mint URL, amount, and unit come from the PERSISTED deposit — `--resume`
+/// needs none of `--mint-url`/`--amount`/`--duration`/`--unit`. If the caller
+/// redundantly passes `--mint-url`/`--amount`, the persisted values still win,
+/// but a real mismatch is rejected (`invalid_input`) so a copy-paste error
+/// against the wrong deposit can't silently target a different mint/amount.
 async fn resume(
     wallet: &mut Wallet,
     http: &reqwest::Client,
-    base: &str,
     deposit_id: &str,
     seed: &[u8],
     args: &MintArgs,
@@ -320,6 +385,32 @@ async fn resume(
         .ok_or_else(|| PopError::DepositNotFound {
             deposit_id: deposit_id.to_string(),
         })?;
+
+    // Mint URL + amount come from the deposit (persisted wins). Validate any
+    // redundantly-supplied flags match, rather than silently ignoring a wrong one.
+    let base = dep.mint_url.trim_end_matches('/').to_string();
+    if let Some(supplied) = args.mint_url.as_deref() {
+        if supplied.trim_end_matches('/') != base {
+            return Err(PopError::invalid_input(format!(
+                "--mint-url ({supplied}) does not match deposit {deposit_id}'s mint ({}); \
+                 --resume uses the persisted mint — omit --mint-url",
+                dep.mint_url
+            ))
+            .into());
+        }
+    }
+    if let Some(supplied) = args.amount {
+        if supplied != dep.amount {
+            return Err(PopError::invalid_input(format!(
+                "--amount ({supplied}) does not match deposit {deposit_id}'s amount ({}); \
+                 --resume uses the persisted amount — omit --amount",
+                dep.amount
+            ))
+            .into());
+        }
+    }
+    let base = base.as_str();
+
     if dep.state == DepositState::Minted {
         return Err(PopError::invalid_input(format!(
             "deposit {deposit_id} is already Minted"
@@ -345,11 +436,13 @@ async fn resume(
 
     eprintln!("Resuming deposit {deposit_id} (state {:?}).", dep.state);
     if dep.state == DepositState::Unpaid {
+        let network = wallet.network();
         let paid = mint_client::poll_until_paid(
             http,
             base,
             &dep.quote_id,
             &dep.funding_address,
+            network,
             Duration::from_secs(args.poll_interval),
             Duration::from_secs(args.poll_timeout),
         )

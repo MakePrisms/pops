@@ -54,7 +54,9 @@ fn parse_single_json(stdout: &str) -> serde_json::Value {
 }
 
 /// (a) A success command (`init`) emits a valid JSON object carrying
-/// `schema_version` on stdout, exit 0.
+/// `schema_version` on stdout, exit 0. SECURITY: by default the mnemonic is NOT
+/// on the stdout parse channel — it's marked `mnemonic_delivery: "stderr"` and
+/// the secret line itself appears on stderr.
 #[test]
 fn success_emits_json_with_schema_version_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
@@ -67,8 +69,37 @@ fn success_emits_json_with_schema_version_on_stdout() {
     assert_eq!(v["schema_version"], serde_json::json!(1));
     // init success fields preserved.
     assert_eq!(v["network"], serde_json::json!("regtest"));
-    assert!(v["mnemonic"].is_string());
     assert_eq!(v["imported"], serde_json::json!(false));
+    // SECURITY: the secret mnemonic is NOT on stdout by default.
+    assert!(
+        v.get("mnemonic").is_none(),
+        "default stdout JSON must not carry the mnemonic; got:\n{}",
+        out.stdout
+    );
+    assert_eq!(v["mnemonic_delivery"], serde_json::json!("stderr"));
+    // The actual mnemonic line went to stderr (clearly labelled, shown once).
+    assert!(
+        out.stderr.contains("mnemonic (write this down, shown once):"),
+        "the mnemonic should be printed to stderr; got:\n{}",
+        out.stderr
+    );
+}
+
+/// (item 1, SECURITY) With `--show-mnemonic` the caller explicitly opts in to
+/// capturing the secret on stdout: the stdout JSON DOES carry `mnemonic` and
+/// `mnemonic_delivery` flips to `"stdout"`.
+#[test]
+fn init_show_mnemonic_puts_mnemonic_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_pop(dir.path(), &["init", "--network", "regtest", "--show-mnemonic"]);
+    assert_eq!(out.code, 0, "init --show-mnemonic should succeed; stderr:\n{}", out.stderr);
+    let v = parse_single_json(&out.stdout);
+    assert!(
+        v["mnemonic"].is_string() && !v["mnemonic"].as_str().unwrap().is_empty(),
+        "with --show-mnemonic the stdout JSON must carry the mnemonic; got:\n{}",
+        out.stdout
+    );
+    assert_eq!(v["mnemonic_delivery"], serde_json::json!("stdout"));
 }
 
 /// (a) `list` is the canonical pure-json default: an envelope with
@@ -264,16 +295,35 @@ fn error_envelope_network_mismatch_has_required_details() {
     assert_eq!(v["error"]["retriable"], serde_json::json!(false));
 }
 
-/// invalid_input for a bad `--state` filter: message-only, exit 1.
+/// invalid_input (message-only, exit 1) for a bad `--network` at `init`. (The
+/// `--state` filter is now a clap ValueEnum, so a bad `--state` is instead a clap
+/// usage error exit 2 — covered by `invalid_state_filter_is_clap_exit_2`.)
 #[test]
 fn error_envelope_invalid_input() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
-    let out = run_pop(dir.path(), &["list", "--state", "bogus"]);
+    let out = run_pop(dir.path(), &["init", "--network", "bogus"]);
     assert_eq!(out.code, 1, "stderr:\n{}", out.stderr);
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("invalid_input"));
     assert!(v["error"].get("details").is_none());
+}
+
+/// (item 8) `--state` is a clap ValueEnum: an unknown value is a clap USAGE error
+/// (exit 2, no envelope), and `--help` enumerates the accepted values.
+#[test]
+fn invalid_state_filter_is_clap_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    let out = run_pop(dir.path(), &["list", "--state", "bogus"]);
+    assert_eq!(out.code, 2, "bad --state must be a clap usage error; stderr:\n{}", out.stderr);
+    // The accepted values are enumerated in the clap error/help.
+    assert!(
+        out.stderr.contains("unpaid") && out.stderr.contains("expired"),
+        "clap should list the valid --state values; got:\n{}",
+        out.stderr
+    );
+    // A valid value still works (exit 0).
+    assert_eq!(run_pop(dir.path(), &["list", "--state", "minted"]).code, 0);
 }
 
 /// (c) stdout-purity: even when there ARE diagnostics, json-mode stdout stays a
@@ -360,4 +410,143 @@ fn unknown_subcommand_is_exit_2() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_pop(dir.path(), &["frobnicate"]);
     assert_eq!(out.code, 2);
+}
+
+/// (item 11) `pay` is an unbuilt phase-2 verb and must NOT present as an exit-0
+/// command: `pop pay` is an unknown subcommand (clap exit 2). (No stub exists in
+/// the Cmd enum, so this holds without code removal.)
+#[test]
+fn pay_subcommand_is_unknown_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["pay"]).code, 2);
+    assert_eq!(run_pop(dir.path(), &["pay", "--help"]).code, 2);
+}
+
+/// (item 2) `pop mint --resume <id>` parses WITHOUT --mint-url/--amount/--unit:
+/// it gets PAST clap (exit != 2) and fails at runtime with the app-level
+/// `deposit_not_found` envelope (exit 1) for an unknown id — proving the bare
+/// resume form is accepted at the arg-parse layer.
+#[test]
+fn mint_resume_parses_without_mint_url_or_amount() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+
+    let out = run_pop(dir.path(), &["mint", "--resume", "no-such-deposit-id"]);
+    // NOT a clap usage error: bare `--resume` is a valid invocation.
+    assert_ne!(out.code, 2, "bare `mint --resume <id>` must parse; stderr:\n{}", out.stderr);
+    assert_eq!(out.code, 1, "expected an app-level error; stderr:\n{}", out.stderr);
+    let v = parse_single_json(&out.stdout);
+    assert_eq!(v["error"]["code"], serde_json::json!("deposit_not_found"));
+    assert_eq!(v["error"]["details"]["deposit_id"], serde_json::json!("no-such-deposit-id"));
+}
+
+/// (item 2) A FRESH `pop mint` (no --resume) WITHOUT --mint-url/--amount is a
+/// clap usage error (exit 2): those are required for a fresh mint.
+#[test]
+fn fresh_mint_without_required_args_is_clap_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    // No --mint-url, no --amount, no --resume → clap usage error.
+    let out = run_pop(dir.path(), &["mint", "--duration", "30d"]);
+    assert_eq!(out.code, 2, "fresh mint missing --mint-url/--amount must be exit 2; stderr:\n{}", out.stderr);
+}
+
+/// (item 3) A fresh `pop mint` with NEITHER --duration NOR --unit is a clap usage
+/// error (exit 2) — never the mint-side "Unit unsupported" (11013).
+#[test]
+fn fresh_mint_without_unit_group_is_clap_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    let out = run_pop(
+        dir.path(),
+        &["mint", "--mint-url", "https://mint.example", "--amount", "1000"],
+    );
+    assert_eq!(out.code, 2, "missing unit/duration must be exit 2; stderr:\n{}", out.stderr);
+}
+
+/// (item 3) `pop quote` with NEITHER --duration NOR --unit is a clap usage error
+/// (exit 2) via the required ArgGroup.
+#[test]
+fn quote_without_unit_group_is_clap_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    let out = run_pop(
+        dir.path(),
+        &["quote", "--mint-url", "https://mint.example", "--amount", "1000", "--mint-pubkey", "02ab"],
+    );
+    assert_eq!(out.code, 2, "quote missing unit/duration must be exit 2; stderr:\n{}", out.stderr);
+}
+
+/// (item 3) Supplying BOTH --duration and --unit is mutually exclusive (clap exit
+/// 2), for both quote and mint.
+#[test]
+fn duration_and_unit_together_is_clap_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    let out = run_pop(
+        dir.path(),
+        &[
+            "quote", "--mint-url", "https://mint.example", "--amount", "1000",
+            "--mint-pubkey", "02ab", "--duration", "30d", "--unit", "pop_1788000000",
+        ],
+    );
+    assert_eq!(out.code, 2, "duration+unit together must be exit 2; stderr:\n{}", out.stderr);
+}
+
+/// (item 4) `recover --all` on a ledger with NO funded candidates is an empty
+/// SUCCESS: stdout is `{schema_version, tip_height:null, tip_mtp:null,
+/// results:[]}`, exit 0 — and it makes NO chain call (so it can't fail
+/// chain_unreachable even with an unroutable esplora). Previously this was an
+/// `invalid_input` error.
+#[test]
+fn recover_all_empty_is_success_with_no_chain_call() {
+    let dir = tempfile::tempdir().unwrap();
+    // Unroutable esplora: if recover tried the tip fetch it would fail; the empty
+    // sweep must NOT touch the chain, so it still succeeds.
+    assert_eq!(
+        run_pop(
+            dir.path(),
+            &["init", "--network", "regtest", "--esplora-url", "http://127.0.0.1:1"],
+        )
+        .code,
+        0
+    );
+
+    let out = run_pop(
+        dir.path(),
+        &["recover", "--all", "--dest", "bcrt1psjw4ymy3cl0a2cp32nnh4kjj9fus8m5daust4kd4hzwnkm7ctmhq29z2wd"],
+    );
+    assert_eq!(out.code, 0, "empty --all sweep must succeed; stderr:\n{}", out.stderr);
+    let v = parse_single_json(&out.stdout);
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(v["tip_height"], serde_json::json!(null));
+    assert_eq!(v["tip_mtp"], serde_json::json!(null));
+    assert!(v["results"].as_array().unwrap().is_empty());
+    // No chain call: no esplora-unreachable warning should appear.
+    assert!(
+        !out.stderr.contains("esplora"),
+        "empty --all sweep must not touch the chain; got stderr:\n{}",
+        out.stderr
+    );
+}
+
+/// (item 7) A malformed `--dest` surfaces a clear `invalid_input` message that
+/// does NOT leak the misleading raw "base58" prose for a bad bech32 string.
+#[test]
+fn recover_malformed_dest_message_is_clear_no_base58() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    let out = run_pop(dir.path(), &["recover", "--all", "--dest", "not-an-address"]);
+    assert_eq!(out.code, 1, "stderr:\n{}", out.stderr);
+    let v = parse_single_json(&out.stdout);
+    assert_eq!(v["error"]["code"], serde_json::json!("invalid_input"));
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("not a valid bitcoin address"),
+        "expected a clear address message; got: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("base58"),
+        "must not leak the misleading base58 prose; got: {msg}"
+    );
 }

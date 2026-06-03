@@ -29,7 +29,7 @@ pub use error::{PopError, SCHEMA_VERSION};
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 // `recovery_address` (the P2TR wrap of an already-tweaked output key) now lives
 // in the `pops-core-funder` kernel as `pops_core_funder::recovery_address`; the
@@ -91,6 +91,24 @@ async fn main() {
     // which surface to write to even if a command fails. Clap usage errors
     // (exit 2) are handled inside `Cli::parse()` before we get here.
     let cli = Cli::parse();
+
+    // Post-parse usage validation that clap's ArgGroup can't express. A fresh
+    // `pop mint` (no --resume) MUST pick a unit/lifetime via exactly one of
+    // {--duration, --unit}; missing both is a clap USAGE error (exit 2), not a
+    // mint-side "Unit unsupported" surprise. (A resume loads the unit from the
+    // deposit, so it's exempt — mirrors `quote`'s required group.)
+    if let Cmd::Mint(margs) = &cli.cmd {
+        if margs.missing_required_unit_group() {
+            Cli::command()
+                .error(
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "a fresh `pop mint` requires exactly one of --duration <DUR> or --unit pop_<ts> \
+                     (or use --resume <deposit_id> to reload the unit from a persisted deposit)",
+                )
+                .exit();
+        }
+    }
+
     let human = cli.human;
 
     if let Err(e) = run(cli).await {

@@ -27,6 +27,16 @@ use crate::wallet::Wallet;
 /// Arguments for `pop quote`. These mirror the relevant `pop mint` args; the
 /// funding-poll / token-output / resume knobs do not apply (quote never polls).
 #[derive(Debug, Parser)]
+#[command(group(
+    // A quote ALWAYS needs a unit/lifetime, so exactly one of duration|unit is
+    // required here (unlike mint, which can resume one from a deposit). Missing
+    // both is a clean clap usage error (exit 2) instead of the mint-side
+    // "Unit unsupported" (11013) failure.
+    clap::ArgGroup::new("unit_or_duration")
+        .args(["duration", "unit"])
+        .required(true)
+        .multiple(false)
+))]
 pub struct QuoteArgs {
     /// Mint base URL (e.g. `https://mint.example`).
     #[arg(long, value_name = "URL")]
@@ -45,9 +55,10 @@ pub struct QuoteArgs {
     #[arg(long, value_name = "pop_<ts>")]
     pub unit: Option<String>,
 
-    /// The mint's 33-byte compressed identity pubkey (hex). REQUIRED on first
-    /// use of a mint (TOFU-pinned into config.toml); it is the value committed
-    /// into `cm` and is needed to independently verify the funding address.
+    /// The mint's 33-byte compressed identity pubkey (66 hex chars), available
+    /// from the mint's `GET /v1/info` endpoint. REQUIRED on first use of a mint
+    /// (TOFU-pinned into config.toml); it is the value committed into `cm` and is
+    /// needed to independently verify the funding address.
     #[arg(long, value_name = "HEX33")]
     pub mint_pubkey: Option<String>,
 
@@ -62,8 +73,8 @@ impl QuoteArgs {
     /// `create_and_persist_quote` and are left at inert defaults.
     fn as_mint_args(&self) -> MintArgs {
         MintArgs {
-            mint_url: self.mint_url.clone(),
-            amount: self.amount,
+            mint_url: Some(self.mint_url.clone()),
+            amount: Some(self.amount),
             duration: self.duration.clone(),
             unit: self.unit.clone(),
             mint_pubkey: self.mint_pubkey.clone(),
@@ -143,8 +154,8 @@ mod tests {
             label: Some("rent".to_string()),
         };
         let m = q.as_mint_args();
-        assert_eq!(m.mint_url, "https://mint.example");
-        assert_eq!(m.amount, 12_345);
+        assert_eq!(m.mint_url.as_deref(), Some("https://mint.example"));
+        assert_eq!(m.amount, Some(12_345));
         assert_eq!(m.duration.as_deref(), Some("30d"));
         assert_eq!(m.unit, None);
         assert_eq!(m.mint_pubkey.as_deref(), Some("02ab"));

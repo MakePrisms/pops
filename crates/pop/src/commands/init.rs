@@ -48,6 +48,15 @@ pub struct InitArgs {
     /// can re-init headlessly). No effect without `--force`.
     #[arg(long)]
     pub yes: bool,
+
+    /// ALSO include the BIP-39 mnemonic in the stdout JSON (explicit opt-in for a
+    /// caller that really wants to capture the secret programmatically). By
+    /// DEFAULT the mnemonic is NEVER on stdout — it is printed to STDERR only,
+    /// and stdout carries `"mnemonic_delivery": "stderr"` instead. Passing this
+    /// flag puts the secret on the same channel agents are told to parse/log, so
+    /// only use it deliberately.
+    #[arg(long)]
+    pub show_mnemonic: bool,
 }
 
 /// Runs `pop init`.
@@ -124,6 +133,12 @@ pub fn run(args: &InitArgs, wallet_dir: &Path, json: bool) -> Result<(), Box<dyn
     std::fs::create_dir_all(crate::wallet::recovery_dir(wallet_dir))
         .map_err(|e| format!("failed to create recovery dir: {e}"))?;
 
+    // SECURITY: the mnemonic is the only secret and MUST NOT land on the stdout
+    // parse channel (the channel agents are told to parse AND log) by default. We
+    // always write it to STDERR as a clearly-labelled human line, and only echo
+    // it into the stdout JSON when `--show-mnemonic` is an explicit opt-in.
+    eprintln!("mnemonic (write this down, shown once): {mnemonic}");
+
     if json {
         let out = init_json(
             wallet_dir,
@@ -131,6 +146,7 @@ pub fn run(args: &InitArgs, wallet_dir: &Path, json: bool) -> Result<(), Box<dyn
             &config.esplora_url,
             &mnemonic.to_string(),
             imported,
+            args.show_mnemonic,
         );
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
@@ -138,7 +154,6 @@ pub fn run(args: &InitArgs, wallet_dir: &Path, json: bool) -> Result<(), Box<dyn
             wallet_dir,
             network,
             &config.esplora_url,
-            &mnemonic,
             word_count,
             imported,
         );
@@ -146,23 +161,38 @@ pub fn run(args: &InitArgs, wallet_dir: &Path, json: bool) -> Result<(), Box<dyn
     Ok(())
 }
 
-/// Builds the `--json` object for a completed init/import. Extracted so the
+/// Builds the stdout JSON object for a completed init/import. Extracted so the
 /// exact output shape can be asserted in a test.
+///
+/// SECURITY: by default the secret `mnemonic` is OMITTED from this object (it is
+/// delivered on stderr only) and a non-secret `"mnemonic_delivery": "stderr"`
+/// marker tells the caller where it went. When `show_mnemonic` is set the caller
+/// has explicitly opted in to capturing the secret on stdout, so the `mnemonic`
+/// field is included instead (and `mnemonic_delivery` becomes `"stdout"`).
 fn init_json(
     wallet_dir: &Path,
     network: Network,
     esplora_url: &str,
     mnemonic: &str,
     imported: bool,
+    show_mnemonic: bool,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "wallet_dir": wallet_dir.to_string_lossy(),
         "network": network_name(network),
         "esplora_url": esplora_url,
-        "mnemonic": mnemonic,
         "imported": imported,
-    })
+    });
+    if show_mnemonic {
+        // Explicit opt-in: the secret is on stdout AND we mark that fact.
+        out["mnemonic"] = serde_json::json!(mnemonic);
+        out["mnemonic_delivery"] = serde_json::json!("stdout");
+    } else {
+        // Default: secret stays off the parse channel; mark where it was sent.
+        out["mnemonic_delivery"] = serde_json::json!("stderr");
+    }
+    out
 }
 
 /// Requires the user to type the wallet path to confirm a destructive re-init,
@@ -199,7 +229,6 @@ fn print_success(
     wallet_dir: &Path,
     network: Network,
     esplora_url: &str,
-    mnemonic: &Mnemonic,
     word_count: usize,
     imported: bool,
 ) {
@@ -209,9 +238,9 @@ fn print_success(
     println!("  esplora:  {esplora_url}");
     println!();
     println!("==================== WRITE THIS DOWN — THE ONLY SECRET ====================");
-    println!("Your {word_count}-word recovery mnemonic (shown once):");
-    println!();
-    println!("    {mnemonic}");
+    println!("Your {word_count}-word recovery mnemonic was printed ABOVE on stderr");
+    println!("(line `mnemonic (write this down, shown once): ...`) — it is shown ONCE and");
+    println!("is kept off stdout so it can't be captured by a stdout-parsing/logging tool.");
     println!();
     println!("This mnemonic is the ONLY backup. It reproduces the seed and every deposit's");
     println!("recovery key. Back it up OFFLINE — the per-deposit recovery files are NOT");
@@ -221,7 +250,7 @@ fn print_success(
     println!("NOTE: the wallet dir stores the seed UNENCRYPTED (file `seed`, perms 0600).");
     println!("There is no passphrase. Anyone who can read the wallet directory can derive");
     println!("your keys — protect the directory (and its disk), and rely on the mnemonic");
-    println!("above as your cold backup.");
+    println!("as your cold backup.");
     println!("==========================================================================");
 }
 
@@ -247,6 +276,7 @@ mod tests {
             esplora_url: None,
             force: false,
             yes: false,
+            show_mnemonic: false,
         }
     }
 
@@ -288,10 +318,12 @@ mod tests {
         assert!(err.contains("not a valid BIP-39 phrase"), "got: {err}");
     }
 
-    /// The `--json` object carries exactly the documented keys, and `imported`
-    /// reflects the import vs generate path.
+    /// DEFAULT (no `--show-mnemonic`): the stdout JSON object carries exactly the
+    /// documented keys and — critically — does NOT include the secret `mnemonic`;
+    /// instead it marks `mnemonic_delivery: "stderr"`. `imported` reflects the
+    /// import vs generate path.
     #[test]
-    fn init_json_has_expected_shape() {
+    fn init_json_default_omits_mnemonic_and_marks_stderr() {
         let dir = tempfile::tempdir().unwrap();
         let v = init_json(
             dir.path(),
@@ -299,6 +331,7 @@ mod tests {
             "https://mutinynet.com/api",
             KNOWN_MNEMONIC,
             true,
+            false, // show_mnemonic = false (default)
         );
         let obj = v.as_object().expect("init_json must be a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -308,15 +341,39 @@ mod tests {
             [
                 "esplora_url",
                 "imported",
-                "mnemonic",
+                "mnemonic_delivery",
                 "network",
                 "schema_version",
                 "wallet_dir"
-            ]
+            ],
+            "default stdout JSON must NOT carry the `mnemonic` field"
         );
+        assert!(
+            !obj.contains_key("mnemonic"),
+            "SECURITY: the mnemonic must never be on the default stdout channel"
+        );
+        assert_eq!(obj["mnemonic_delivery"], serde_json::json!("stderr"));
         assert_eq!(obj["schema_version"], serde_json::json!(crate::SCHEMA_VERSION));
         assert_eq!(obj["imported"], serde_json::json!(true));
         assert_eq!(obj["network"], serde_json::json!("signet"));
+    }
+
+    /// With `--show-mnemonic`, the caller has explicitly opted in: the stdout
+    /// JSON DOES carry the `mnemonic`, and `mnemonic_delivery` flips to `stdout`.
+    #[test]
+    fn init_json_show_mnemonic_includes_mnemonic_on_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = init_json(
+            dir.path(),
+            Network::Signet,
+            "https://mutinynet.com/api",
+            KNOWN_MNEMONIC,
+            false,
+            true, // show_mnemonic = true (explicit opt-in)
+        );
+        let obj = v.as_object().expect("init_json must be a JSON object");
         assert_eq!(obj["mnemonic"], serde_json::json!(KNOWN_MNEMONIC));
+        assert_eq!(obj["mnemonic_delivery"], serde_json::json!("stdout"));
+        assert_eq!(obj["imported"], serde_json::json!(false));
     }
 }

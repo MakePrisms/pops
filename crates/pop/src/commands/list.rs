@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::chain::Esplora;
 use crate::db::{Deposit, DepositState};
@@ -16,12 +16,44 @@ use crate::recovery::utc_iso8601;
 use crate::wallet::Wallet;
 use crate::SCHEMA_VERSION;
 
+/// The `--state` filter values, as a clap `ValueEnum` so `--help` enumerates and
+/// clap validates them (an unknown value is a clap usage error, exit 2). Maps 1:1
+/// onto [`DepositState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lower")]
+pub enum StateFilter {
+    /// Quote created, no confirmed funding yet.
+    Unpaid,
+    /// Funding credited; credential not yet issued.
+    Paid,
+    /// Credential issued (token printed).
+    Minted,
+    /// The recovery spend was broadcast.
+    Recovered,
+    /// Funding deadline passed.
+    Expired,
+}
+
+impl StateFilter {
+    /// The corresponding stored [`DepositState`].
+    fn to_deposit_state(self) -> DepositState {
+        match self {
+            StateFilter::Unpaid => DepositState::Unpaid,
+            StateFilter::Paid => DepositState::Paid,
+            StateFilter::Minted => DepositState::Minted,
+            StateFilter::Recovered => DepositState::Recovered,
+            StateFilter::Expired => DepositState::Expired,
+        }
+    }
+}
+
 /// Arguments for `pop list`.
 #[derive(Debug, Parser)]
 pub struct ListArgs {
-    /// Filter by lifecycle state.
-    #[arg(long, value_name = "STATE")]
-    pub state: Option<String>,
+    /// Filter by lifecycle state (one of: unpaid, paid, minted, recovered,
+    /// expired).
+    #[arg(long, value_name = "STATE", value_enum)]
+    pub state: Option<StateFilter>,
 }
 
 /// Arguments for `pop status`.
@@ -78,15 +110,10 @@ pub fn run_list(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let wallet = Wallet::open(wallet_dir)?;
-    let deposits = match &args.state {
-        Some(s) => {
-            let st = DepositState::parse(&s.to_lowercase()).map_err(|_| {
-                PopError::invalid_input(format!(
-                    "unknown --state `{s}` (unpaid|paid|minted|recovered|expired)"
-                ))
-            })?;
-            wallet.db.list_deposits_by_state(st)?
-        }
+    let deposits = match args.state {
+        // clap's ValueEnum already validated the value (an unknown one is a clap
+        // usage error, exit 2), so this is a total mapping — no string parse.
+        Some(s) => wallet.db.list_deposits_by_state(s.to_deposit_state())?,
         None => wallet.db.list_deposits()?,
     };
 

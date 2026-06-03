@@ -33,6 +33,24 @@ pub fn network_name(net: Network) -> &'static str {
     }
 }
 
+/// A machine-readable on-ramp hint for funding a deposit on a NON-mainnet
+/// network — where the funder needs test coins, not real BTC. Returns `None` for
+/// mainnet (real BTC has no faucet) and any unknown network.
+///
+/// Surfaced in `funding_pending.details.faucet_hint` so an agent waiting on a
+/// signet/testnet/regtest deposit can point the human at where to get coins.
+pub fn faucet_hint(net: Network) -> Option<&'static str> {
+    match net {
+        // Mainnet: real bitcoin, no faucet.
+        Network::Bitcoin => None,
+        // Signet here means Mutinynet (the project's signet), whose faucet is:
+        Network::Signet => Some("https://faucet.mutinynet.com"),
+        Network::Testnet => Some("https://mempool.space/testnet4/faucet"),
+        Network::Regtest => Some("fund via your regtest node / generatetoaddress"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +67,16 @@ mod tests {
     #[test]
     fn parse_unknown_errors() {
         assert!(parse_network("liquid").is_err());
+    }
+
+    #[test]
+    fn faucet_hint_is_none_on_mainnet_and_some_on_test_networks() {
+        // Mainnet (real BTC) has no faucet.
+        assert_eq!(faucet_hint(Network::Bitcoin), None);
+        // Signet here = Mutinynet.
+        assert_eq!(faucet_hint(Network::Signet), Some("https://faucet.mutinynet.com"));
+        // Testnet + regtest both provide a hint (URL resp. a node note).
+        assert!(faucet_hint(Network::Testnet).is_some());
+        assert!(faucet_hint(Network::Regtest).is_some());
     }
 }

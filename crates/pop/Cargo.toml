@@ -2,7 +2,8 @@
 name = "pop"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85.0"
+# Aligned to the workspace toolchain pinned in rust-toolchain.toml (1.95.0).
+rust-version = "1.95.0"
 authors = ["CDK Developers"]
 license = "MIT"
 description = "Funder-side CLI wallet for PoP (Proof-of-Power) Cashu credentials: mint, hold, and recover CLTV-backed BTC deposits"

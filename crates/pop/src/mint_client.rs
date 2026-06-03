@@ -169,7 +169,8 @@ pub async fn get_quote(
 ///
 /// `funding_address` is used only to populate the `funding_pending` error
 /// details when the poll times out without crediting (still-pending is the
-/// transient, keep-polling case).
+/// transient, keep-polling case). `network` selects the non-mainnet
+/// `faucet_hint` carried in those same details (None on mainnet).
 ///
 /// Progress is logged to STDERR (json mode keeps stdout pure).
 ///
@@ -185,6 +186,7 @@ pub async fn poll_until_paid(
     base: &str,
     quote_id: &str,
     funding_address: &str,
+    network: bitcoin::Network,
     interval: Duration,
     timeout: Duration,
 ) -> Result<PopQuoteResponse, Box<dyn std::error::Error>> {
@@ -227,6 +229,8 @@ pub async fn poll_until_paid(
                 expires_at: quote.expiry.unwrap_or(0),
                 confs_seen: None,
                 confs_required: None,
+                // Non-mainnet: tell the caller where to get test coins. Mainnet → None.
+                faucet_hint: crate::network::faucet_hint(network).map(str::to_string),
             }
             .into());
         }

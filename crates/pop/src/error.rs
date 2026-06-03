@@ -136,6 +136,10 @@ pub enum PopError {
         confs_seen: Option<u64>,
         /// Confirmations required, if known.
         confs_required: Option<u64>,
+        /// On a NON-mainnet network, a machine-readable on-ramp hint for where to
+        /// get test coins (signet/testnet faucet URL, or a regtest note).
+        /// `None` on mainnet (real BTC has no faucet).
+        faucet_hint: Option<String>,
     },
     /// The deposit's CLTV has not matured (MTP < ts_expiry); wait, then retry the
     /// same call. (`cltv_not_expired`)
@@ -294,6 +298,7 @@ impl PopError {
                 expires_at,
                 confs_seen,
                 confs_required,
+                faucet_hint,
             } => {
                 let mut o = json!({
                     "address": address,
@@ -304,6 +309,10 @@ impl PopError {
                 }
                 if let Some(c) = confs_required {
                     o["confs_required"] = json!(c);
+                }
+                // Non-mainnet on-ramp hint (where to get test coins); absent on mainnet.
+                if let Some(h) = faucet_hint {
+                    o["faucet_hint"] = json!(h);
                 }
                 Some(o)
             }
@@ -606,6 +615,44 @@ mod tests {
         assert!(d.get("operation").is_none());
     }
 
+    /// `funding_pending` carries the non-mainnet `faucet_hint` in its details when
+    /// present (signet/testnet/regtest), and OMITS it on mainnet (None).
+    #[test]
+    fn funding_pending_carries_faucet_hint_when_present() {
+        // Signet-style: faucet_hint present.
+        let e = PopError::FundingPending {
+            address: "tb1pexample".to_string(),
+            expires_at: 1_788_000_000,
+            confs_seen: None,
+            confs_required: None,
+            faucet_hint: Some("https://faucet.mutinynet.com".to_string()),
+        };
+        let env = e.to_envelope();
+        assert_eq!(env["error"]["code"], json!("funding_pending"));
+        assert_eq!(env["error"]["retriable"], json!(true));
+        assert_eq!(
+            env["error"]["details"]["faucet_hint"],
+            json!("https://faucet.mutinynet.com")
+        );
+        // Required details still present.
+        assert_eq!(env["error"]["details"]["address"], json!("tb1pexample"));
+        assert_eq!(env["error"]["details"]["expires_at"], json!(1_788_000_000u64));
+
+        // Mainnet-style: no faucet_hint key.
+        let e = PopError::FundingPending {
+            address: "bc1pexample".to_string(),
+            expires_at: 1_788_000_000,
+            confs_seen: None,
+            confs_required: None,
+            faucet_hint: None,
+        };
+        let d = e.details().unwrap();
+        assert!(
+            d.get("faucet_hint").is_none(),
+            "mainnet funding_pending must not carry a faucet_hint"
+        );
+    }
+
     /// Message-only codes carry no `details` key.
     #[test]
     fn message_only_codes_have_no_details() {
@@ -679,6 +726,7 @@ mod tests {
                 expires_at: 1,
                 confs_seen: None,
                 confs_required: None,
+                faucet_hint: None,
             },
             PopError::CltvNotExpired {
                 matures_at: 2,

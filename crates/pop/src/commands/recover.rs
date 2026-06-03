@@ -105,8 +105,15 @@ pub async fn run(
 
     // Parse the destination once. A malformed address is invalid_input; an
     // address for the wrong network is network_mismatch{expected, got}.
-    let dest_unchecked = Address::from_str(args.dest.trim())
-        .map_err(|e| PopError::invalid_input(format!("--dest parse failed: {e}")))?;
+    // NOTE: the raw bitcoin-crate parse error misleadingly mentions "base58" even
+    // for a malformed bech32 string, so we DON'T surface it — we give a clear,
+    // address-type-agnostic message (echoing the offending input, not the prose).
+    let dest_unchecked = Address::from_str(args.dest.trim()).map_err(|_| {
+        PopError::invalid_input(format!(
+            "--dest is not a valid bitcoin address (got `{}`)",
+            args.dest.trim()
+        ))
+    })?;
     let dest = match dest_unchecked.clone().require_network(network) {
         Ok(addr) => addr,
         Err(_) => {
@@ -121,7 +128,24 @@ pub async fn run(
     // Select deposits.
     let deposits = select_deposits(&wallet, args)?;
     if deposits.is_empty() {
-        return Err(PopError::invalid_input("no deposits selected (nothing recoverable)").into());
+        // Only reachable via `--all` (a single `--deposit` resolves or errors
+        // deposit_not_found). An empty sweep is a no-op SUCCESS, not an error: we
+        // return an empty `results` and — crucially — do NOT touch the chain, so
+        // an empty sweep can never fail with chain_unreachable.
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": SCHEMA_VERSION,
+                    "tip_height": serde_json::Value::Null,
+                    "tip_mtp": serde_json::Value::Null,
+                    "results": serde_json::Value::Array(vec![]),
+                }))?
+            );
+        } else {
+            println!("nothing recoverable (no funded, un-recovered deposits)");
+        }
+        return Ok(());
     }
 
     // Tip MTP for maturity checks.
