@@ -69,8 +69,8 @@ fn main() -> ExitCode {
 /// Resolve the config path, read it, parse it, and validate it. Any failure is
 /// returned as a fully-formed stderr message string (already structured).
 fn load_config() -> Result<ValidatedConfig, String> {
-    let path = std::env::var("POPS_GATEWAY_CONFIG")
-        .unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
+    let path =
+        std::env::var("POPS_GATEWAY_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
 
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("config file {path}: could not read: {e}"))?;

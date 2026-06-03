@@ -12,6 +12,7 @@
 //! the reason, which `main` renders as `config field <X>: <reason>` to stderr.
 
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cashu::nuts::CurrencyUnit;
 use cashu::{Amount, MintUrl};
@@ -21,6 +22,17 @@ use pops_core_verify::challenge::CashuRequirement;
 
 /// The default listen address when `listen` is omitted.
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
+
+/// Default cap on a buffered request body (1 MiB). The gateway buffers each
+/// request body in full before forwarding it upstream; without a cap an
+/// attacker on a PUBLIC/unauthenticated path could stream an unbounded body and
+/// OOM the process. A body exceeding this is rejected with `413`.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Default upstream request timeout (30s). Bounds a hung upstream so a request
+/// whose pop was already redeemed cannot be stranded indefinitely, and makes
+/// the `504 Gateway Timeout` path reachable.
+pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 30;
 
 /// Top-level gateway config, deserialized from the mounted TOML.
 ///
@@ -45,6 +57,20 @@ pub struct Config {
     /// Listen address for the gateway's own HTTP listener.
     #[serde(default = "default_listen")]
     pub listen: String,
+
+    /// Maximum buffered request-body size in bytes. The gateway buffers each
+    /// request body in full before forwarding; a body larger than this is
+    /// rejected with `413 Payload Too Large` (before any charge on a gated
+    /// path). Defaults to 1 MiB; caps an unbounded-body OOM on public paths.
+    #[serde(default = "default_max_body_bytes")]
+    pub max_body_bytes: usize,
+
+    /// Upstream request timeout in seconds (connect + total). Bounds a hung
+    /// upstream and makes the `504` path reachable. Defaults to 30s. `0`
+    /// disables the timeout (NOT recommended — a hung upstream then strands a
+    /// request whose pop is already spent).
+    #[serde(default = "default_upstream_timeout_secs")]
+    pub upstream_timeout_secs: u64,
 
     /// The charge requirement advertised on the 402 challenge + enforced on
     /// retry.
@@ -94,6 +120,14 @@ fn default_listen() -> String {
     DEFAULT_LISTEN.to_string()
 }
 
+fn default_max_body_bytes() -> usize {
+    DEFAULT_MAX_BODY_BYTES
+}
+
+fn default_upstream_timeout_secs() -> u64 {
+    DEFAULT_UPSTREAM_TIMEOUT_SECS
+}
+
 /// A semantic config failure, naming the field and the human reason. Rendered
 /// by `main` as `config field <field>: <reason>` to stderr before a nonzero
 /// exit (never a panic / stacktrace).
@@ -135,6 +169,10 @@ pub struct ValidatedConfig {
     pub proofs_sink: PathBuf,
     /// Listen address.
     pub listen: String,
+    /// Maximum buffered request-body size in bytes (over → `413`).
+    pub max_body_bytes: usize,
+    /// Upstream request timeout (`None` ⇒ no timeout, from `0`).
+    pub upstream_timeout: Option<std::time::Duration>,
     /// The pre-built cashu requirement advertised on the 402 + enforced on
     /// retry. Built once at startup.
     pub requirement: CashuRequirement,
@@ -155,8 +193,13 @@ impl Config {
     /// - `upstream_url` parses as an absolute http(s) URL;
     /// - `charge.unit` is a well-formed `pop_<ts>` (via `parse_pop_unit`);
     /// - `charge.amount > 0`;
+    /// - `max_body_bytes > 0`;
     /// - every `charge.mints` entry parses as a `MintUrl`;
-    /// - `proofs_sink` has an existing, writable parent directory.
+    /// - `proofs_sink`'s parent directory exists and is ACTUALLY writable by the
+    ///   running uid (a real create+fsync+delete write-probe, not a mode-bit
+    ///   inspection).
+    ///
+    /// Also maps `upstream_timeout_secs` to an `Option<Duration>` (`0` ⇒ `None`).
     pub fn validate(self) -> Result<ValidatedConfig, ConfigError> {
         // upstream_url — absolute http(s).
         let upstream_url = reqwest::Url::parse(self.upstream_url.trim())
@@ -164,7 +207,10 @@ impl Config {
         if !matches!(upstream_url.scheme(), "http" | "https") {
             return Err(ConfigError::new(
                 "upstream_url",
-                format!("scheme must be http or https, got {:?}", upstream_url.scheme()),
+                format!(
+                    "scheme must be http or https, got {:?}",
+                    upstream_url.scheme()
+                ),
             ));
         }
 
@@ -181,6 +227,18 @@ impl Config {
         if self.charge.amount == 0 {
             return Err(ConfigError::new("charge.amount", "must be greater than 0"));
         }
+
+        // max_body_bytes — strictly positive (0 would reject every request).
+        if self.max_body_bytes == 0 {
+            return Err(ConfigError::new("max_body_bytes", "must be greater than 0"));
+        }
+
+        // upstream_timeout_secs — 0 means "no timeout" (mapped to None).
+        let upstream_timeout = if self.upstream_timeout_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(self.upstream_timeout_secs))
+        };
 
         // charge.mints — default to [mint_url] when empty; otherwise parse each.
         let mints: Vec<MintUrl> = if self.charge.mints.is_empty() {
@@ -215,16 +273,28 @@ impl Config {
             mint_url,
             proofs_sink: self.proofs_sink,
             listen: self.listen,
+            max_body_bytes: self.max_body_bytes,
+            upstream_timeout,
             requirement,
             routes: self.routes,
         })
     }
 }
 
-/// `proofs_sink` parent-dir existence + writability check. The sink FILE itself
-/// need not pre-exist (it is created append-wise at first write), but its parent
-/// directory must exist and be writable now — a missing parent is the
-/// un-mounted-volume failure mode.
+/// `proofs_sink` parent-dir existence + REAL writability check. The sink FILE
+/// itself need not pre-exist (it is created append-wise at first write), but its
+/// parent directory must exist and be writable *by the running uid* now — a
+/// missing parent is the un-mounted-volume failure mode, and a dir the process
+/// uid cannot write is the chown failure mode.
+///
+/// Writability is checked with an ACTUAL write probe — create a temp file in the
+/// dir as the running uid, write + fsync it, then delete it — NOT by inspecting
+/// the inode's `readonly` mode bit. The mode bit reflects the directory owner's
+/// permission, not whether *this* (non-root, e.g. `pops` uid 10001) process can
+/// write; a dir owned by root with mode 0755 reports "not readonly" yet the
+/// `pops` uid gets EACCES on the first redeemed proof = silent value loss after
+/// a passing fail-fast. The probe catches that at boot. (See the Dockerfile /
+/// README: `chown` the mounted volume to the container uid.)
 fn validate_proofs_sink(path: &std::path::Path) -> Result<(), ConfigError> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = match parent {
@@ -244,16 +314,51 @@ fn validate_proofs_sink(path: &std::path::Path) -> Result<(), ConfigError> {
             format!("parent path {dir:?} is not a directory"),
         ));
     }
-    // Writability: check the directory permissions are not read-only. A
-    // belt-and-braces probe (creating a temp file) would mutate the operator's
-    // volume, so we inspect the mode instead.
-    let readonly = meta.permissions().readonly();
-    if readonly {
-        return Err(ConfigError::new(
+    probe_writable(dir)
+}
+
+/// Real write probe: create → write → fsync → remove a uniquely-named temp file
+/// in `dir` as the running uid. Any error ⇒ the dir is not writable by this
+/// process. The probe file is `.pops-gateway-writecheck-<pid>-<nanos>` so two
+/// concurrent boots never collide, and it is removed on success; a stray file
+/// (if the process is killed mid-probe) is harmless (dotfile, distinct name).
+fn probe_writable(dir: &std::path::Path) -> Result<(), ConfigError> {
+    use std::io::Write;
+
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe = dir.join(format!(".pops-gateway-writecheck-{pid}-{nanos}"));
+
+    let not_writable = |what: &str, e: &dyn std::fmt::Display| {
+        ConfigError::new(
             "proofs_sink",
-            format!("parent directory {dir:?} is not writable (read-only)"),
-        ));
+            format!(
+                "parent directory {dir:?} is not writable by the running uid \
+                 ({} {probe:?}: {e}); if running in Docker, chown the mounted \
+                 volume to the container uid",
+                what
+            ),
+        )
+    };
+
+    // create + write + fsync
+    let mut file = std::fs::File::create(&probe).map_err(|e| not_writable("create", &e))?;
+    let write_then_sync = file
+        .write_all(b"pops-gateway-writecheck")
+        .and_then(|()| file.sync_all());
+    if let Err(e) = write_then_sync {
+        // Best-effort cleanup before surfacing the write/fsync failure.
+        let _ = std::fs::remove_file(&probe);
+        return Err(not_writable("write", &e));
     }
+    drop(file);
+
+    // remove — a leftover probe file is not fatal, but a failure to remove still
+    // signals a broken dir, so surface it.
+    std::fs::remove_file(&probe).map_err(|e| not_writable("remove", &e))?;
     Ok(())
 }
 
@@ -298,8 +403,7 @@ amount = 1
 
     #[test]
     fn valid_config_parses_and_validates() {
-        let cfg = Config::from_toml_str(&valid_toml("/tmp/pops-proofs.jsonl"))
-            .expect("parses");
+        let cfg = Config::from_toml_str(&valid_toml("/tmp/pops-proofs.jsonl")).expect("parses");
         let v = cfg.validate().expect("validates");
         assert_eq!(v.listen, DEFAULT_LISTEN);
         assert_eq!(v.requirement.amount, Amount::from(1));
@@ -376,11 +480,149 @@ amount = 1
 
     #[test]
     fn missing_parent_dir_proofs_sink_is_named_field_error() {
-        let cfg =
-            Config::from_toml_str(&valid_toml("/no/such/dir/anywhere/proofs.jsonl"))
-                .expect("parses");
+        let cfg = Config::from_toml_str(&valid_toml("/no/such/dir/anywhere/proofs.jsonl"))
+            .expect("parses");
         let err = cfg.validate().expect_err("nonexistent parent must fail");
         assert_eq!(err.field, "proofs_sink");
+    }
+
+    /// Best-effort root detection: root bypasses DAC permission bits, so a
+    /// `0o555` dir is still writable by uid 0 and the read-only-dir probe test
+    /// below would not hold. Detect root by probing a `0o000` temp dir.
+    fn running_as_root() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(dir) = tempfile::tempdir() else {
+            return false;
+        };
+        let sub = dir.path().join("noperm");
+        if std::fs::create_dir(&sub).is_err() {
+            return false;
+        }
+        let _ = std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000));
+        // If we can still create a file in a 0o000 dir, we are root.
+        let can_write = std::fs::File::create(sub.join("probe")).is_ok();
+        // Restore perms so tempdir cleanup can remove it.
+        let _ = std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755));
+        can_write
+    }
+
+    #[test]
+    fn defaults_present_when_omitted() {
+        let cfg = Config::from_toml_str(&valid_toml("/tmp/pops-proofs.jsonl")).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(v.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(
+            v.upstream_timeout,
+            Some(std::time::Duration::from_secs(
+                DEFAULT_UPSTREAM_TIMEOUT_SECS
+            ))
+        );
+    }
+
+    #[test]
+    fn zero_max_body_bytes_is_named_field_error() {
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+max_body_bytes = 0
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let err = cfg.validate().expect_err("max_body_bytes=0 must fail");
+        assert_eq!(err.field, "max_body_bytes");
+    }
+
+    #[test]
+    fn zero_upstream_timeout_means_no_timeout() {
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+upstream_timeout_secs = 0
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(v.upstream_timeout, None, "0 disables the timeout");
+    }
+
+    #[test]
+    fn custom_body_cap_and_timeout_round_trip() {
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+max_body_bytes = 2048
+upstream_timeout_secs = 60
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(v.max_body_bytes, 2048);
+        assert_eq!(v.upstream_timeout, Some(std::time::Duration::from_secs(60)));
+    }
+
+    // MAJOR 2: the write-probe must FAIL FAST when the proofs_sink dir is not
+    // writable by the running uid (a read-only dir), instead of passing at boot
+    // and only hitting EACCES on the first redeemed proof.
+    #[test]
+    fn readonly_proofs_sink_dir_fails_fast() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if running_as_root() {
+            // Root ignores DAC perm bits, so a read-only dir is still writable
+            // to uid 0 — the failure this test asserts cannot occur as root.
+            eprintln!("skipping readonly_proofs_sink_dir_fails_fast: running as root");
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ro = dir.path().join("readonly");
+        std::fs::create_dir(&ro).expect("mkdir");
+        // r-xr-xr-x: readable + traversable, but NOT writable.
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod 0555");
+
+        let sink = ro.join("proofs.jsonl");
+        let err = validate_proofs_sink(&sink)
+            .expect_err("a read-only proofs_sink dir must fail fast at startup");
+        assert_eq!(err.field, "proofs_sink");
+        assert!(
+            err.reason.contains("not writable"),
+            "reason should name the writability failure, got: {}",
+            err.reason
+        );
+
+        // Restore perms so tempdir cleanup can remove the dir.
+        let _ = std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755));
+    }
+
+    // The write-probe must PASS (and leave no probe file behind) on a normal
+    // writable dir.
+    #[test]
+    fn writable_proofs_sink_dir_probe_passes_and_cleans_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sink = dir.path().join("proofs.jsonl");
+        validate_proofs_sink(&sink).expect("writable dir passes the probe");
+        // No probe file (or anything else) left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "probe must clean up after itself, found: {leftovers:?}"
+        );
     }
 
     #[test]

@@ -89,6 +89,14 @@ appends them to `proofs_sink`.
 - **It MUST be a persistent mount.** If `proofs_sink` lives on an ephemeral
   container layer, a restart **destroys received value**. The gateway logs a
   loud warning at startup for exactly this reason — heed it.
+- **It MUST be writable by the container uid.** The image runs as the non-root
+  `pops` user (**uid 10001**). The gateway runs a **real write-probe** at startup
+  (create + fsync + delete a temp file in the `proofs_sink` directory **as that
+  uid**) and **fails fast** if it can't write — so a volume owned by host root is
+  caught at boot, not on the first paid request. `chown 10001:10001` the host
+  directory before mounting it (or run the container `--user "$(id -u):$(id -g)"`
+  with the dir owned by that uid). A named docker volume needs no host chown. See
+  the Dockerfile header for both recipes.
 - **Back up the volume.** Losing the file loses the money.
 - **Restrict access.** Anyone who can read it can spend the proofs.
 
@@ -120,10 +128,16 @@ value — it is the payment for the gated request.
    fsync) BEFORE forwarding** — a crash between forward and persist would
    otherwise lose already-consumed value.
 4. Then the **original** request (method/path/query/headers/body) is forwarded
-   to `upstream_url` and the response is streamed back.
+   to `upstream_url` (with a bounded **`upstream_timeout_secs`**, default 30s)
+   and the response is streamed back.
 5. Error mapping (mirrors the reference verifier):
    - mint unreachable → `503` + `Retry-After` (token **not** consumed, retry).
+   - request body over **`max_body_bytes`** (default 1 MiB) → `413 Payload Too
+     Large`. On a gated path this is checked **before the charge**, so the pop
+     is **not** consumed.
    - malformed request → `400`.
+   - upstream hung past the timeout → `504`; upstream down → `502` (the pop, if
+     gated, is already spent — see the v1 edge below).
    - any other verification failure → `402` + a fresh challenge.
 
 ### Known v1 edge — paid but upstream down
@@ -159,8 +173,11 @@ config field charge.amount: must be greater than 0
 ```
 
 Checks: `upstream_url` / `mint_url` parse; `charge.unit` is a well-formed
-`pop_<ts>`; `charge.amount > 0`; every `charge.mints` entry parses; and
-`proofs_sink`'s parent directory exists and is writable.
+`pop_<ts>`; `charge.amount > 0`; `max_body_bytes > 0`; every `charge.mints`
+entry parses; and `proofs_sink`'s parent directory exists **and is actually
+writable by the running uid** — verified with a real create+fsync+delete
+write-probe (not just an inode mode-bit inspection), so a dir the process can't
+write is caught at boot rather than on the first redeemed proof.
 
 ---
 

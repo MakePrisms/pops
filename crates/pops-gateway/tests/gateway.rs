@@ -112,7 +112,12 @@ fn make_token(mint: MintUrl, unit: CurrencyUnit, proofs: Proofs) -> Token {
 
 /// A valid presented token worth exactly 10 against `pop_1700000000` / mint_a.
 fn valid_token_string() -> String {
-    make_token(mint_a(), pop_unit(), vec![make_proof(8, 0), make_proof(2, 1)]).to_string()
+    make_token(
+        mint_a(),
+        pop_unit(),
+        vec![make_proof(8, 0), make_proof(2, 1)],
+    )
+    .to_string()
 }
 
 /// Wrap a raw cashuB token in the `Payment` auth envelope.
@@ -156,6 +161,10 @@ fn validated_config(
         mint_url: mint_a(),
         proofs_sink: sink_path.to_path_buf(),
         listen: "127.0.0.1:0".into(),
+        max_body_bytes: pops_gateway::config::DEFAULT_MAX_BODY_BYTES,
+        upstream_timeout: Some(std::time::Duration::from_secs(
+            pops_gateway::config::DEFAULT_UPSTREAM_TIMEOUT_SECS,
+        )),
         requirement: requirement(),
         routes,
     }
@@ -176,6 +185,23 @@ fn gateway(
         credential,
         sink,
     ));
+    (build_router(state), swap_calls)
+}
+
+/// Build the gateway with a custom `max_body_bytes` cap (for the 413 tests).
+fn gateway_with_cap(
+    upstream: &str,
+    sink_path: &std::path::Path,
+    swap: SwapResponse,
+    routes: Vec<RouteConfig>,
+    max_body_bytes: usize,
+) -> (Router, Arc<AtomicUsize>) {
+    let (mock, swap_calls) = MockMintClient::new(swap);
+    let credential = CashuCredential::new(mock);
+    let sink = ProofsSink::open(sink_path).expect("open sink");
+    let mut cfg = validated_config(upstream, sink_path, routes);
+    cfg.max_body_bytes = max_body_bytes;
+    let state = Arc::new(AppState::new(cfg, credential, sink));
     (build_router(state), swap_calls)
 }
 
@@ -294,10 +320,7 @@ async fn valid_credential_persists_then_forwards_and_returns_body() {
     assert_eq!(v["amount"], 10);
     assert_eq!(v["unit"], "pop_1700000000");
     assert!(
-        v["fresh_proofs"]
-            .as_str()
-            .unwrap()
-            .starts_with("cashuB"),
+        v["fresh_proofs"].as_str().unwrap().starts_with("cashuB"),
         "fresh_proofs is a cashuB token"
     );
     assert_eq!(
@@ -405,7 +428,11 @@ async fn public_route_forwards_without_gate() {
     let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
     assert_eq!(&body[..], b"FREE-CONTENT");
     // No gate ran: no swap, no persist, but the upstream WAS hit.
-    assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "public path not gated");
+    assert_eq!(
+        swap_calls.load(Ordering::SeqCst),
+        0,
+        "public path not gated"
+    );
     assert_eq!(up_hits.load(Ordering::SeqCst), 1, "public path forwarded");
     assert!(read_lines(&sink).is_empty());
 }
@@ -419,7 +446,12 @@ async fn healthz_is_gateway_own() {
     let (app, _swap) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
 
     let resp = app
-        .oneshot(Request::builder().uri("/healthz").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -447,4 +479,111 @@ amount = 0
     let err = cfg.validate().expect_err("amount=0 must fail validation");
     assert_eq!(err.field, "charge.amount");
     assert!(err.to_string().starts_with("config field charge.amount:"));
+}
+
+// ───────────────────── Body-cap (413) tests — MAJOR 1 ────────────────────────
+
+// A PUBLIC request whose body exceeds max_body_bytes → 413, upstream NOT hit.
+// (The public/unauthenticated path is the OOM-DoS surface the cap closes.)
+#[tokio::test]
+async fn oversized_body_on_public_path_returns_413_not_forwarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, up_hits) = spawn_upstream("FREE").await;
+    let routes = vec![RouteConfig {
+        path: "/free/*".into(),
+        public: true,
+    }];
+    // Cap at 64 bytes; send 256.
+    let (app, _swap) = gateway_with_cap(&upstream, &sink, SwapResponse::Echo, routes, 64);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/free/upload")
+                .body(Body::from(vec![b'x'; 256]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&body).unwrap()).expect("413 body is JSON");
+    assert_eq!(v["error"], "payload_too_large");
+    assert_eq!(v["max_body_bytes"], 64);
+    // The oversized body was rejected BEFORE reaching upstream.
+    assert_eq!(up_hits.load(Ordering::SeqCst), 0, "413 not forwarded");
+}
+
+// A GATED request whose body exceeds the cap → 413 BEFORE the swap: the pop is
+// NOT consumed and nothing is persisted. This is the value-safety property —
+// we never charge for a request we are going to reject for being too large.
+#[tokio::test]
+async fn oversized_body_on_gated_path_returns_413_before_charge() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, up_hits) = spawn_upstream("SECRET").await;
+    // Cap at 64 bytes; send a valid credential + a 4 KiB body.
+    let (app, swap_calls) = gateway_with_cap(&upstream, &sink, SwapResponse::Echo, vec![], 64);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/protected")
+                .header(AUTHORIZATION, payment_header(&valid_token_string()))
+                .body(Body::from(vec![b'x'; 4096]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // CRUCIAL: no swap (pop unspent), no persist, no forward.
+    assert_eq!(
+        swap_calls.load(Ordering::SeqCst),
+        0,
+        "413 must precede the charge — pop not consumed"
+    );
+    assert!(
+        read_lines(&sink).is_empty(),
+        "nothing persisted for an over-cap request"
+    );
+    assert_eq!(up_hits.load(Ordering::SeqCst), 0, "not forwarded");
+}
+
+// A body AT/under the cap still forwards normally (the cap doesn't break
+// legitimate request bodies — guards against an off-by-one rejecting valid load).
+#[tokio::test]
+async fn body_at_cap_forwards_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, up_hits) = spawn_upstream("OK").await;
+    let routes = vec![RouteConfig {
+        path: "/free/*".into(),
+        public: true,
+    }];
+    // Cap 128, body exactly 128.
+    let (app, _swap) = gateway_with_cap(&upstream, &sink, SwapResponse::Echo, routes, 128);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/free/ok")
+                .body(Body::from(vec![b'y'; 128]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a body at the cap is allowed"
+    );
+    assert_eq!(up_hits.load(Ordering::SeqCst), 1, "forwarded to upstream");
 }
