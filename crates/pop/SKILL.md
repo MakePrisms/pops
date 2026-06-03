@@ -40,6 +40,10 @@ This skill teaches you to drive `pop` for a human while keeping them in the loop
 text. (`--human` / `--pretty` switches to human-readable text for a person to
 read; you should not normally pass it.)
 
+> **Build note.** `pop` is a Cargo crate in the `pops` workspace; build/test it
+> with `cargo build -p pop` / `cargo test -p pop`. The workspace toolchain is
+> pinned in `rust-toolchain.toml` (Rust 1.95).
+
 ---
 
 ## Output & error contract (FROZEN, schema_version 1)
@@ -75,14 +79,20 @@ CONTRACT below and `agent-state.schema.json` for the schema.
 ## The `pop` command surface (the only commands you may use)
 
 ```
-pop init    [--network mainnet|testnet|signet|regtest] [--mnemonic "<words>"] [--force --yes]
+pop init    [--network mainnet|testnet|signet|regtest] [--mnemonic "<words>"] [--show-mnemonic] [--force --yes]
 pop quote   --mint-url <url> --amount <sats> (--duration <30d> | --unit pop_<ts>) --mint-pubkey <hex33>
-pop mint    --resume <deposit_id>
+pop mint    --resume <deposit_id>                                    # bare resume; mint-url/amount/unit reloaded from the deposit
+pop mint    --mint-url <url> --amount <sats> (--duration <30d> | --unit pop_<ts>) [--mint-pubkey <hex33>]  # fresh: quote+poll+mint in one
 pop recover (--deposit <id> | --all) --dest <addr> [--fee <sats> | --target <blocks>] [--no-broadcast]
 pop list    [--state unpaid|paid|minted|recovered|expired]
 pop status  [--deposit <id>]
 pop balance
 ```
+
+For a **fresh** `pop mint` (no `--resume`), `--mint-url`, `--amount`, and exactly
+one of `--duration`/`--unit` are required (missing them is a clap usage error,
+exit 2). With `--resume <id>` all of those are OPTIONAL — they're reloaded from
+the persisted deposit, so `pop mint --resume <id>` works bare.
 
 Global: `--wallet-dir <PATH>` (default `~/.pop-wallet`); `--human` (alias
 `--pretty`) for text output (json is the default — omit it for machine use);
@@ -132,14 +142,24 @@ Do this the first time the human asks you to use PoP, or whenever
    ```
    pop init --network mainnet
    ```
-   Output: `{ "schema_version": 1, "wallet_dir", "network", "esplora_url",
-   "mnemonic", "imported" }`.
+   Output (stdout JSON): `{ "schema_version": 1, "wallet_dir", "network",
+   "esplora_url", "mnemonic_delivery", "imported" }`.
 
-   The `mnemonic` is shown **once**. **Surface it to the human and have them back
-   it up BEFORE locking any real funds.** Do not write the mnemonic into the
-   state file, the activity log, or any other file — it is the secret. Once the
-   human confirms they've stored it, set `mnemonic_backed_up: true` in the state
-   file. (To restore an existing seed instead: `pop init --mnemonic "<words>"`.)
+   **SECURITY — the mnemonic is NOT on stdout by default.** Because stdout is the
+   channel you parse AND may log, the secret mnemonic is printed to **stderr**
+   instead (a clearly-labelled `mnemonic (write this down, shown once): …` line),
+   and the stdout JSON only carries a non-secret `"mnemonic_delivery": "stderr"`
+   marker. **Surface the stderr mnemonic line to the human and have them back it
+   up BEFORE locking any real funds.** Do not write the mnemonic into the state
+   file, the activity log, stdout capture, or any other file — it is the secret.
+   Once the human confirms they've stored it, set `mnemonic_backed_up: true` in
+   the state file. (To restore an existing seed instead: `pop init --mnemonic
+   "<words>"` — the imported phrase is likewise kept off stdout.)
+
+   Only if a caller deliberately needs to capture the mnemonic programmatically,
+   pass `--show-mnemonic`: that ALSO includes `"mnemonic"` in the stdout JSON (and
+   flips `mnemonic_delivery` to `"stdout"`). Avoid it unless you have a specific,
+   secure reason — it puts the secret on the parse/log channel.
 
 3. **Capture preferences and write the state file** at
    `~/.pop-wallet/agent-state.json` (schema: `agent-state.schema.json`). Ask the
@@ -175,6 +195,14 @@ On confirmation, create the quote (non-blocking):
 ```
 pop quote --mint-url https://mint.example --amount 50000 --duration 30d --mint-pubkey <hex33>
 ```
+
+`--mint-pubkey` is the mint's **33-byte compressed identity pubkey** (66 hex
+chars), available from the mint's **`GET /v1/info`** endpoint. The wallet commits
+it into the funding-address construction and uses it to independently verify the
+address, so it is REQUIRED on the **first** use of a mint; it is then **TOFU-pinned**
+(trust-on-first-use) into the wallet's `config.toml` and reused automatically on
+later mints to that mint (a changed key for a known mint is a hard error). Record
+it as `default_mint.mint_pubkey` in the state file.
 Returns:
 ```json
 {
@@ -194,6 +222,14 @@ Log the lock (see ACTIVITY LOG). Now **fund `funding_address` with EXACTLY
 `amount_sats`** (over- or under-funding will NOT credit) — via the human's
 on-chain wallet or whatever funding path the human authorized; the `bip21_uri`
 is scannable. Funding is on-chain and takes ~1 confirmation.
+
+**Funding on test networks.** On a non-mainnet wallet (signet/testnet/regtest)
+you fund with TEST coins, not real BTC. When `mint --resume` times out still
+waiting, the `funding_pending` error carries a machine-readable
+`details.faucet_hint` pointing at where to get them (signet →
+`https://faucet.mutinynet.com`, testnet → a testnet faucet, regtest → fund via
+your regtest node / `generatetoaddress`). On **mainnet** there is no
+`faucet_hint` (real bitcoin has no faucet) — fund from the human's wallet.
 
 After funding is sent, mint the credential (polls until the mint confirms
 funding, then issues):
@@ -240,7 +276,8 @@ immature deposit and reports an ETA.
 3. **Confirm the destination address with the human** (default from
    `default_recovery_dest`; recommend a fresh address). **Never recover to an
    unconfirmed/unverified destination.** Optionally dry-run with
-   `--no-broadcast` to show the fee + sweep amount first.
+   `--no-broadcast` (see the dry-run note below) to preview the fee + sweep
+   amount for a **matured** deposit first.
 
 ```
 pop recover --deposit <id> --dest <addr> --target 6
@@ -263,6 +300,14 @@ Note: a **single** `pop recover --deposit <id>` that isn't matured yet returns
 the `cltv_not_expired` **error** envelope (retriable — wait until `matures_at`,
 details carry `matures_at` + `now`), whereas a `--all` sweep keeps an immature
 deposit as a per-deposit `"status":"immature"` row so the sweep can proceed.
+
+**`--no-broadcast` is a true DRY-RUN, not a timelock bypass.** It builds and signs
+the recovery tx but does NOT broadcast — for a **matured** deposit it returns the
+fee + sweep amount (`"status":"built"` with `txid` + `tx_hex`). It does **NOT**
+skip the maturity gate: for an **immature** deposit it reports maturity exactly
+like a real recover — a single `--deposit` still returns the `cltv_not_expired`
+error (with `matures_at`/`now`), and `--all` still emits an `"status":"immature"`
+row. There is no flag that moves funds before the CLTV.
 
 ### Checking the aggregate balance
 
@@ -382,8 +427,9 @@ week's bitcoin" or "how much have I got locked":
   the larger amount (then optionally update the state file).
 - **Recovery destinations:** always re-confirm the `--dest` with the human;
   never recover to an unconfirmed/unverified address; prefer a fresh address
-  (recovery reveals the construction on-chain). Consider `--no-broadcast` to
-  preview the fee first.
+  (recovery reveals the construction on-chain). Consider `--no-broadcast` (a true
+  dry-run — builds + signs but does not broadcast; still honors the timelock) to
+  preview the fee for a matured deposit first.
 - **Don't fight the timelock.** If `pop recover` reports `immature`, surface the
   ETA — the funds genuinely cannot move yet.
 - **Exact funding only.** Fund `funding_address` with EXACTLY `amount_sats`;
@@ -446,7 +492,7 @@ from them.
 | `mint_unreachable` | true | transient | `{mint_url}` REQ | network blip — retry |
 | `chain_unreachable` | true | transient | `{esplora_url, operation?}` REQ(esplora_url); `operation` ∈ `tip_mtp`\|`utxo_fetch`\|`fee_estimate` | esplora (chain backend) read unreachable — retry |
 | `mint_error` | false | terminal | `{status?, mint_message}` REQ(mint_message) | the mint rejected it; surface `mint_message` |
-| `funding_pending` | true | transient | `{address, expires_at, confs_seen?, confs_required?}` REQ(address, expires_at) | funding not credited yet — keep polling (`mint --resume`) |
+| `funding_pending` | true | transient | `{address, expires_at, confs_seen?, confs_required?, faucet_hint?}` REQ(address, expires_at); `faucet_hint` present on non-mainnet only | funding not credited yet — keep polling (`mint --resume`); on a test network `faucet_hint` says where to get coins |
 | `cltv_not_expired` | true | transient (gated) | `{matures_at, now}` REQ | not matured — wait until `matures_at`, then retry the SAME recover |
 | `quote_expired` | false | needs_input | `{quote_id, expired_at}` REQ | STOP polling + re-`quote`; funds sent are recoverable after CLTV |
 | `amount_mismatch` | false | needs_input | `{expected_sats, funded_sats}` REQ | PoP is exact-amount; funds are safe on-chain — `recover` that deposit |
