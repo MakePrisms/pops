@@ -231,8 +231,61 @@ pub async fn run(
     )
     .await?;
 
-    // ---- 8/9. Build credentials + retry the SAME request with payment. ----
-    let creds = build_credentials(&params, &send_token);
+    // ---- 8/9. Build credentials, retry with payment, emit. ----
+    //
+    // POST-SWAP VALUE-RECOVERY INVARIANT: `build_exact_payment` may have run a
+    // swap that SPENT the held input proofs. From here the only surviving form
+    // of that ecash is `send_token` (+ any `change_token`). So EVERY exit of the
+    // credentials/retry/emit block below — including the success path — must
+    // surface BOTH tokens. `finish_payment` constructs the two expected error
+    // cases (`GatewayRetryFailed`, `GatewayRejectedPayment`) token-bearing by
+    // construction; `ensure_post_swap_token_bearing` is the belt-and-suspenders
+    // catch-all that converts ANY other stray error into a token-bearing one too
+    // (so an unforeseen failure can never silently drop the spent value).
+    //
+    // On the FAST path (no swap) `send_token == the user's --token`, so echoing
+    // it is harmless; doing this uniformly also covers the ZERO-CHANGE swap case
+    // (`change_token` is None yet the input WAS spent — `send_token` still must
+    // surface), which is why recovery is NOT gated on `change_token.is_some()`.
+    finish_payment(
+        &http,
+        method,
+        args,
+        &params,
+        &charge,
+        base,
+        &send_token,
+        change_token.as_deref(),
+        json,
+    )
+    .await
+    .map_err(|e| ensure_post_swap_token_bearing(e, &send_token, change_token.as_deref()))
+}
+
+/// Builds the `Authorization: Payment` credentials, retries the SAME request
+/// with the exact-amount token, and emits the result. Every non-success exit is
+/// token-bearing (carries both `send_token` and `change_token`) — see the
+/// POST-SWAP invariant at the call site.
+///
+/// - retry HTTP transport error → [`PopError::GatewayRetryFailed`] (NOT
+///   retriable: the input proofs are already spent, so retrying the original
+///   `--token` would mask the loss; recover by presenting `send_token`).
+/// - gateway answered non-2xx → [`PopError::GatewayRejectedPayment`] carrying
+///   BOTH the unredeemed send token and any change token.
+/// - 2xx → [`emit_paid`] (which surfaces the change token in json + human).
+#[allow(clippy::too_many_arguments)]
+async fn finish_payment(
+    http: &reqwest::Client,
+    method: reqwest::Method,
+    args: &PayArgs,
+    params: &PaymentParams,
+    charge: &Charge,
+    base: &str,
+    send_token: &str,
+    change_token: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let creds = build_credentials(params, send_token);
     let blob = encode_payment_credentials(&creds);
     eprintln!(
         "Presenting payment ({} sat) and retrying ...",
@@ -245,8 +298,13 @@ pub async fn run(
         .await
         .map_err(|e| {
             eprintln!("payment retry to {} failed: {e}", args.url);
-            PopError::MintUnreachable {
-                mint_url: args.url.clone(),
+            // The retry never reached the gateway, so the swapped-out send proofs
+            // are UNSPENT valid ecash. Carry BOTH tokens; mark NOT retriable (the
+            // input proofs are spent — do not retry with the original --token).
+            PopError::GatewayRetryFailed {
+                reason: e.to_string(),
+                send_token: send_token.to_string(),
+                change_token: change_token.map(str::to_string),
             }
         })?;
     let retry_status = retry.status();
@@ -256,23 +314,49 @@ pub async fn run(
         emit_paid(
             args,
             retry_status.as_u16(),
-            &charge,
+            charge,
             base,
-            change_token.as_deref(),
+            change_token,
             &retry_body,
             json,
         )?;
         Ok(())
     } else {
-        // Gateway rejected the (exact) payment. Surface its body AND the change
-        // token (the pop is already partly spent via the swap) so no value is lost.
+        // Gateway rejected the (exact) payment: it did NOT redeem, so the send
+        // set (the bigger half) AND any change set are unspent ecash. Surface
+        // BOTH so no value is lost.
         Err(PopError::GatewayRejectedPayment {
             status: retry_status.as_u16(),
             body: retry_body,
-            change_token,
+            send_token: send_token.to_string(),
+            change_token: change_token.map(str::to_string),
         }
         .into())
     }
+}
+
+/// Belt-and-suspenders: guarantees a post-swap error is token-bearing. If `err`
+/// already carries recovery tokens (the two expected gateway cases, or a
+/// `token_encode_failed` carrying raw proofs), it passes through unchanged;
+/// otherwise — any unforeseen failure after the swap spent the input — it is
+/// wrapped into a token-bearing [`PopError::GatewayRetryFailed`] so the spent
+/// value is never silently dropped.
+fn ensure_post_swap_token_bearing(
+    err: Box<dyn std::error::Error>,
+    send_token: &str,
+    change_token: Option<&str>,
+) -> Box<dyn std::error::Error> {
+    let pe = crate::error::from_boxed(err);
+    // Already surfaces tokens (gateway cases) or raw proofs (encode-failed)? Keep.
+    if pe.recovery_tokens().is_some() || pe.recovery_proofs_json().is_some() {
+        return pe.into();
+    }
+    PopError::GatewayRetryFailed {
+        reason: pe.message(),
+        send_token: send_token.to_string(),
+        change_token: change_token.map(str::to_string),
+    }
+    .into()
 }
 
 /// The two tokens produced by the exact-amount construction.
@@ -305,7 +389,21 @@ async fn build_exact_payment(
     if token_total == charge.amount {
         let send_sum = proofs_value(&token_proofs);
         assert_send_is_exact(send_sum, charge.amount)?;
-        let send_token = Token::new(mint_url_typed, token_proofs, None, unit.clone()).to_string();
+        // No swap ran, so the input is NOT yet spent — a stringify failure here
+        // is benign (the caller still holds the original `--token`). Still avoid
+        // the `.to_string()` panic: surface it as an error carrying the proofs.
+        let send_proofs_json = proofs_to_json(&token_proofs);
+        let send_token = token_to_string(&Token::new(
+            mint_url_typed,
+            token_proofs,
+            None,
+            unit.clone(),
+        ))
+        .map_err(|reason| PopError::TokenEncodeFailed {
+            reason: format!("fast-path send token: {reason}"),
+            send_proofs_json: Some(send_proofs_json),
+            change_proofs_json: None,
+        })?;
         return Ok(Outcome {
             send_token,
             change_token: None,
@@ -350,15 +448,65 @@ async fn build_exact_payment(
     let send_sum = proofs_value(&send_proofs);
     assert_send_is_exact(send_sum, charge.amount)?;
 
-    let send_token =
-        Token::new(mint_url_typed.clone(), send_proofs, None, unit.clone()).to_string();
-    let change_token =
-        change_proofs.map(|cp| Token::new(mint_url_typed, cp, None, unit.clone()).to_string());
+    // POST-SWAP: the input proofs are SPENT. From here, the freshly-minted
+    // send/change ecash exists only as these proofs/strings — every failure
+    // must surface it. Pre-serialize both proof sets to raw JSON so that if the
+    // `cashuB` Display (CBOR) ever fails, the value is still recoverable as
+    // proofs (never a `.to_string()` panic that vaporizes spent ecash).
+    let send_proofs_json = proofs_to_json(&send_proofs);
+    let change_proofs_json = change_proofs.as_ref().map(proofs_to_json);
+
+    let send_token = token_to_string(&Token::new(
+        mint_url_typed.clone(),
+        send_proofs,
+        None,
+        unit.clone(),
+    ))
+    .map_err(|reason| PopError::TokenEncodeFailed {
+        reason: format!("send bucket: {reason}"),
+        send_proofs_json: Some(send_proofs_json.clone()),
+        change_proofs_json: change_proofs_json.clone(),
+    })?;
+
+    let change_token = match change_proofs {
+        Some(cp) => Some(
+            token_to_string(&Token::new(mint_url_typed, cp, None, unit.clone())).map_err(
+                |reason| PopError::TokenEncodeFailed {
+                    reason: format!("change bucket: {reason}"),
+                    // The send token DID encode (above) — carry it so it is not
+                    // lost, plus the raw change proofs that failed to encode.
+                    send_proofs_json: Some(send_proofs_json.clone()),
+                    change_proofs_json: change_proofs_json.clone(),
+                },
+            )?,
+        ),
+        None => None,
+    };
 
     Ok(Outcome {
         send_token,
         change_token,
     })
+}
+
+/// Serializes a proof set to a JSON array string for recovery surfacing. Falls
+/// back to a diagnostic placeholder if serde ever fails (it does not for valid
+/// proofs) — this is a last-ditch value-recovery aid, never a hard error.
+fn proofs_to_json(proofs: &Proofs) -> String {
+    serde_json::to_string(proofs)
+        .unwrap_or_else(|e| format!("<proofs unserializable: {e}; {} proof(s)>", proofs.len()))
+}
+
+/// Stringifies a [`Token`] to its `cashuB…` form WITHOUT the `.to_string()`
+/// panic. `Token`'s `Display` (CBOR-encodes via ciborium) can return a
+/// `fmt::Error`; `ToString::to_string` PANICS on that, which on the post-swap
+/// path would vaporize already-spent proofs. Writing through [`std::fmt::Write`]
+/// surfaces the error as an `Err` instead, so the caller can recover the proofs.
+fn token_to_string(token: &Token) -> Result<String, String> {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    write!(&mut s, "{token}").map_err(|_| "cashuB encoding (CBOR) failed".to_string())?;
+    Ok(s)
 }
 
 /// Decodes the concrete [`Charge`] from parsed 402 params: unwrap the request
@@ -383,6 +531,16 @@ pub fn decode_charge(creq_a: &str) -> Result<Charge, Box<dyn std::error::Error>>
             reason: "payment request has no amount (PoP charges are exact-amount)".to_string(),
         })?
         .to_u64();
+    // A 0-sat exact charge is meaningless and unsafe: build_premint(0) yields an
+    // EMPTY send bucket (Amount::split(0) == []), so a proof-less token would be
+    // presented and a non-zero-fee keyset would burn the swap fee for nothing.
+    // Reject it up front (BEFORE any spend).
+    if amount == 0 {
+        return Err(PopError::ChallengeParseFailed {
+            reason: "payment request amount is 0 (a 0-sat exact charge is meaningless)".to_string(),
+        }
+        .into());
+    }
     let unit = pr.unit.ok_or_else(|| PopError::ChallengeParseFailed {
         reason: "payment request has no unit".to_string(),
     })?;

@@ -267,17 +267,54 @@ pub enum PopError {
         /// What the send set actually summed to.
         got: u64,
     },
-    /// The gateway rejected the presented payment on retry (it answered 402
-    /// again). Carries the gateway's response body and the change token (if the
-    /// swap already produced one) so no value is silently lost.
-    /// (`gateway_rejected_payment`)
+    /// The gateway rejected the presented payment on retry (it answered non-2xx).
+    /// The gateway did NOT redeem, so BOTH the send set (the bigger half — the
+    /// `amount`) AND any change set are unspent, spendable ecash. Carries BOTH so
+    /// no value is silently lost. (`gateway_rejected_payment`)
     GatewayRejectedPayment {
         /// The HTTP status the retry returned (typically 402).
         status: u16,
         /// The gateway's response body verbatim (intelligible rejection reason).
         body: String,
+        /// The send `cashuB` token — worth EXACTLY the charge. The gateway did
+        /// not redeem it, so it is unspent, valid ecash and MUST be recovered
+        /// (it is the bigger half of the value to save).
+        send_token: String,
         /// The change `cashuB` token, if a swap produced one before the retry —
         /// it is spendable and must not be lost.
+        change_token: Option<String>,
+    },
+    /// A freshly-minted proof set from the swap could not be encoded into its
+    /// `cashuB` token string (CBOR/Display serialization failed). The swap had
+    /// ALREADY spent the held input proofs, so the value survives ONLY as these
+    /// raw proofs — they are surfaced as JSON (the wire `Proof` shape:
+    /// `{amount, id, secret, C, ...}`) so the ecash is still recoverable by
+    /// re-encoding them. Must never happen in practice (proof CBOR does not fail);
+    /// it would indicate a serialization bug. (`token_encode_failed`)
+    TokenEncodeFailed {
+        /// What failed to encode (which bucket + the underlying reason).
+        reason: String,
+        /// The send proofs as a JSON array (worth EXACTLY the charge), or `None`
+        /// if the send token DID encode and only the change failed.
+        send_proofs_json: Option<String>,
+        /// The change proofs as a JSON array, if any were produced.
+        change_proofs_json: Option<String>,
+    },
+    /// The payment-retry HTTP call to the gateway failed at the transport layer
+    /// AFTER a swap had already spent the held proofs. The retry never reached
+    /// the gateway, so the freshly-minted send set (worth the `amount`) and any
+    /// change set are unspent, valid ecash that exist ONLY as these token
+    /// strings — losing them is permanent value loss. This is NOT retriable with
+    /// the original `--token` (those input proofs are already spent); retry
+    /// instead by presenting `send_token` to the gateway directly.
+    /// (`gateway_retry_failed`)
+    GatewayRetryFailed {
+        /// The transport-layer failure reason (what the HTTP send reported).
+        reason: String,
+        /// The send `cashuB` token — worth EXACTLY the charge, unspent (the
+        /// retry never reached the gateway). MUST be recovered.
+        send_token: String,
+        /// The change `cashuB` token, if a swap produced one — also unspent.
         change_token: Option<String>,
     },
 }
@@ -315,6 +352,8 @@ impl PopError {
             PopError::SwapFailed { .. } => "swap_failed",
             PopError::ExactAmountAssertionFailed { .. } => "exact_amount_assertion_failed",
             PopError::GatewayRejectedPayment { .. } => "gateway_rejected_payment",
+            PopError::GatewayRetryFailed { .. } => "gateway_retry_failed",
+            PopError::TokenEncodeFailed { .. } => "token_encode_failed",
         }
     }
 
@@ -504,15 +543,52 @@ impl PopError {
             PopError::GatewayRejectedPayment {
                 status,
                 body,
+                send_token,
                 change_token,
             } => {
+                // Surface BOTH tokens: the gateway did not redeem, so the send
+                // set AND any change set are unspent ecash that must be recovered.
                 let mut o = json!({
                     "status": status,
                     "body": body,
+                    "send_token": send_token,
                 });
-                // Surface the change token so a partially-spent pop is never lost.
                 if let Some(ct) = change_token {
                     o["change_token"] = json!(ct);
+                }
+                Some(o)
+            }
+            PopError::GatewayRetryFailed {
+                reason,
+                send_token,
+                change_token,
+            } => {
+                // The retry never reached the gateway after the swap: the send
+                // set (and any change) are unspent ecash — surface BOTH.
+                let mut o = json!({
+                    "reason": reason,
+                    "send_token": send_token,
+                });
+                if let Some(ct) = change_token {
+                    o["change_token"] = json!(ct);
+                }
+                Some(o)
+            }
+            PopError::TokenEncodeFailed {
+                reason,
+                send_proofs_json,
+                change_proofs_json,
+            } => {
+                // Surface the raw proofs (as parsed JSON when possible) so the
+                // ecash survives even though the cashuB string could not be built.
+                let parse =
+                    |s: &str| -> Value { serde_json::from_str(s).unwrap_or_else(|_| json!(s)) };
+                let mut o = json!({ "reason": reason });
+                if let Some(sp) = send_proofs_json {
+                    o["send_proofs"] = parse(sp);
+                }
+                if let Some(cp) = change_proofs_json {
+                    o["change_proofs"] = parse(cp);
                 }
                 Some(o)
             }
@@ -657,13 +733,41 @@ impl PopError {
                 status,
                 body,
                 change_token,
+                ..
             } => {
                 let ct = match change_token {
-                    Some(_) => " (a change token was produced and is in `details.change_token` — keep it)",
+                    Some(_) => " plus a change token",
                     None => "",
                 };
-                format!("the gateway rejected the payment (HTTP {status}): {body}{ct}")
+                format!(
+                    "the gateway rejected the payment (HTTP {status}): {body}. The gateway did \
+                     NOT redeem, so the send token{ct} are unspent ecash — RECOVER them \
+                     (json: `details.send_token`/`details.change_token`; human mode prints them below)"
+                )
             }
+            PopError::GatewayRetryFailed {
+                reason,
+                change_token,
+                ..
+            } => {
+                let ct = match change_token {
+                    Some(_) => " plus a change token",
+                    None => "",
+                };
+                format!(
+                    "the payment retry to the gateway failed after the swap already spent the \
+                     held proofs ({reason}). The retry never reached the gateway, so the send \
+                     token{ct} are unspent ecash — RECOVER them and present the send token to \
+                     the gateway directly; do NOT retry with the original --token (it is spent) \
+                     (json: `details.send_token`/`details.change_token`; human mode prints them below)"
+                )
+            }
+            PopError::TokenEncodeFailed { reason, .. } => format!(
+                "INTERNAL: the swap succeeded but a proof set could not be encoded to a cashuB \
+                 token ({reason}); your input proofs are ALREADY spent. The raw proofs are in \
+                 `details.send_proofs`/`details.change_proofs` (and printed below in human mode) \
+                 — they are your ecash; re-encode them to recover the value. Please report this."
+            ),
         }
     }
 
@@ -682,6 +786,45 @@ impl PopError {
             "schema_version": SCHEMA_VERSION,
             "error": err,
         })
+    }
+
+    /// The recovery tokens an error carries, if any: `(send_token, change_token)`.
+    ///
+    /// Only the **post-swap** `pay` errors carry these — once the swap has spent
+    /// the held input proofs, the freshly-minted send/change ecash exists ONLY as
+    /// these token strings, so they MUST be surfaced on EVERY exit (the json
+    /// envelope already carries them in `details`; `--human` mode reads them here
+    /// to print them verbatim, since human mode does not print `details`).
+    pub fn recovery_tokens(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            PopError::GatewayRejectedPayment {
+                send_token,
+                change_token,
+                ..
+            }
+            | PopError::GatewayRetryFailed {
+                send_token,
+                change_token,
+                ..
+            } => Some((send_token, change_token.as_deref())),
+            _ => None,
+        }
+    }
+
+    /// The raw recovery proofs (as JSON) an error carries, if any:
+    /// `(send_proofs_json, change_proofs_json)`. Only [`PopError::TokenEncodeFailed`]
+    /// carries these — the swap spent the input but the `cashuB` string could not
+    /// be built, so the ecash survives only as these raw proofs. `--human` mode
+    /// reads them here to print them verbatim (human mode does not print `details`).
+    pub fn recovery_proofs_json(&self) -> Option<(Option<&str>, Option<&str>)> {
+        match self {
+            PopError::TokenEncodeFailed {
+                send_proofs_json,
+                change_proofs_json,
+                ..
+            } => Some((send_proofs_json.as_deref(), change_proofs_json.as_deref())),
+            _ => None,
+        }
     }
 }
 
@@ -848,6 +991,102 @@ mod tests {
         );
     }
 
+    /// The post-swap `gateway_rejected_payment` is terminal (not retriable) and
+    /// MUST carry BOTH the send token AND the change token in its details +
+    /// `recovery_tokens()` — once the swap ran, both halves are unspent ecash and
+    /// losing either is permanent value loss.
+    #[test]
+    fn gateway_rejected_payment_surfaces_both_tokens() {
+        let e = PopError::GatewayRejectedPayment {
+            status: 402,
+            body: "still owe".to_string(),
+            send_token: "cashuBsend".to_string(),
+            change_token: Some("cashuBchange".to_string()),
+        };
+        let env = e.to_envelope();
+        assert_eq!(env["error"]["code"], json!("gateway_rejected_payment"));
+        assert_eq!(env["error"]["retriable"], json!(false));
+        assert_eq!(env["error"]["details"]["send_token"], json!("cashuBsend"));
+        assert_eq!(
+            env["error"]["details"]["change_token"],
+            json!("cashuBchange")
+        );
+        // recovery_tokens() exposes both for the human-mode renderer.
+        assert_eq!(
+            e.recovery_tokens(),
+            Some(("cashuBsend", Some("cashuBchange")))
+        );
+
+        // ZERO-CHANGE swap: change_token is None, but the send token is STILL
+        // surfaced (the input WAS spent → the send set must be recoverable).
+        let e = PopError::GatewayRejectedPayment {
+            status: 402,
+            body: "no".to_string(),
+            send_token: "cashuBsend".to_string(),
+            change_token: None,
+        };
+        assert_eq!(e.details().unwrap()["send_token"], json!("cashuBsend"));
+        assert!(e.details().unwrap().get("change_token").is_none());
+        assert_eq!(e.recovery_tokens(), Some(("cashuBsend", None)));
+    }
+
+    /// `gateway_retry_failed` is a NEW post-swap code: terminal (NOT retriable —
+    /// the input proofs are already spent), carrying BOTH unspent tokens so the
+    /// freshly-minted send/change ecash is never lost on a retry network error.
+    #[test]
+    fn gateway_retry_failed_is_terminal_and_carries_both_tokens() {
+        let e = PopError::GatewayRetryFailed {
+            reason: "connection reset by peer".to_string(),
+            send_token: "cashuBsend".to_string(),
+            change_token: Some("cashuBchange".to_string()),
+        };
+        let env = e.to_envelope();
+        assert_eq!(env["error"]["code"], json!("gateway_retry_failed"));
+        // CRITICAL: NOT retriable — retrying with the spent --token would mask
+        // the loss (the input proofs are gone).
+        assert_eq!(env["error"]["retriable"], json!(false));
+        assert_eq!(env["error"]["details"]["send_token"], json!("cashuBsend"));
+        assert_eq!(
+            env["error"]["details"]["change_token"],
+            json!("cashuBchange")
+        );
+        assert_eq!(
+            e.recovery_tokens(),
+            Some(("cashuBsend", Some("cashuBchange")))
+        );
+    }
+
+    /// `token_encode_failed` (post-swap, cashuB string unbuildable) carries the
+    /// raw proofs as parsed JSON so the value survives, and exposes them via
+    /// `recovery_proofs_json()` for the human-mode renderer.
+    #[test]
+    fn token_encode_failed_surfaces_raw_proofs() {
+        let e = PopError::TokenEncodeFailed {
+            reason: "send bucket: cbor write failed".to_string(),
+            send_proofs_json: Some(r#"[{"amount":600}]"#.to_string()),
+            change_proofs_json: Some(r#"[{"amount":400}]"#.to_string()),
+        };
+        let env = e.to_envelope();
+        assert_eq!(env["error"]["code"], json!("token_encode_failed"));
+        assert_eq!(env["error"]["retriable"], json!(false));
+        // The proof JSON is surfaced as PARSED json (not a string blob).
+        assert_eq!(
+            env["error"]["details"]["send_proofs"][0]["amount"],
+            json!(600)
+        );
+        assert_eq!(
+            env["error"]["details"]["change_proofs"][0]["amount"],
+            json!(400)
+        );
+        assert_eq!(
+            e.recovery_proofs_json(),
+            Some((Some(r#"[{"amount":600}]"#), Some(r#"[{"amount":400}]"#)))
+        );
+        // It is NOT a cashuB-token-bearing error (those go through a different
+        // human-mode path): recovery_tokens() must be None.
+        assert!(e.recovery_tokens().is_none());
+    }
+
     /// Message-only codes carry no `details` key.
     #[test]
     fn message_only_codes_have_no_details() {
@@ -989,7 +1228,18 @@ mod tests {
             PopError::GatewayRejectedPayment {
                 status: 402,
                 body: "still owe".into(),
+                send_token: "cashuBsend".into(),
                 change_token: Some("cashuBchange".into()),
+            },
+            PopError::GatewayRetryFailed {
+                reason: "connection reset".into(),
+                send_token: "cashuBsend".into(),
+                change_token: Some("cashuBchange".into()),
+            },
+            PopError::TokenEncodeFailed {
+                reason: "send bucket: cbor".into(),
+                send_proofs_json: Some("[]".into()),
+                change_proofs_json: None,
             },
         ]
     }

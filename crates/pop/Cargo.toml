@@ -65,3 +65,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Recovery-path integration tests (`tests/pay_recovery.rs`) stand up a tiny
+# in-process TCP stub that plays BOTH the pops-gateway (the 402 + retry) and the
+# mint (`/v1/keysets`, `/v1/keys`, `/v1/swap`) so the post-swap value-recovery
+# exits can be exercised end-to-end. `net`/`io-util` drive the listener; the
+# stub can also DROP a connection mid-retry to simulate the transport error that
+# must surface both tokens. The `mint` feature on cdk-common (already enabled
+# above) provides the mint-side signing primitives the swap stub uses.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+# `pop` is a bin crate (no lib target), so integration tests don't inherit its
+# `[dependencies]` — re-list the crates the recovery stub needs as dev-deps.
+# These resolve to the SAME versions the bin already builds (one graph).
+cdk-common = { version = "0.16", default-features = false, features = ["wallet", "mint"] }
+pops-core-verify = { path = "../pops-core-verify", default-features = false }
+bitcoin = { version = "0.32.2", default-features = false, features = ["std", "serde", "rand", "rand-std"] }
+hex = "0.4"

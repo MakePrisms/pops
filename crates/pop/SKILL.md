@@ -64,7 +64,7 @@ CONTRACT below and `agent-state.schema.json` for the schema.
 - **Failure**: `{ "schema_version": 1, "error": { "code", "retriable",
   "message", "details"? } }` on **stdout**, with a **non-zero exit (1)**. Two
   failure signals: the `error` key AND the non-zero exit.
-  - `code` — stable lower_snake_case enum (the 20 codes below). **Branch on
+  - `code` — stable lower_snake_case enum (the 31 codes below). **Branch on
     `code`, never on `message`.**
   - `retriable` — bool; `true` ⟺ the failure is transient (safe to retry the
     same call as-is).
@@ -302,9 +302,15 @@ pop pay https://app.example/resource --token cashuB... --max-amount 5000
 
 3. **Failure** — the standard `{schema_version, error:{…}}` envelope on stdout,
    exit 1. The pay-specific codes (see the table) tell you exactly what to fix.
-   Notably, **`gateway_rejected_payment`** carries `details.body` (the gateway's
-   reason) AND, if a swap already ran, `details.change_token` — **do not lose
-   that change token**, the pop is already partly spent.
+   Notably, the **post-swap** codes **`gateway_rejected_payment`** and
+   **`gateway_retry_failed`** carry BOTH `details.send_token` (worth the charge)
+   AND any `details.change_token` — once the swap ran, the held input is spent,
+   so **recover BOTH tokens; never lose them** (don't gate on `change_token`
+   being present — a no-change swap still spent the input). In `--human` mode
+   these recovery tokens are printed verbatim to stderr (json `details` is not
+   printed in human mode). `token_encode_failed` is the rare post-swap case where
+   even the `cashuB` string couldn't be built — it carries the raw proofs
+   (`details.send_proofs`/`change_proofs`) to re-encode instead.
 
 **Exactness is a money-safety invariant.** Internally, if the held token > the
 charge, `pay` does a NUT-03 swap that splits the proofs into a send set summing
@@ -529,7 +535,7 @@ Schema: `agent-state.schema.json` (next to this file). Filled example
 
 ---
 
-## ERROR CONTRACT — the 29 codes (FROZEN, additive-only)
+## ERROR CONTRACT — the 31 codes (FROZEN, additive-only)
 
 On failure, `pop` writes `{ "schema_version": 1, "error": { "code", "retriable",
 "message", "details"? } }` to **stdout** and exits **1**. Branch on `code` +
@@ -562,7 +568,9 @@ from them.
 | `amount_exceeds_cap` | false | needs_input | `{amount, cap}` REQ | (`pay`) the charge exceeds `--max-amount`; raise the cap only if you trust the charge — SENT NOTHING |
 | `swap_failed` | false | terminal | `{reason}` REQ | (`pay`) the NUT-03 swap-to-exact failed; the token may be unspent (verify) — nothing presented to the gateway |
 | `exact_amount_assertion_failed` | false | terminal | `{required, got}` REQ | (`pay`) INTERNAL money-safety abort — the send set didn't equal the charge; SENT NOTHING. Must never happen — report it |
-| `gateway_rejected_payment` | false | terminal | `{status, body, change_token?}` REQ(status, body) | (`pay`) the gateway answered 402 again after a valid payment; surface `body`. **If `change_token` is present, KEEP it — the pop is already partly spent** |
+| `gateway_rejected_payment` | false | terminal | `{status, body, send_token, change_token?}` REQ(status, body, send_token) | (`pay`) the gateway answered non-2xx after a valid payment; surface `body`. The gateway did NOT redeem, so **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH** (the pop's input was spent by the swap). `--human` mode prints both tokens to stderr |
+| `gateway_retry_failed` | false | terminal | `{reason, send_token, change_token?}` REQ(reason, send_token) | (`pay`) the payment-retry HTTP call failed at the transport layer AFTER the swap spent the input — the retry never reached the gateway. **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH and present `send_token` to the gateway directly; do NOT retry with the original `--token` (it is spent).** `--human` prints both to stderr |
+| `token_encode_failed` | false | terminal | `{reason, send_proofs?, change_proofs?}` REQ(reason) | (`pay`) INTERNAL: the swap spent the input but a proof set could not be encoded to a `cashuB` string. The raw proofs are in `details.send_proofs`/`details.change_proofs` (and printed in `--human`) — they ARE your ecash; re-encode to recover. Must never happen — report it |
 | `address_mismatch` | false | terminal (security) | `{expected, got}` REQ | mint's address ≠ our reconstruction — do NOT fund; tell the human |
 | `network_mismatch` | false | needs_input | `{expected, got}` REQ | wrong-network `--dest`; supply a `expected`-network address |
 | `deposit_not_found` | false | needs_input | `{deposit_id}` REQ | no such deposit id — re-check `pop list` |
@@ -588,10 +596,18 @@ Notes:
 - **`pay`-path codes** (`not_402`, `payment_rejected`, `no_payment_challenge`,
   `challenge_parse_failed`, `token_unit_mismatch`, `token_mint_mismatch`,
   `insufficient_token_value`, `amount_exceeds_cap`, `swap_failed`,
-  `exact_amount_assertion_failed`, `gateway_rejected_payment`) all belong to `pop
-  pay`. The validation codes (`token_*`, `insufficient_token_value`,
-  `amount_exceeds_cap`) are raised BEFORE any spend — when you see them, **no
-  token was sent**. `swap_failed` and `gateway_rejected_payment` can occur AFTER a
-  swap has run, so heed any `change_token` in their details (the held pop may
-  already be partly spent). `exact_amount_assertion_failed` is the internal
-  money-safety gate and must never fire — if it does, it sent nothing; report it.
+  `exact_amount_assertion_failed`, `gateway_rejected_payment`,
+  `gateway_retry_failed`, `token_encode_failed`) all belong to `pop pay`. The
+  validation codes (`token_*`, `insufficient_token_value`, `amount_exceeds_cap`)
+  and `swap_failed` are raised BEFORE / without a completed swap — when you see
+  them, **no token was sent and the held pop is intact** (verify on `swap_failed`).
+  `exact_amount_assertion_failed` also sends nothing (it fires before the gateway).
+  But **`gateway_rejected_payment`, `gateway_retry_failed`, and
+  `token_encode_failed` are POST-SWAP** — the swap already spent the held input,
+  so the freshly-minted ecash exists ONLY in the error: **always recover the
+  `send_token` (worth the charge) AND any `change_token` from their details**
+  (`token_encode_failed` carries raw `send_proofs`/`change_proofs` instead, when
+  even the cashuB string couldn't be built). In `--human` mode these tokens/proofs
+  are printed verbatim to stderr (details are not printed in human mode). Do NOT
+  gate recovery on `change_token` being present: a swap with no change still spent
+  the input, so `send_token` alone must be recovered.

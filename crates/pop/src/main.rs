@@ -119,6 +119,35 @@ async fn main() {
         if human {
             // Human mode: the human message to STDERR, no json, non-zero exit.
             eprintln!("error: {}", pe.message());
+            // Post-swap `pay` errors carry recovery tokens that ONLY live in
+            // `details` (which human mode never prints). The held input proofs
+            // are already spent, so these freshly-minted tokens are the only
+            // surviving form of that ecash — dump them verbatim to STDERR so the
+            // value is recoverable in human mode too (mirrors emit_paid's change
+            // print on the success path). MUST stay in sync with the JSON
+            // envelope's `details.send_token`/`details.change_token`.
+            if let Some((send_token, change_token)) = pe.recovery_tokens() {
+                eprintln!(
+                    "\nRECOVER THIS ECASH (the swap already spent your input — these are NOT stored):"
+                );
+                eprintln!("send token (worth the charge):\n{send_token}");
+                if let Some(ct) = change_token {
+                    eprintln!("change token:\n{ct}");
+                }
+            }
+            // The cashuB string itself could not be built — surface the raw proofs.
+            if let Some((send_proofs, change_proofs)) = pe.recovery_proofs_json() {
+                eprintln!(
+                    "\nRECOVER THIS ECASH as raw proofs (the cashuB token could not be encoded; \
+                     re-encode these to a token):"
+                );
+                if let Some(sp) = send_proofs {
+                    eprintln!("send proofs (worth the charge):\n{sp}");
+                }
+                if let Some(cp) = change_proofs {
+                    eprintln!("change proofs:\n{cp}");
+                }
+            }
         } else {
             // JSON mode (default): the single failure envelope to STDOUT.
             // stdout stays pure-parseable; nothing else is printed here.
