@@ -24,7 +24,12 @@
 //!
 //! `MintClientError` is intentionally coarse: `Unreachable` for transport
 //! failures and `RejectedSwap` for any mint-side refusal. It does not
-//! distinguish expired vs. double-spent vs. keyset-rotated refusals.
+//! distinguish expired vs. double-spent vs. keyset-rotated refusals. The one
+//! exception is `SwapOutputDleqInvalid`, kept as its OWN arm (never folded into
+//! `RejectedSwap`) because a swap whose returned blind signatures fail DLEQ is
+//! a money-safety event — the mint handed back outputs we MUST NOT treat as
+//! redeemed value — and the cross-slice contract surfaces it as the distinct
+//! `ChargeError::DleqInvalid { location: SwapOutput }`, not a double-spend.
 //!
 //! On `wasm32` the trait is `#[async_trait(?Send)]` (single-threaded; matches
 //! cdk's own wasm32 usage). On native it is `Send + Sync` so the validator can
@@ -100,4 +105,20 @@ pub enum MintClientError {
     /// double-spent proof, invalid signature, keyset rotated, etc.).
     #[error("mint rejected swap: {0}")]
     RejectedSwap(String),
+
+    /// The swap succeeded at the HTTP level but a returned blind signature
+    /// failed DLEQ verification — its NUT-12 proof is MISSING or INVALID
+    /// against the mint's advertised keyset key.
+    ///
+    /// SECURITY-CRITICAL and deliberately distinct from [`Self::RejectedSwap`]:
+    /// a missing/invalid swap-output DLEQ means the mint did NOT prove it
+    /// signed the outputs with the advertised key, so the unblinded proofs are
+    /// not provably valid bearer value and MUST NOT be redeemed. This is the
+    /// money-safety invariant — no redeemed value without a verified DLEQ. The
+    /// validator maps it to the contract's
+    /// `ChargeError::DleqInvalid { location: SwapOutput }` (a verification
+    /// failure → 402, the gateway does NOT serve the resource), NOT to a
+    /// double-spend.
+    #[error("swap-output DLEQ verification failed: {0}")]
+    SwapOutputDleqInvalid(String),
 }

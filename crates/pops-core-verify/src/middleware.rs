@@ -306,6 +306,10 @@ mod tests {
         Echo,
         Unreachable,
         RejectedSwap,
+        /// Swap-output DLEQ gate rejected the mint's returned blind signatures
+        /// (missing/invalid DLEQ). Drives the end-to-end money-safety path:
+        /// must yield 402 + re-challenge with the resource NOT served.
+        DleqInvalid,
     }
 
     struct MockMintClient {
@@ -340,6 +344,9 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
+                SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
+                    "mock swap-output DLEQ invalid".into(),
+                )),
             }
         }
     }
@@ -749,6 +756,46 @@ mod tests {
         assert!(
             body.contains("double-spend"),
             "expected double-spend (SAFE interim for any swap rejection) message, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_output_dleq_invalid_returns_402_and_does_not_serve_resource() {
+        // Money-safety end-to-end: the mint returned blind signatures whose
+        // DLEQ is missing/invalid, the swap-output gate rejected them, and that
+        // maps to ChargeError::DleqInvalid → 402 + fresh re-challenge. The
+        // gated handler MUST NOT run (no `ok:` body), so a malicious/buggy mint
+        // never gets the resource served against unsigned ecash.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let encoded = token.to_string();
+
+        let app = router_with(state_with(SwapResponse::DleqInvalid));
+        let response = app
+            .oneshot(request_with_token(&encoded))
+            .await
+            .expect("oneshot");
+
+        // Verification failure (not transport): 402, NOT 503/200.
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        // A fresh re-challenge is present.
+        assert!(response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .is_some());
+
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        // The handler never ran — the gated resource was NOT served.
+        assert!(
+            !body.starts_with("ok:"),
+            "gated resource must NOT be served on a DLEQ failure, got: {body}"
+        );
+        // The failure reason names the DLEQ problem.
+        assert!(
+            body.to_ascii_lowercase().contains("dleq"),
+            "expected a DLEQ failure message, got: {body}"
         );
     }
 

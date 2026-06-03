@@ -24,7 +24,7 @@ use std::str::FromStr;
 
 use cashu::nuts::nut00::ProofsMethods;
 use cashu::{Amount, CurrencyUnit, MintUrl, Proofs, Token};
-use pops_core_types::{ChargeError, RedeemedProofs};
+use pops_core_types::{ChargeError, DleqLocation, RedeemedProofs};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -58,7 +58,7 @@ pub struct ValidatedCharge {
 /// Variants split into two groups: structural (`UnitMismatch`,
 /// `MintNotAllowed`, `AmountMismatch`, `TokenEmpty`) — raised before
 /// any network call — and mint-mediated (`MintRejectedSwap`,
-/// `MintUnreachable`) — raised after the swap attempt.
+/// `SwapOutputDleqInvalid`, `MintUnreachable`) — raised after the swap attempt.
 ///
 /// These are the cashu-typed internal arms; the public
 /// [`CashuCredential`] maps them onto
@@ -103,6 +103,14 @@ pub enum ValidationError {
     /// etc.).
     #[error("mint rejected swap: {0}")]
     MintRejectedSwap(String),
+
+    /// The swap returned blind signatures whose NUT-12 DLEQ proof is MISSING
+    /// or INVALID against the mint's advertised key (money-safety: unsigned /
+    /// wrong-key outputs that MUST NOT be redeemed). Distinct from
+    /// [`Self::MintRejectedSwap`] so it maps to the contract's
+    /// `DleqInvalid { location: SwapOutput }`, not a double-spend.
+    #[error("swap-output DLEQ verification failed: {0}")]
+    SwapOutputDleqInvalid(String),
 
     /// Mint could not be reached (DNS, TCP, TLS, timeout, etc.).
     #[error("mint unreachable: {0}")]
@@ -200,6 +208,12 @@ impl<M: MintClient> ChargeValidator<M> {
             .map_err(|e| match e {
                 MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
+                // `keysets()` does no DLEQ work, so this arm is unreachable in
+                // practice; map defensively to a swap-rejection rather than
+                // panic, keeping the match total.
+                MintClientError::SwapOutputDleqInvalid(msg) => {
+                    ValidationError::MintRejectedSwap(msg)
+                }
             })?;
 
         // Extract proofs against the fetched keyset list. Resolves V1
@@ -268,6 +282,12 @@ impl<M: MintClient> ChargeValidator<M> {
             .map_err(|e| match e {
                 MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
+                // Money-safety: a missing/invalid swap-output DLEQ is its own
+                // outcome, NEVER collapsed into MintRejectedSwap (which would
+                // become a DoubleSpend 402 and hide the mint-trust signal).
+                MintClientError::SwapOutputDleqInvalid(msg) => {
+                    ValidationError::SwapOutputDleqInvalid(msg)
+                }
             })?;
 
         let new_amount = new_proofs
@@ -353,6 +373,10 @@ fn token_hash_hex(presented: &str) -> String {
 /// - `MintRejectedSwap`→ `DoubleSpend` (SAFE interim — both swap-rejections
 ///   collapse to DoubleSpend=402 until the NUT-03 error-body parse for
 ///   `Expired` lands; that split is conformance backlog, NOT Step 1).
+/// - `SwapOutputDleqInvalid` → `DleqInvalid { location: SwapOutput }` (a mint
+///   that omitted or forged the output DLEQ — verification-failed → 402; the
+///   gateway does NOT serve the resource. Money-safety: NEVER collapsed into
+///   `DoubleSpend`).
 fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
     match e {
         ValidationError::MintUnreachable(detail) => ChargeError::MintUnreachable {
@@ -384,6 +408,13 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
         // double-spent proof) collapse to DoubleSpend=402. The Expired split
         // needs the mint's NUT-03 error-body parse (conformance stream, G5).
         ValidationError::MintRejectedSwap(_) => ChargeError::DoubleSpend,
+        // Money-safety: a missing/invalid swap-output DLEQ is verification-
+        // failed at the SwapOutput location — a 402 (gateway serves nothing),
+        // distinct from a double-spend so the operator sees the mint-trust
+        // signal. NEVER serve the resource on this path.
+        ValidationError::SwapOutputDleqInvalid(_) => ChargeError::DleqInvalid {
+            location: DleqLocation::SwapOutput,
+        },
     }
 }
 
@@ -525,6 +556,13 @@ mod tests {
         Unreachable,
         /// Return [`MintClientError::RejectedSwap`] with a fixed message.
         RejectedSwap,
+        /// Return [`MintClientError::SwapOutputDleqInvalid`] — the swap-output
+        /// DLEQ gate (in [`swap_to_redeem`][crate::swap_ceremony::swap_to_redeem])
+        /// rejected a missing/invalid DLEQ. Asserts the validator's mapping of
+        /// this distinct error (NOT collapsed into a double-spend). The gate
+        /// itself is exercised against a real signing mock in
+        /// `swap_ceremony`'s tests.
+        DleqInvalid,
     }
 
     /// Canned outcome for the mock [`MintClient::keysets`] call.
@@ -615,6 +653,9 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
+                SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
+                    "mock swap-output DLEQ invalid".into(),
+                )),
             }
         }
     }
@@ -928,6 +969,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_propagates_swap_output_dleq_invalid() {
+        // Money-safety: a swap-output DLEQ failure (the gate in swap_to_redeem
+        // rejected missing/invalid DLEQ on the returned blind signatures) must
+        // surface as its OWN ValidationError arm, never collapsed into
+        // MintRejectedSwap — and produce no redeemed proofs.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::with_swap(SwapResponse::DleqInvalid);
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("swap-output DLEQ failure must fail validation");
+        assert!(
+            matches!(err, ValidationError::SwapOutputDleqInvalid(_)),
+            "expected SwapOutputDleqInvalid (distinct from MintRejectedSwap), got {err:?}"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            1,
+            "swap must be called once before the DLEQ failure surfaces"
+        );
+    }
+
+    #[tokio::test]
     async fn validate_happy_path_v1_keyset() {
         // Synthesize a V1-format token: proofs whose keyset id has the
         // `01` version byte. On the wire the token serializes the id as
@@ -1173,6 +1241,35 @@ mod tests {
             matches!(err, ChargeError::DoubleSpend),
             "expected DoubleSpend, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_maps_swap_output_dleq_to_dleq_invalid_swap_output() {
+        // Money-safety: a swap-output DLEQ failure maps to the contract's
+        // DleqInvalid { location: SwapOutput } — NOT DoubleSpend — so the
+        // envelope renders `dleq-invalid` and the gateway serves nothing. No
+        // redeemed proofs are produced.
+        use pops_core_types::DleqLocation;
+        let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::DleqInvalid);
+        let cred = CashuCredential::new(mock);
+
+        let err = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect_err("swap-output DLEQ failure must map to DleqInvalid");
+        match err {
+            ChargeError::DleqInvalid { location } => {
+                assert_eq!(
+                    location,
+                    DleqLocation::SwapOutput,
+                    "swap-output DLEQ failure must carry the SwapOutput location"
+                );
+            }
+            other => panic!("expected DleqInvalid {{ SwapOutput }}, got {other:?}"),
+        }
     }
 
     #[tokio::test]
