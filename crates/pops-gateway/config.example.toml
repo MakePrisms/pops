@@ -1,0 +1,59 @@
+# pops-gateway — example config.
+#
+# Copy this to `config.toml`, fill in the five REQUIRED facts below, then run
+# the gateway pointing at it (see the README quickstart). This file is parsed
+# by the gateway's `Config` (serde, `deny_unknown_fields`) — keep field names
+# and table nesting exactly as shown; an unknown key is a fail-fast error.
+
+# ── REQUIRED — the five facts ────────────────────────────────────────────────
+
+# Your existing API, unmodified. Every gated request is forwarded here on a
+# successful charge. Must be an absolute http(s) URL.
+upstream_url = "http://your-api:3000"
+
+# The pops mint the presented credential is redeemed against (a NUT-03 swap).
+# Also the target of the /readyz reachability probe. Must be http(s).
+mint_url = "https://mint.example.com"
+
+# WHERE received value lands — this path is a WALLET. It MUST be a persistent
+# mount: each line holds spendable bearer proofs, so if it lives on an ephemeral
+# container layer a restart DESTROYS received value. No default on purpose. Its
+# parent directory must already exist and be writable.
+proofs_sink = "/data/proofs.jsonl"
+
+# ── OPTIONAL ─────────────────────────────────────────────────────────────────
+
+# Gateway's own listen address. Default: 0.0.0.0:8080.
+# listen = "0.0.0.0:8080"
+
+[charge]
+# The pop_<unix_ts> currency unit you accept.
+#
+# NOTE: pop units are CLTV-dated and ROTATE — a given pop_<ts> eventually goes
+# inactive; use your mint's currently-ACTIVE unit: GET <mint_url>/v1/keysets and
+# pick a keyset with `active: true`. The value below is currently active (it is
+# also the Vercel demo's default), but confirm against your mint.
+unit = "pop_1780372941"
+
+# Exact net value required per request. Must be > 0.
+amount = 1
+
+# ── OPTIONAL ─────────────────────────────────────────────────────────────────
+
+# Mints the verifier accepts. Defaults to [mint_url] when omitted.
+# Uncomment to accept tokens from more than just `mint_url`.
+# [charge] continues here — `mints` / `description` are keys of the [charge] table.
+# mints = ["https://mint.example.com", "https://mint-b.example.com"]
+
+# Human-readable description shown in the 402 challenge.
+# description = "my API"
+
+# OPTIONAL per-path gating rules. Absent ⇒ gate EVERY path. When present, only
+# paths matching a non-`public` rule are gated; `public = true` paths forward
+# WITHOUT a gate. Each rule is a [[routes]] table.
+# [[routes]]
+# path   = "/health/*"
+# public = true            # forwarded WITHOUT a gate
+#
+# [[routes]]
+# path   = "/api/*"        # gated (public defaults to false)

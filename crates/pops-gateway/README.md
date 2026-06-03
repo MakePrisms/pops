@@ -16,33 +16,13 @@ re-implement verification.
 
 ## Quickstart
 
-Write one config (`config.toml`):
+One command, two prep steps. Copy the shipped example, edit the five required
+values, then run the published image:
 
-```toml
-# REQUIRED — the five facts.
-upstream_url = "http://your-api:3000"        # your existing API, unmodified
-mint_url     = "https://mint.example.com"    # the pops mint to redeem against
-proofs_sink  = "/data/proofs.jsonl"          # WHERE received value lands (a wallet!)
-
-[charge]
-unit   = "pop_1782668279"                    # the pop_<unix_ts> unit you accept
-amount = 1                                   # exact net value required per request
-
-# OPTIONAL
-# listen = "0.0.0.0:8080"                    # default 0.0.0.0:8080
-# [charge].mints       = ["https://mint.example.com"]   # default [mint_url]
-# [charge].description = "my API"            # shown in the 402 challenge
-
-# OPTIONAL per-path gating. Absent ⇒ gate EVERY path.
-# [[routes]]
-# path   = "/health/*"
-# public = true                              # forwarded WITHOUT a gate
-# [[routes]]
-# path   = "/api/*"                          # gated (public defaults to false)
-```
-
-Run the published image, mounting the config and a **persistent** volume for the
-proofs sink:
+1. Copy [`config.example.toml`](./config.example.toml) → `config.toml`.
+2. Edit the five required facts (`upstream_url`, `mint_url`, `proofs_sink`,
+   `[charge].unit`, `[charge].amount`) — they are commented inline in the file.
+3. Run, mounting the config and a **persistent** volume for the proofs sink:
 
 ```sh
 docker run -p 8080:8080 \
@@ -54,7 +34,87 @@ docker run -p 8080:8080 \
 Point your clients at `http://localhost:8080`. That's it — no local build.
 
 A bare request gets a `402` with the challenge; a request carrying a valid
-`Authorization: Payment <blob>` credential gates through to your upstream.
+`Authorization: Payment <blob>` credential gates through to your upstream. See
+[Paying the gateway (client side)](#paying-the-gateway-client-side) for how a
+client builds that credential.
+
+The five required facts, for reference (see
+[`config.example.toml`](./config.example.toml) for the optionals and comments):
+
+```toml
+upstream_url = "http://your-api:3000"        # your existing API, unmodified
+mint_url     = "https://mint.example.com"    # the pops mint to redeem against
+proofs_sink  = "/data/proofs.jsonl"          # WHERE received value lands (a wallet!)
+
+[charge]
+unit   = "pop_1780372941"                    # the pop_<unix_ts> unit you accept
+amount = 1                                   # exact net value required per request
+```
+
+> **NOTE:** pop units are CLTV-dated and ROTATE — a given `pop_<ts>` eventually
+> goes inactive; use your mint's currently-**ACTIVE** unit: `GET
+> <mint_url>/v1/keysets` and pick a keyset with `active: true`. The
+> `pop_1780372941` above is currently active (also the Vercel demo's default),
+> but confirm against your mint.
+
+---
+
+## Paying the gateway (client side)
+
+A client that receives a `402` pays by **retrying with an `Authorization:
+Payment <credential>` header**. The credential ECHOES the challenge from the
+402 and carries a `cashuB…` token. The field names + encoding below are exact —
+they are what the gateway parses (source of truth:
+`crates/pops-core-verify/src/envelope.rs`).
+
+### Flow
+
+1. **`GET`** the protected resource → `402` with a challenge header:
+   ```
+   WWW-Authenticate: Payment id="…", realm="…", method="cashu", intent="charge", request="<envelope>"
+   ```
+2. **Base64url-nopad-decode** the `request` param → JSON
+   `{"cashu_request":"creqA…"}`. The `creqA…` is a cashu payment-request that
+   describes the charge (amount, unit, accepted mints).
+3. With your **cashu wallet**, mint/select a `cashuB…` token for that amount +
+   unit at one of the accepted mints.
+4. **Build the credential** — a JSON object that echoes the challenge and
+   carries the token, then base64url-nopad-encode it and prefix `Payment `:
+   ```json
+   {
+     "challenge": {
+       "id": "<echo>",
+       "realm": "<echo>",
+       "method": "cashu",
+       "intent": "charge",
+       "request": "<echo of the request param, verbatim>"
+     },
+     "payload": { "cashu_token": "cashuB…" }
+   }
+   ```
+   → header value: `Payment <base64url-nopad(that JSON)>`
+5. **Retry** the request with that `Authorization` header → `200` (gated
+   content) or `402` (re-challenge — e.g. wrong amount/unit/mint, double-spend,
+   or mint unreachable; on `503` retry, the token was **not** consumed).
+
+### Rules
+
+- The scheme `Payment` is **case-insensitive**.
+- All **five** `challenge` fields (`id`, `realm`, `method`, `intent`, `request`)
+  are **REQUIRED** and must be echoed **verbatim** from the 402.
+- `method` **must** equal `cashu`.
+- Extra fields (`source`, `description`, …) are tolerated and ignored.
+
+### Canonical builder
+
+Don't hand-roll the encoding. `pops-core-verify` exposes the builder:
+
+- **WASM:** `build_payment_credential(credentials_json)` — takes the JSON object
+  above as a string, returns the base64url-nopad blob; you prepend `Payment `.
+- **Native (Rust):** `encode_payment_credentials(&PaymentCredentials)` — same
+  blob.
+
+Source of truth for the format: `crates/pops-core-verify/src/envelope.rs`.
 
 ---
 
@@ -77,7 +137,7 @@ appends them to `proofs_sink`.
 The record written per settlement is one JSON line:
 
 ```json
-{"received_at":1782668300,"token_hash":"<sha256-hex>","amount":1,"unit":"pop_1782668279","active_keyset_id":"<hex>","fresh_proofs":"cashuB…"}
+{"received_at":1782668300,"token_hash":"<sha256-hex>","amount":1,"unit":"pop_1780372941","active_keyset_id":"<hex>","fresh_proofs":"cashuB…"}
 ```
 
 `token_hash` is a SHA-256 of the *presented* token — a shareable receipt
