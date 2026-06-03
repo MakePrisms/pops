@@ -393,31 +393,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cashu"
-version = "0.17.0-rc.0"
-source = "git+https://github.com/MakePrisms/cdk.git?branch=feat%2Fcdk-pop-readonly#b0a8d80a0d38af56f2b322f2594935ea55acf9e8"
-dependencies = [
- "bitcoin",
- "cbor-diag",
- "ciborium",
- "lightning",
- "lightning-invoice",
- "once_cell",
- "serde",
- "serde_json",
- "serde_with",
- "strum",
- "strum_macros",
- "thiserror 2.0.18",
- "tracing",
- "unicode-normalization",
- "url",
- "uuid",
- "web-time",
- "zeroize",
-]
-
-[[package]]
 name = "cbor-diag"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -460,7 +435,7 @@ dependencies = [
  "bitcoin",
  "bitcoin-payment-instructions",
  "cbor-diag",
- "cdk-common 0.16.0",
+ "cdk-common",
  "cdk-signatory",
  "ciborium",
  "futures",
@@ -494,9 +469,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bitcoin",
- "cashu 0.16.0",
+ "cashu",
  "cbor-diag",
- "cdk-http-client 0.16.0",
+ "cdk-http-client",
  "ciborium",
  "futures",
  "getrandom 0.2.17",
@@ -511,38 +486,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tonic",
- "tracing",
- "url",
- "uuid",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-time",
-]
-
-[[package]]
-name = "cdk-common"
-version = "0.17.0-rc.0"
-source = "git+https://github.com/MakePrisms/cdk.git?branch=feat%2Fcdk-pop-readonly#b0a8d80a0d38af56f2b322f2594935ea55acf9e8"
-dependencies = [
- "anyhow",
- "async-trait",
- "bitcoin",
- "cashu 0.17.0-rc.0",
- "cbor-diag",
- "cdk-http-client 0.17.0-rc.0",
- "ciborium",
- "futures",
- "getrandom 0.2.17",
- "jsonwebtoken",
- "lightning",
- "lightning-invoice",
- "parking_lot",
- "paste",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror 2.0.18",
- "tokio",
  "tracing",
  "url",
  "uuid",
@@ -574,27 +517,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cdk-http-client"
-version = "0.17.0-rc.0"
-source = "git+https://github.com/MakePrisms/cdk.git?branch=feat%2Fcdk-pop-readonly#b0a8d80a0d38af56f2b322f2594935ea55acf9e8"
-dependencies = [
- "futures",
- "futures-channel",
- "js-sys",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio-tungstenite",
- "tracing",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "cdk-signatory"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -604,7 +526,7 @@ dependencies = [
  "async-trait",
  "bip39",
  "bitcoin",
- "cdk-common 0.16.0",
+ "cdk-common",
  "clap",
  "getrandom 0.2.17",
  "home",
@@ -1837,7 +1759,7 @@ version = "0.1.0"
 dependencies = [
  "bip39",
  "bitcoin",
- "cdk-common 0.17.0-rc.0",
+ "cdk-common",
  "chrono",
  "clap",
  "esplora-client",
@@ -1880,7 +1802,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
- "cashu 0.16.0",
+ "cashu",
  "cdk",
  "getrandom 0.2.17",
  "http",
@@ -1904,7 +1826,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "cashu 0.16.0",
+ "cashu",
  "futures-util",
  "http",
  "pops-core-types",

@@ -22,7 +22,7 @@ pops-core-funder = { path = "../pops-core-funder" }
 
 # cdk-common carries the Cashu primitives the mint/issue flow uses (NUT-04/20
 # MintRequest, proofs, keysets).
-cdk-common = { git = "https://github.com/MakePrisms/cdk.git", branch = "feat/cdk-pop-readonly", default-features = false, features = ["wallet", "mint"] }
+cdk-common = { version = "0.16", default-features = false, features = ["wallet", "mint"] }
 
 # bitcoin 0.32.x MUST match pops-core-funder's bitcoin version so the kernel's
 # return types (XOnlyPublicKey, ScriptBuf, TapSighash, schnorr::Signature,
