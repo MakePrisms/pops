@@ -10,8 +10,6 @@
 //! The construction is taproot with a NUMS-commit internal key and a
 //! single-leaf script tree containing the CLTV recovery script.
 //!
-//! No I/O, no state. Every function here is deterministic over its inputs.
-//!
 //! ## Layered API
 //!
 //! Individual stage functions (`compute_cm`, `compute_internal_key`,
@@ -210,14 +208,9 @@ pub fn compute_funding_address(
 mod tests {
     //! Cryptographic vector tests.
     //!
-    //! Each intermediate stage gets its own pinned-vector test so a
-    //! single-step bug surfaces in the right place (rather than only
-    //! at the final address comparison). All vectors are generated
-    //! from this crate's own functions over a fixed input tuple; once
-    //! pinned, regressions in any step will break exactly one test.
-    //!
-    //! The fixed input tuple uses deterministically chosen byte
-    //! patterns so a human can read them off the test:
+    //! Each intermediate stage gets its own pinned-vector test so a single-step
+    //! bug surfaces in the right place, not only at the final address compare.
+    //! The fixed input tuple uses readable byte patterns:
     //!
     //! - `mint_pubkey` = 33-byte compressed pubkey starting `0x02` with
     //!   x-coordinate `01..21` (sequential bytes).

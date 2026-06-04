@@ -497,7 +497,7 @@ fn token_hash_hex(presented: &str) -> String {
 /// - `TokenEmpty` / `MalformedToken` → `MalformedCredential`.
 /// - `MintRejectedSwap`→ `DoubleSpend` (SAFE interim — both swap-rejections
 ///   collapse to DoubleSpend=402 until the NUT-03 error-body parse for
-///   `Expired` lands; that split is conformance backlog, NOT Step 1).
+///   `Expired` lands; that split is conformance backlog).
 /// - `SwapOutputDleqInvalid` → `DleqInvalid { location: SwapOutput }` (a mint
 ///   that omitted or forged the output DLEQ — verification-failed → 402; the
 ///   gateway does NOT serve the resource. Money-safety: NEVER collapsed into
@@ -1471,7 +1471,7 @@ mod tests {
     }
 
     // ---- Credential impl: ValidationError → ChargeError mapping + the
-    //      RedeemedProofs shape (build-plan §1.3 new tests) -------------
+    //      RedeemedProofs shape -------------
 
     use super::CashuCredential;
     use crate::credential::{ChargeRequirement, Credential};
@@ -1601,7 +1601,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_rejected_swap_to_double_spend() {
-        // SAFE interim: any swap rejection collapses to DoubleSpend in Step 1.
+        // SAFE interim: any swap rejection collapses to DoubleSpend.
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)])
             .to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);

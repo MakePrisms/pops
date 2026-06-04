@@ -181,7 +181,7 @@ pub enum PopError {
         message: String,
     },
 
-    // ---- pay path (phase-2; defined now, used by `pay`) ----
+    // ---- pay path ----
     /// A URL the funder tried to pay did not answer with HTTP 402. (`not_402`)
     Not402 {
         /// The URL that was probed.

@@ -23,13 +23,9 @@
 //! before [`Token::proofs`][cashu::Token::proofs] will return them.
 //!
 //! `MintClientError` is intentionally coarse: `Unreachable` for transport
-//! failures and `RejectedSwap` for any mint-side refusal. It does not
-//! distinguish expired vs. double-spent vs. keyset-rotated refusals. The one
-//! exception is `SwapOutputDleqInvalid`, kept as its OWN arm (never folded into
-//! `RejectedSwap`) because a swap whose returned blind signatures fail DLEQ is
-//! a money-safety event — the mint handed back outputs we MUST NOT treat as
-//! redeemed value — and the cross-slice contract surfaces it as the distinct
-//! `ChargeError::DleqInvalid { location: SwapOutput }`, not a double-spend.
+//! failures, `RejectedSwap` for any mint-side refusal. The one carved-out arm
+//! is `SwapOutputDleqInvalid` — a money-safety event, never folded into
+//! `RejectedSwap` (see the variant docs).
 //!
 //! On `wasm32` the trait is `#[async_trait(?Send)]` (single-threaded; matches
 //! cdk's own wasm32 usage). On native it is `Send + Sync` so the validator can

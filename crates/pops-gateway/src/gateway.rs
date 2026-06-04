@@ -7,8 +7,7 @@
 //! 1. decides whether a path is gated ([`crate::routes`]);
 //! 2. on a gated path, runs the gate (no/invalid credential → 402 with the
 //!    prebuilt challenge; else parse + `verify_and_redeem`);
-//! 3. **on success, persists `fresh_proofs` durably BEFORE forwarding** (spec
-//!    refinement #2);
+//! 3. **on success, persists `fresh_proofs` durably BEFORE forwarding**;
 //! 4. forwards the ORIGINAL request to `upstream_url` and streams the response
 //!    back;
 //! 5. maps a [`ChargeError`] to HTTP exactly as the Vercel `route.ts`
@@ -199,10 +198,9 @@ where
     };
 
     // ── Step 4: PERSIST fresh_proofs DURABLY *before* forwarding. ──
-    // (spec refinement #2: a crash between forward and persist loses
-    // already-consumed proofs.) On failure we do NOT forward and emit the
-    // proofs + token_hash to stderr as a last resort so value is never silently
-    // lost.
+    // A crash between forward and persist loses already-consumed proofs. On
+    // failure we do NOT forward and emit the proofs + token_hash to stderr as a
+    // last resort so value is never silently lost.
     if let Err(e) = state.sink.persist(&redeemed.proofs) {
         eprintln!(
             "FATAL persist failure (value at risk): {e}\n  token_hash={}\n  fresh_proofs={}",
@@ -339,8 +337,7 @@ where
         Err(e) => {
             // Upstream down/unreachable. Proofs (if any) are ALREADY persisted —
             // the operator keeps the value; the client loses the pop. This is
-            // the documented v1 edge (spec refinement #3). 504 if it was a
-            // timeout, else 502.
+            // the documented v1 edge. 504 if it was a timeout, else 502.
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {

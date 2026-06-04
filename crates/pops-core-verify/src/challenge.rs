@@ -2,7 +2,7 @@
 //! auth-scheme. This is the cashu-coupled `creqA` layer (the cashu-free
 //! request/credentials envelopes live in [`crate::envelope`]). It compiles on
 //! both native and wasm (cashu compiles to wasm), but is NOT re-exported on
-//! the wasm-bindgen surface — only the envelope codec is (Step 1).
+//! the wasm-bindgen surface — only the envelope codec is.
 //!
 //! [`CashuRequirement`] is the cashu-typed verifier-side description of what a
 //! holder must present: a Cashu mint set, unit, amount and metadata.

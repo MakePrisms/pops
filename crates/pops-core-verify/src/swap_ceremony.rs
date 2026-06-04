@@ -15,13 +15,6 @@
 //!   and [`WasmMintClient`][crate::wasm_mint_client::WasmMintClient] each
 //!   implement only the three `MintHttp` methods and delegate their
 //!   [`MintClient::swap`][crate::mint_client::MintClient::swap] to this fn.
-//!
-//! This is the build-plan §3.1 extraction: "lift the swap ceremony out of
-//! `CdkMintClient::swap` into a SHARED helper that takes the client for HTTP
-//! and keeps the crypto cashu-pure". The validator's `MintClient` seam (which
-//! the unit-test mocks stub at the `swap`→`Proofs` level) is left untouched —
-//! the ceremony sits a layer *below* it, between a concrete client and the
-//! mint, so the 72 folded tests remain the regression guard.
 
 use async_trait::async_trait;
 use cashu::amount::{FeeAndAmounts, SplitTarget};

@@ -20,13 +20,13 @@
 //! * False → [`MintClientError::Unreachable`] (HTTP 5xx, transport,
 //!   timeout, ambiguous network condition). Re-trying may succeed.
 //!
-//! **Swap ceremony.** This client no longer hand-rolls the ceremony. As of
-//! build-plan §3.1 the blinded-output generation + `construct_proofs` unblind
-//! live in the transport-generic [`swap_to_redeem`][crate::swap_ceremony::swap_to_redeem]
-//! helper; `CdkMintClient` supplies only the three raw HTTP calls via
-//! [`MintHttp`] and delegates [`MintClient::swap`] to that shared ceremony.
-//! The wasm client ([`WasmMintClient`][crate::wasm_mint_client::WasmMintClient])
-//! drives the *same* ceremony over an injected `fetch`.
+//! **Swap ceremony.** The blinded-output generation + `construct_proofs`
+//! unblind live in the transport-generic
+//! [`swap_to_redeem`][crate::swap_ceremony::swap_to_redeem] helper;
+//! `CdkMintClient` supplies only the three raw HTTP calls via [`MintHttp`] and
+//! delegates [`MintClient::swap`] to that shared ceremony. The wasm client
+//! ([`WasmMintClient`][crate::wasm_mint_client::WasmMintClient]) drives the
+//! *same* ceremony over an injected `fetch`.
 //!
 //! The implementation assumes a zero-fee keyset (PoP v1 fixes fees at 0).
 
@@ -127,9 +127,8 @@ impl MintClient for CdkMintClient {
         mint_url: &MintUrl,
         proofs: Proofs,
     ) -> Result<Proofs, MintClientError> {
-        // Delegate to the transport-generic ceremony (build-plan §3.1): the
-        // crypto is shared with the wasm client; this struct supplies only
-        // the raw HTTP above.
+        // Delegate to the transport-generic ceremony: the crypto is shared with
+        // the wasm client; this struct supplies only the raw HTTP above.
         swap_to_redeem(self, mint_url, proofs).await
     }
 }

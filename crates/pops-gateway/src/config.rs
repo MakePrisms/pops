@@ -3,9 +3,9 @@
 //! Five facts are REQUIRED (missing/empty any → fail-fast structured error +
 //! nonzero exit, never a panic): `upstream_url`, `mint_url`, `[charge].unit`,
 //! `[charge].amount`, and `proofs_sink`. `proofs_sink` has NO default on
-//! purpose (spec refinement #1): a silent in-container default would, on a
-//! restart of an unmounted container, lose received bearer value — so the
-//! operator is forced to land a conscious path.
+//! purpose: a silent in-container default would, on a restart of an unmounted
+//! container, lose received bearer value — so the operator is forced to land a
+//! conscious path.
 //!
 //! Parsing ([`Config::from_toml_str`]) is pure serde; semantic validation
 //! ([`Config::validate`]) produces a [`ConfigError`] naming the exact field and
@@ -58,7 +58,7 @@ pub struct Config {
     pub mint_url: String,
 
     /// Where redeemed bearer proofs are persisted. REQUIRED, NO default — this
-    /// path is a WALLET holding received value (spec refinement #1).
+    /// path is a WALLET holding received value.
     pub proofs_sink: PathBuf,
 
     /// Listen address for the gateway's own HTTP listener.
@@ -288,8 +288,8 @@ impl Config {
         };
 
         // proofs_sink — parent must exist + be writable (we never create dirs:
-        // a missing parent is almost always an un-mounted volume, which is the
-        // exact "lose received value" failure refinement #1 guards against).
+        // a missing parent is almost always an un-mounted volume, the exact
+        // "lose received value" failure we guard against).
         validate_proofs_sink(&self.proofs_sink)?;
 
         // Build the cashu requirement ONCE, with the CANONICAL unit string.

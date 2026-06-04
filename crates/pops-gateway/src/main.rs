@@ -19,7 +19,7 @@ use pops_gateway::proofs_sink::ProofsSink;
 const DEFAULT_CONFIG_PATH: &str = "/etc/pops-gateway/config.toml";
 
 fn main() -> ExitCode {
-    // Structured JSON logs (plan §4.2) so an agent/operator can parse outcomes.
+    // Structured JSON logs so an agent/operator can parse outcomes.
     // `env-filter` honours RUST_LOG; default to `info`.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -39,7 +39,7 @@ fn main() -> ExitCode {
         }
     };
 
-    // ── LOUD proofs_sink warning (refinement #1). ──
+    // ── LOUD proofs_sink warning. ──
     tracing::warn!(
         proofs_sink = %validated.proofs_sink.display(),
         "proofs_sink={} holds BEARER ecash = received value; ensure this is a PERSISTENT mount or you will lose received value.",

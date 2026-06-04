@@ -14,8 +14,8 @@
 //! Two compile surfaces:
 //! - `native` (default): adds the cdk-backed [`cdk_mint_client`], the axum
 //!   [`middleware`], and the cashu-typed [`challenge`] codec.
-//! - `wasm`: a wasm-bindgen surface (the cashu-free envelope codec in Step 1;
-//!   the full `verify_and_redeem` in Step 2).
+//! - `wasm`: a wasm-bindgen surface exporting the cashu-free envelope codec and
+//!   the full `verify_and_redeem`.
 //!
 //! [`Credential`]: crate::credential::Credential
 
@@ -33,20 +33,16 @@ pub mod mint_client;
 pub mod swap_ceremony;
 
 // `cdk_mint_client` (cdk wallet HTTP) and `middleware` (axum) are the only
-// truly native-only modules. `challenge` is cashu-typed but cashu compiles to
-// wasm, so it stays `always` — `cashu_credential` (the verify engine, also
-// `always`) depends on it, and Step 2 exposes that engine on wasm. The wasm
-// EXPORT surface (`wasm`) still re-exports only the cashu-free envelope codec.
+// truly native-only modules; everything else stays `always` because `cashu`
+// compiles to wasm.
 #[cfg(feature = "native")]
 pub mod cdk_mint_client;
 #[cfg(feature = "native")]
 pub mod middleware;
 
-// The injected-`fetch` MintClient + the wasm-bindgen export surface. Both are
-// wasm-feature-only (the fetch client needs js-sys/web-sys; the exports need
-// wasm-bindgen). `wasm_mint_client` is gated on the feature, not the target,
-// so a native `--features wasm` typecheck still sees it — but its `fetch`
-// bodies only run on wasm32.
+// The injected-`fetch` MintClient + the wasm-bindgen export surface. Gated on
+// the feature, not the target, so a native `--features wasm` typecheck sees
+// them; the `fetch` bodies only run on wasm32.
 #[cfg(feature = "wasm")]
 pub mod wasm;
 #[cfg(feature = "wasm")]

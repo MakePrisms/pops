@@ -14,13 +14,11 @@
 //!
 //! ## Scope: ON-CHAIN DEPOSITS ONLY
 //!
-//! `balance` accounts the **on-chain CLTV deposits** this wallet tracks — it does
-//! NOT count spendable ecash. This wallet *mints-and-prints* `cashuB` tokens and
-//! holds **no token custody** (db: "no tokens stored"), so already-minted
-//! spendable-pops are not part of any balance number here. (If/when a phase-2
-//! `pay` command gives the wallet ecash custody, `balance` would surface
-//! spendable-pops then.) So `balance` answers "how much BTC have I got locked /
-//! mintable / recoverable", NOT "how much spendable ecash do I hold".
+//! `balance` accounts the **on-chain CLTV deposits** this wallet tracks, NOT
+//! spendable ecash. The wallet mints-and-prints `cashuB` tokens and holds **no
+//! token custody** (db: "no tokens stored"), so minted spendable-pops are not in
+//! any balance number — `balance` answers "how much BTC is locked / mintable /
+//! recoverable", not "how much spendable ecash do I hold".
 //!
 //! ## Lifecycle → money mapping
 //!
@@ -31,13 +29,11 @@
 //! - `expired`   — funding deadline passed → BTC LOCKED **iff** funds were sent
 //!   (`funding_txid` set); an un-funded expired quote holds NOTHING → NOT locked.
 //!
-//! So **locked** (`total_locked_sats`, and the candidate set for
-//! `recoverable_now`) = funded-and-not-recovered = `paid + minted + funded-expired`
-//! (BTC still in the CLTV address). The test is funding-gated, not state-gated
-//! (an expired-but-never-funded deposit must NOT inflate the locked total), and
-//! lives in one place — [`Deposit::is_locked`] — shared with `status`.
-//! `mintable_now` = `paid`. A locked deposit is recoverable once chain MTP ≥ its
-//! `ts_expiry` (BIP-113, the same maturity gate `recover` uses).
+//! So `total_locked_sats` (and the `recoverable_now` candidate set) is
+//! funding-gated, not state-gated, and lives in one place —
+//! [`Deposit::is_locked`], shared with `status`. `mintable_now` = `paid`; a
+//! locked deposit is recoverable once chain MTP ≥ its `ts_expiry` (BIP-113, the
+//! same gate `recover` uses).
 
 use std::path::Path;
 

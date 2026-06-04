@@ -1,6 +1,6 @@
 //! Injected-`fetch` [`MintClient`] for wasm32 (feature `wasm`).
 //!
-//! The build-plan §3.1 second [`MintClient`] impl: where
+//! The second [`MintClient`] impl: where
 //! [`CdkMintClient`][crate::cdk_mint_client::CdkMintClient] drives the shared
 //! swap ceremony over cdk's native HTTP, [`WasmMintClient`] drives the *same*
 //! [`swap_to_redeem`] ceremony over the JS `fetch` available on `globalThis`
@@ -11,10 +11,8 @@
 //! `fetch` is reached by reflecting `"fetch"` off `globalThis` rather than
 //! through `web_sys::window()` so the same code runs in a Node serverless
 //! function (no `window`/`WorkerGlobalScope`) as in a browser. The async
-//! plumbing (`wasm_bindgen_futures::JsFuture` over the two `Promise`s a fetch
-//! yields — the response, then its body text) is exactly the
-//! "async-across-wasm-bindgen for injected fetch" path the plan calls out as
-//! risk (c)/R3 to de-risk.
+//! plumbing is `wasm_bindgen_futures::JsFuture` over the two `Promise`s a fetch
+//! yields — the response, then its body text.
 //!
 //! HTTP status drives the coarse [`MintClientError`] split the validator
 //! needs: a 5xx (or a `fetch` that rejects — DNS/TCP/TLS/CORS) is

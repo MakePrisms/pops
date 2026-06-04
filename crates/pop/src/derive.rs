@@ -12,18 +12,8 @@
 //! ```
 //!
 //! - **purpose = `5271376'`** = `0x506F50` = the ASCII bytes `"PoP"`
-//!   (`P`=0x50, `o`=0x6F, `P`=0x50). Hardened. This value is part of what
-//!   reproduces the funder key everywhere (this wallet, and Bitcoin Core
-//!   recovery), so it is fixed forever.
-//!
-//!   NOTE FOR KEEPER REVIEW: the genesis decision text gave THREE specifiers
-//!   for this index that do not all agree — decimal `5271888'`, hex
-//!   `0x506F50`, and ASCII `"PoP"`. Two of the three (`0x506F50` and ASCII
-//!   `"PoP"`) equal decimal **5271376**; only the standalone decimal `5271888`
-//!   (= `0x506F90`, which is NOT valid ASCII "PoP") is the outlier. This
-//!   implementation uses `0x506F50` = `5271376'` because the ASCII-"PoP"
-//!   rationale is the stated meaning. CONFIRM before mainnet funds depend on
-//!   it — a wrong purpose makes every deposit derive at the wrong path.
+//!   (`P`=0x50, `o`=0x6F, `P`=0x50). Hardened, fixed forever — it reproduces
+//!   the funder key everywhere (this wallet, and Bitcoin Core recovery).
 //! - **coin_type'** — SLIP-44 per network: `0'` mainnet, `1'` for
 //!   test / signet / regtest. Hardened.
 //! - **account = `0'`**, **change = `0`** — fixed.

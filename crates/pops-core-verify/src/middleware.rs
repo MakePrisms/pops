@@ -936,8 +936,8 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_must_be_opaque_base64url_blob() {
-        // The transitional `method="cashu", token="..."` param form is
-        // no longer accepted — base64 decode trips → 402 re-challenge.
+        // The `method="cashu", token="..."` param form is not accepted —
+        // base64 decode trips → 402 re-challenge.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
             .oneshot(request_with_authorization(
