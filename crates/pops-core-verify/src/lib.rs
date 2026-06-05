@@ -31,14 +31,19 @@ pub mod redeemer;
 // compiled: the crypto is shared by the native cdk client and the wasm
 // injected-fetch client, and `cashu` itself compiles to wasm.
 pub mod swap_ceremony;
+// The NUT-24 `X-Cashu` transport codec. Cashu-free string handling over the
+// shared verify core, so it stays `always` and wasm-compiles like `envelope`.
+pub mod xcashu;
 
-// `cdk_mint_client` (cdk wallet HTTP) and `middleware` (axum) are the only
-// truly native-only modules; everything else stays `always` because `cashu`
-// compiles to wasm.
+// `cdk_mint_client` (cdk wallet HTTP), `middleware`, and `middleware_xcashu`
+// (axum) are the only truly native-only modules; everything else stays `always`
+// because `cashu` compiles to wasm.
 #[cfg(feature = "native")]
 pub mod cdk_mint_client;
 #[cfg(feature = "native")]
 pub mod middleware;
+#[cfg(feature = "native")]
+pub mod middleware_xcashu;
 
 // The injected-`fetch` MintClient + the wasm-bindgen export surface. Gated on
 // the feature, not the target, so a native `--features wasm` typecheck sees
