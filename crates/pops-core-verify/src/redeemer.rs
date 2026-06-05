@@ -1,7 +1,7 @@
-//! The ecash-agnostic verify seam: the [`Credential`] trait + its
+//! The ecash-agnostic verify seam: the [`Redeemer`] trait + its
 //! decoupled request/result types.
 //!
-//! This is the Axis-A generalization: a `Credential` verifies a presented
+//! This is the Axis-A generalization: a `Redeemer` verifies a presented
 //! credential string against a [`ChargeRequirement`] and, on success, redeems
 //! it — returning a [`Redeemed`] whose payload is the cross-slice
 //! [`pops_core_types::RedeemedProofs`] contract. The only ecash-specific logic
@@ -47,7 +47,7 @@ pub struct ChargeRequirement {
     pub single_use: bool,
 }
 
-/// The result of a successful [`Credential::verify_and_redeem`].
+/// The result of a successful [`Redeemer::verify_and_redeem`].
 ///
 /// `unit` + `amount` echo the validated facts; `proofs` is the cross-slice
 /// [`RedeemedProofs`] payload the SDK needs to confirm value + emit a receipt
@@ -74,10 +74,32 @@ pub struct Redeemed {
 /// the trait is the place a second ecash method would slot in.
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
-pub trait Credential {
+pub trait Redeemer {
     /// Verify `presented` (a credential string — for cashu, a `cashuB…`
     /// token) against `req`, redeem it, and return what the operator now
     /// holds. Errors are the committed [`ChargeError`] contract.
+    ///
+    /// # Value-safety contract
+    ///
+    /// Every implementation MUST satisfy these invariants. They are what makes
+    /// the seam safe to swap (the cdk impl and any other ecash impl alike); an
+    /// impl that breaks one is incorrect, regardless of what it returns:
+    ///
+    /// 1. **Atomic redeem** — the value is redeemed in one atomic operation;
+    ///    partial redemption is impossible. On any failure the credential is
+    ///    left unspent at its source (no value-loss).
+    /// 2. **Output-DLEQ verified** — the returned proofs are verified (NUT-12
+    ///    DLEQ for cashu) before being treated as value: a malicious or buggy
+    ///    source cannot make the redeemer accept unsigned outputs.
+    /// 3. **Exact amount** — `Redeemed.amount` is the net value received AND
+    ///    equals `req.amount`. Both overpay and underpay return a
+    ///    [`ChargeError`]; neither is silently accepted.
+    /// 4. **Double-spend caught** — an already-spent or replayed credential
+    ///    returns a [`ChargeError`].
+    /// 5. **Unit + mint match** — the credential's unit and source satisfy
+    ///    `req`, or it returns a [`ChargeError`].
+    /// 6. **No value-loss on any error path** — every `Err(ChargeError)` leaves
+    ///    no orphaned or half-redeemed value.
     async fn verify_and_redeem(
         &self,
         presented: &str,
@@ -85,10 +107,10 @@ pub trait Credential {
     ) -> Result<Redeemed, ChargeError>;
 }
 
-/// `wasm32` variant of [`Credential`]: `?Send` futures (single-threaded).
+/// `wasm32` variant of [`Redeemer`]: `?Send` futures (single-threaded).
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
-pub trait Credential {
+pub trait Redeemer {
     /// See the native variant.
     async fn verify_and_redeem(
         &self,

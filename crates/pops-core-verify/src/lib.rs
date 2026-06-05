@@ -5,7 +5,7 @@
 //! presented credential and redeems it (for the Cashu impl, the redemption is
 //! a NUT-03 swap whose success proves unspentness + unexpired `final_expiry`).
 //!
-//! "Charge-ness" is the surrounding `Payment` envelope + the [`Credential`]
+//! "Charge-ness" is the surrounding `Payment` envelope + the [`Redeemer`]
 //! seam; the only ecash-specific logic lives in [`cashu_credential`]. Public
 //! types are decoupled from `cashu::{Amount,MintUrl,CurrencyUnit}` (→
 //! `String`/`u64`) and produced against the [`pops_core_types`] contract
@@ -17,16 +17,16 @@
 //! - `wasm`: a wasm-bindgen surface exporting the cashu-free envelope codec and
 //!   the full `verify_and_redeem`.
 //!
-//! [`Credential`]: crate::credential::Credential
+//! [`Redeemer`]: crate::redeemer::Redeemer
 
 #![warn(missing_docs)]
 
 pub mod cashu_credential;
 pub mod challenge;
-pub mod credential;
 pub mod envelope;
 pub mod error;
 pub mod mint_client;
+pub mod redeemer;
 // The cashu-pure NUT-03 swap ceremony + its raw-HTTP (`MintHttp`) seam. Always
 // compiled: the crypto is shared by the native cdk client and the wasm
 // injected-fetch client, and `cashu` itself compiles to wasm.

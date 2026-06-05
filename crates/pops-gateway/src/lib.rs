@@ -25,7 +25,7 @@ use std::sync::Arc;
 use axum::routing::{any, get};
 use axum::Router;
 
-use pops_core_verify::credential::Credential;
+use pops_core_verify::redeemer::Redeemer;
 
 use crate::gateway::{handle, AppState};
 use crate::health::{healthz, readyz};
@@ -42,7 +42,7 @@ use crate::health::{healthz, readyz};
 /// `CashuCredential<CdkMintClient>` and tests inject a mock-backed credential.
 pub fn build_router<C>(state: Arc<AppState<C>>) -> Router
 where
-    C: Credential + Send + Sync + 'static,
+    C: Redeemer + Send + Sync + 'static,
 {
     Router::new()
         .route("/healthz", get(healthz))

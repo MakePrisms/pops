@@ -9,7 +9,7 @@
 //! obviously-bad token — or a flood of them — never reaches the mint.
 //!
 //! [`ChargeValidator`] is the cashu-typed engine; [`CashuCredential`] wraps it
-//! to expose the ecash-agnostic [`Credential`][crate::credential::Credential]
+//! to expose the ecash-agnostic [`Redeemer`][crate::redeemer::Redeemer]
 //! seam (converting to `String`/`u64` and the [`pops_core_types`] contract).
 
 use std::str::FromStr;
@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::challenge::{decode_token, CashuRequirement};
-use crate::credential::{ChargeRequirement, Credential, Redeemed};
+use crate::redeemer::{ChargeRequirement, Redeemer, Redeemed};
 use crate::error::Error as ChallengeError;
 use crate::mint_client::{MintClient, MintClientError};
 
@@ -321,9 +321,9 @@ impl<M: MintClient> ChargeValidator<M> {
 }
 
 /// Convert a cashu-typed [`CashuRequirement`] into the decoupled
-/// [`ChargeRequirement`] the [`Credential`] seam speaks. For callers (the
+/// [`ChargeRequirement`] the [`Redeemer`] seam speaks. For callers (the
 /// middleware) that hold the cashu-typed requirement but drive a generic
-/// `Credential`.
+/// `Redeemer`.
 pub fn charge_requirement_from_cashu(req: &CashuRequirement) -> ChargeRequirement {
     ChargeRequirement {
         amount: u64::from(req.amount),
@@ -424,7 +424,7 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
     }
 }
 
-/// The ecash-agnostic [`Credential`] implementation for Cashu: wraps a
+/// The ecash-agnostic [`Redeemer`] implementation for Cashu: wraps a
 /// [`ChargeValidator`] and produces the cross-slice [`RedeemedProofs`].
 /// `token_hash` and `fresh_proofs` are computed HERE because both need data only
 /// the core holds (the raw presented string / the swap-returned proofs).
@@ -459,10 +459,10 @@ impl<M: MintClient> CashuCredential<M> {
     }
 }
 
-// `?Send` on wasm32 to match the `Credential` trait + `MintClient` seam.
+// `?Send` on wasm32 to match the `Redeemer` trait + `MintClient` seam.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-impl<M: MintClient> Credential for CashuCredential<M> {
+impl<M: MintClient> Redeemer for CashuCredential<M> {
     async fn verify_and_redeem(
         &self,
         presented: &str,
@@ -1275,11 +1275,11 @@ mod tests {
         );
     }
 
-    // ---- Credential impl: ValidationError → ChargeError mapping + the
+    // ---- Redeemer impl: ValidationError → ChargeError mapping + the
     //      RedeemedProofs shape -------------
 
     use super::CashuCredential;
-    use crate::credential::{ChargeRequirement, Credential};
+    use crate::redeemer::{ChargeRequirement, Redeemer};
     use pops_core_types::ChargeError;
 
     fn charge_req(unit: &str, mints: Vec<MintUrl>, amount: u64) -> ChargeRequirement {

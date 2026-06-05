@@ -6,8 +6,8 @@
 //! `WWW-Authenticate: Payment` challenge (whose `request="…"` wraps the
 //! [`CashuRequirement`][crate::challenge::CashuRequirement] `creqA`). The client
 //! retries with the credentials blob; the middleware verify+redeems through the
-//! generic [`Credential`] seam and, on success, attaches the
-//! [`Redeemed`][crate::credential::Redeemed] to `request.extensions_mut()`.
+//! generic [`Redeemer`] seam and, on success, attaches the
+//! [`Redeemed`][crate::redeemer::Redeemed] to `request.extensions_mut()`.
 //!
 //! Status mapping: ANY validation failure (bad header/token, wrong
 //! unit/mint/amount, refused swap) → 402 + a fresh re-challenge (plain-text body
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use crate::cdk_mint_client::CdkMintClient;
 use crate::challenge::{encode_challenge, CashuRequirement};
-use crate::credential::Credential;
+use crate::redeemer::Redeemer;
 use crate::envelope::{
     encode_request_envelope, parse_payment_authorization, AuthParseError, EchoedChallenge,
     PAYMENT_SCHEME,
@@ -43,19 +43,19 @@ pub const DEFAULT_REALM: &str = "pops-core-verify";
 pub const INTENT_CHARGE: &str = "charge";
 
 /// Request-time state: the [`CashuRequirement`] to advertise on 402 and the
-/// [`Credential`] that verifies + redeems on retry.
+/// [`Redeemer`] that verifies + redeems on retry.
 ///
 /// Generic over `C` so a second ecash method slots in with no middleware change;
 /// constructed once at router-build time and shared (`Arc`).
 #[derive(Debug)]
-pub struct ChargeMiddlewareState<C: Credential> {
+pub struct ChargeMiddlewareState<C: Redeemer> {
     /// What the verifier requires; built into the 402's `request="…"` `creqA`.
     pub requirement: CashuRequirement,
     /// The credential the middleware delegates to on retry.
     pub credential: Arc<C>,
 }
 
-impl<C: Credential> ChargeMiddlewareState<C> {
+impl<C: Redeemer> ChargeMiddlewareState<C> {
     /// Wraps `credential` in an [`Arc`] and pairs it with the requirement.
     pub fn new(requirement: CashuRequirement, credential: C) -> Self {
         Self {
@@ -82,7 +82,7 @@ pub async fn require_charge<C>(
     next: Next,
 ) -> Response
 where
-    C: Credential + Send + Sync + 'static,
+    C: Redeemer + Send + Sync + 'static,
 {
     // A missing header or any non-`Payment` scheme is "no payment attempt" → 402.
     let Some(header_raw) = req.headers().get(http::header::AUTHORIZATION) else {
@@ -220,7 +220,7 @@ mod tests {
     use super::*;
     use crate::cashu_credential::CashuCredential;
     use crate::challenge::CashuRequirement;
-    use crate::credential::Redeemed;
+    use crate::redeemer::Redeemed;
     use crate::envelope::{encode_payment_credentials, CashuPayload, PaymentCredentials};
     use crate::mint_client::{MintClient, MintClientError};
 

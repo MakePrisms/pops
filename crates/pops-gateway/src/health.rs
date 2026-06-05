@@ -11,7 +11,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use http::StatusCode;
 
-use pops_core_verify::credential::Credential;
+use pops_core_verify::redeemer::Redeemer;
 
 use crate::gateway::AppState;
 
@@ -26,7 +26,7 @@ pub async fn healthz() -> Response {
 /// unreachable mint is the dependency we gate on.)
 pub async fn readyz<C>(State(state): State<Arc<AppState<C>>>) -> Response
 where
-    C: Credential,
+    C: Redeemer,
 {
     let mint = state.config.mint_url.to_string();
     let url = format!("{}/v1/keysets", mint.trim_end_matches('/'));

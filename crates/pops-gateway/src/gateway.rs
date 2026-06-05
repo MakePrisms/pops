@@ -17,7 +17,7 @@ use pops_core_types::ChargeError;
 use pops_core_verify::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use pops_core_verify::cdk_mint_client::CdkMintClient;
 use pops_core_verify::challenge::{encode_challenge, CashuRequirement};
-use pops_core_verify::credential::Credential;
+use pops_core_verify::redeemer::Redeemer;
 use pops_core_verify::envelope::{
     encode_request_envelope, parse_payment_authorization, AuthParseError, PAYMENT_SCHEME,
 };
@@ -38,7 +38,7 @@ pub const CHALLENGE_ID: &str = "pops-gateway";
 
 /// Per-request shared state, built once at startup (`Arc`). `C` is the credential
 /// seam (production: `CashuCredential<CdkMintClient>` via [`AppState::production`]).
-pub struct AppState<C: Credential> {
+pub struct AppState<C: Redeemer> {
     /// The pre-parsed config.
     pub config: ValidatedConfig,
     /// The credential that verifies + redeems on retry.
@@ -51,7 +51,7 @@ pub struct AppState<C: Credential> {
     pub upstream: reqwest::Client,
 }
 
-impl<C: Credential> AppState<C> {
+impl<C: Redeemer> AppState<C> {
     /// Build the shared state. The forwarding client gets the configured request
     /// + connect timeout so a hung upstream is bounded (and `504` is reachable).
     pub fn new(config: ValidatedConfig, credential: C, sink: ProofsSink) -> Self {
@@ -107,7 +107,7 @@ fn build_www_authenticate(requirement: &CashuRequirement) -> HeaderValue {
 /// endpoints, which are routed separately) flows through here.
 pub async fn handle<C>(State(state): State<Arc<AppState<C>>>, req: Request) -> Response
 where
-    C: Credential + Send + Sync + 'static,
+    C: Redeemer + Send + Sync + 'static,
 {
     let path = req.uri().path().to_string();
 
@@ -130,7 +130,7 @@ where
 /// 4. forward the already-buffered body (no read can fail after the charge).
 async fn gate_then_forward<C>(state: Arc<AppState<C>>, req: Request) -> Response
 where
-    C: Credential + Send + Sync + 'static,
+    C: Redeemer + Send + Sync + 'static,
 {
     let (parts, body) = req.into_parts();
 
@@ -199,7 +199,7 @@ where
 /// guard against an unbounded-body OOM on this unauthenticated path.
 async fn forward<C>(state: &AppState<C>, req: Request) -> Response
 where
-    C: Credential,
+    C: Redeemer,
 {
     let (parts, body) = req.into_parts();
     let body_bytes = match read_body_capped(body, state.config.max_body_bytes).await {
@@ -272,7 +272,7 @@ async fn forward_buffered<C>(
     body_bytes: axum::body::Bytes,
 ) -> Response
 where
-    C: Credential,
+    C: Redeemer,
 {
     let target = match upstream_target(&state.config.upstream_url, &parts.uri) {
         Ok(u) => u,
@@ -411,7 +411,7 @@ fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
 /// `Cache-Control: no-store`).
 fn challenge_402<C>(state: &AppState<C>, failure: Option<&str>) -> Response
 where
-    C: Credential,
+    C: Redeemer,
 {
     let body = match failure {
         Some(detail) => format!(
@@ -441,7 +441,7 @@ where
 /// (verification / malformed-credential) → `402` + a fresh challenge.
 fn charge_error_to_response<C>(state: &AppState<C>, e: ChargeError) -> Response
 where
-    C: Credential,
+    C: Redeemer,
 {
     match &e {
         ChargeError::MintUnreachable { .. } => (

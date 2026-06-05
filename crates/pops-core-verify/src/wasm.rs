@@ -21,7 +21,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::cashu_credential::CashuCredential;
-use crate::credential::{ChargeRequirement, Credential};
+use crate::redeemer::{ChargeRequirement, Redeemer};
 use crate::envelope::{
     decode_request_envelope as core_decode_request_envelope, encode_payment_credentials,
     encode_request_envelope as core_encode_request_envelope, parse_payment_authorization,

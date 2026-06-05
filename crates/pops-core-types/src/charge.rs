@@ -10,7 +10,7 @@
 //! contract the SDK maps off, but the SDK owns emission — no `to_status()` etc.
 //! lives here.
 
-/// Error returned by `Credential::verify_and_redeem`. The per-variant docs are
+/// Error returned by `Redeemer::verify_and_redeem`. The per-variant docs are
 /// AUTHORITATIVE on each variant's status; this banner gives the invariant.
 ///
 /// Variants encode THREE NON-COLLAPSING concerns the HTTP envelope must keep
