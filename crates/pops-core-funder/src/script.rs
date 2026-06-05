@@ -1,23 +1,13 @@
-//! Taproot output-key construction for PoPs commitment addresses.
+//! Taproot output-key construction for PoPs commitment addresses (pure
+//! functions). Computes `Q`, its ancillary values, and the bech32m address from
+//! public quote inputs (`mint_pubkey`, `ts_expiry`, `nonce`, `funder_pubkey`),
+//! used at quote-create time and at funding-verification time (to reconstruct
+//! the expected address for chain-side matching).
 //!
-//! Pure-function module. Computes the taproot output key `Q`, ancillary
-//! cryptographic values, and bech32m address for a PoPs funding commitment
-//! from public quote inputs (`mint_pubkey`, `ts_expiry`, `nonce`,
-//! `funder_pubkey`). Used at quote-create time (to populate the response
-//! address) and at funding-verification time (to reconstruct the expected
-//! address for chain-side matching).
-//!
-//! The construction is taproot with a NUMS-commit internal key and a
-//! single-leaf script tree containing the CLTV recovery script.
-//!
-//! ## Layered API
-//!
-//! Individual stage functions (`compute_cm`, `compute_internal_key`,
-//! `compute_leaf_script`, `compute_leaf_hash`, `compute_tap_tweak`,
-//! `compute_output_key`, `compute_bech32m_address`) expose each
-//! intermediate value so callers (and tests) can pin or inspect each
-//! step. `compute_funding_address` is the all-in-one convenience that
-//! wires them together.
+//! The construction is taproot with a NUMS-commit internal key and a single-leaf
+//! script tree holding the CLTV recovery script. The stage functions expose each
+//! intermediate value so callers/tests can pin a single step;
+//! [`compute_funding_address`] wires them together.
 
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::script::Builder;
@@ -41,31 +31,24 @@ pub const NUMS_H_X: [u8; 32] = [
 /// `cm = TaggedHash("PoPCommit/v1", ...)`.
 pub const POP_COMMIT_TAG: &[u8] = b"PoPCommit/v1";
 
-/// Returns the NUMS H point as an [`XOnlyPublicKey`] via `lift_x` of
-/// [`NUMS_H_X`].
-///
-/// # Panics
-///
-/// Never. [`NUMS_H_X`] is a fixed valid x-only pubkey and `lift_x`
-/// succeeds by construction.
+/// The NUMS H point as an [`XOnlyPublicKey`] (`lift_x` of [`NUMS_H_X`]; never
+/// panics — fixed valid key).
 pub fn nums_h() -> XOnlyPublicKey {
     XOnlyPublicKey::from_slice(&NUMS_H_X).expect("NUMS_H_X is a valid x-only pubkey")
 }
 
 /// Computes `cm = TaggedHash("PoPCommit/v1", mint_pubkey || ts_expiry_be ||
-/// nonce || funder_pubkey)`.
+/// nonce || funder_pubkey)`. Pre-image layout (105 bytes):
 ///
-/// Pre-image layout (105 bytes total):
+/// | Field           | Type                        | Size |
+/// |-----------------|-----------------------------|------|
+/// | `mint_pubkey`   | compressed secp256k1 pubkey | 33 B |
+/// | `ts_expiry`     | u64 big-endian              | 8 B  |
+/// | `nonce`         | random bytes                | 32 B |
+/// | `funder_pubkey` | x-only secp256k1 pubkey     | 32 B |
 ///
-/// | Field           | Type                              | Size |
-/// |-----------------|-----------------------------------|------|
-/// | `mint_pubkey`   | compressed secp256k1 pubkey       | 33 B |
-/// | `ts_expiry`     | u64 big-endian                    | 8 B  |
-/// | `nonce`         | random bytes                      | 32 B |
-/// | `funder_pubkey` | x-only secp256k1 pubkey           | 32 B |
-///
-/// The mint pubkey is hashed in compressed (33-byte, parity-preserving)
-/// form — no x-only stripping.
+/// The mint pubkey is hashed COMPRESSED (33-byte, parity-preserving) — no x-only
+/// stripping.
 pub fn compute_cm(
     mint_pubkey: &[u8; 33],
     ts_expiry: u64,
@@ -84,21 +67,16 @@ pub fn compute_cm(
     sha256::Hash::from_engine(eng).to_byte_array()
 }
 
-/// Computes `P_internal = NUMS_H + cm·G`.
-///
-/// `cm` is interpreted as a scalar modulo the curve order. The addition
-/// `NUMS_H + cm·G` is implemented via secp256k1's `add_exp_tweak`. The
-/// returned key is the x-only projection (even-y).
+/// Computes `P_internal = NUMS_H + cm·G` (`cm` as a scalar mod the curve order,
+/// via `add_exp_tweak`), returned x-only (even-y).
 ///
 /// # Panics
 ///
-/// Panics only on a statistically impossible event: `cm` colliding with
-/// the secp256k1 curve order (probability ~ 2^-256), or the resulting
-/// point being the point at infinity. Both are vanishingly improbable
-/// for a SHA-256 output.
+/// Only on a statistically impossible event (~2^-256): `cm` equal to the curve
+/// order, or the sum being the point at infinity.
 pub fn compute_internal_key(cm: &[u8; 32]) -> XOnlyPublicKey {
     let secp = Secp256k1::verification_only();
-    // Lift NUMS_H to a full PublicKey on the even-y branch.
+    // Lift NUMS_H on the even-y branch.
     let nums = nums_h().public_key(bitcoin::key::Parity::Even);
     let scalar = Scalar::from_be_bytes(*cm)
         .expect("cm is a 32-byte hash; collision with curve order is statistically impossible");
@@ -114,15 +92,14 @@ pub fn compute_internal_key(cm: &[u8; 32]) -> XOnlyPublicKey {
 /// <ts_expiry> OP_CHECKLOCKTIMEVERIFY OP_VERIFY <funder_pubkey> OP_CHECKSIG
 /// ```
 ///
-/// `ts_expiry` is emitted as a `LockTime` so `script::Builder::push_lock_time`
-/// produces the correct minimal `CScriptNum` encoding. `funder_pubkey`
-/// is pushed as 32 raw x-only bytes for tapscript `OP_CHECKSIG`.
+/// `ts_expiry` is emitted as a `LockTime` so `push_lock_time` produces the
+/// minimal `CScriptNum` encoding; `funder_pubkey` is 32 raw x-only bytes for
+/// tapscript `OP_CHECKSIG`.
 ///
 /// # Panics
 ///
-/// Panics if `ts_expiry` does not fit in a `u32` (i.e. > 2^32 - 1 ≈
-/// year 2106). Quote-create-time validation rejects out-of-range values
-/// before reaching here.
+/// If `ts_expiry` does not fit in u32 (≈ year 2106). Quote-create validation
+/// rejects out-of-range values before here.
 pub fn compute_leaf_script(ts_expiry: u64, funder_pubkey: &XOnlyPublicKey) -> ScriptBuf {
     let locktime = LockTime::from_consensus(
         u32::try_from(ts_expiry).expect("ts_expiry fits in u32 (≤ year 2106 sec timestamp)"),
@@ -142,25 +119,19 @@ pub fn compute_leaf_hash(leaf_script: &ScriptBuf) -> TapLeafHash {
     TapLeafHash::from_script(leaf_script, LeafVersion::TapScript)
 }
 
-/// Computes the tap-tweak: `t = H_TapTweak(P_internal.x || leaf_hash)`.
-///
-/// Returned as raw 32 bytes for symmetric pin-testing; convert via
-/// [`Scalar::from_be_bytes`] for use with the key-tweaking API.
+/// Computes the tap-tweak `t = H_TapTweak(P_internal.x || leaf_hash)`, raw 32
+/// bytes (convert via [`Scalar::from_be_bytes`] for the key-tweaking API).
 pub fn compute_tap_tweak(internal_key: &XOnlyPublicKey, leaf_hash: &TapLeafHash) -> [u8; 32] {
     let node_hash = TapNodeHash::from(*leaf_hash);
     TapTweakHash::from_key_and_tweak(*internal_key, Some(node_hash)).to_byte_array()
 }
 
-/// Computes `Q = P_internal + t·G` and returns the x-only output key.
-///
-/// `tweak` must be a valid scalar (modulo the curve order). The returned
-/// key is the x-only projection.
+/// Computes `Q = P_internal + t·G`, returned x-only.
 ///
 /// # Panics
 ///
-/// Panics only on a statistically impossible event: `tweak` colliding with
-/// the secp256k1 curve order, or the resulting point being the point at
-/// infinity. Both are vanishingly improbable for a SHA-256 output.
+/// Only on a statistically impossible event (~2^-256): `tweak` equal to the
+/// curve order, or the sum being the point at infinity.
 pub fn compute_output_key(internal_key: &XOnlyPublicKey, tweak: &[u8; 32]) -> XOnlyPublicKey {
     let secp = Secp256k1::verification_only();
     let scalar = Scalar::from_be_bytes(*tweak).expect(
@@ -173,21 +144,17 @@ pub fn compute_output_key(internal_key: &XOnlyPublicKey, tweak: &[u8; 32]) -> XO
     tweaked.x_only_public_key().0
 }
 
-/// Encodes the taproot output key as a bech32m P2TR address (`bc1p…`,
-/// `tb1p…`, `bcrt1p…`).
+/// Encodes the taproot output key as a bech32m P2TR address.
 pub fn compute_bech32m_address(output_key: &XOnlyPublicKey, network: Network) -> String {
-    // The output key is already tweaked. Wrap as a TweakedPublicKey to
-    // bypass the "must call tap_tweak" lint; the tweak was computed in
-    // compute_output_key.
+    // `Q` is already tweaked (in compute_output_key), so the
+    // `dangerous_assume_tweaked` wrap is sound and bypasses the "must call
+    // tap_tweak" lint.
     let tweaked = TweakedPublicKey::dangerous_assume_tweaked(*output_key);
     Address::p2tr_tweaked(tweaked, network).to_string()
 }
 
-/// All-in-one convenience: computes `cm`, `P_internal`, leaf script, leaf
-/// hash, tap tweak, output key, and returns the bech32m address.
-///
-/// Used at quote-create time and at funding-verification time to recompute
-/// the expected address.
+/// All-in-one: `cm` → `P_internal` → leaf script → leaf hash → tap tweak →
+/// output key → bech32m address.
 pub fn compute_funding_address(
     mint_pubkey: &[u8; 33],
     ts_expiry: u64,
@@ -206,18 +173,9 @@ pub fn compute_funding_address(
 
 #[cfg(test)]
 mod tests {
-    //! Cryptographic vector tests.
-    //!
-    //! Each intermediate stage gets its own pinned-vector test so a single-step
-    //! bug surfaces in the right place, not only at the final address compare.
-    //! The fixed input tuple uses readable byte patterns:
-    //!
-    //! - `mint_pubkey` = 33-byte compressed pubkey starting `0x02` with
-    //!   x-coordinate `01..21` (sequential bytes).
-    //! - `ts_expiry` = `1_782_259_200` (2026-06-01T00:00:00Z).
-    //! - `nonce` = bytes `0x42` repeated 32 times.
-    //! - `funder_pubkey` = x-only pubkey with x-coordinate bytes
-    //!   `0xaa` repeated 32 times (chosen to be a valid x-only).
+    //! Cryptographic vector tests. Each intermediate stage gets its own
+    //! pinned-vector test so a single-step bug surfaces in the right place, not
+    //! only at the final address compare.
     use super::*;
     use bitcoin::hashes::Hash;
 
@@ -235,32 +193,25 @@ mod tests {
     /// Fixed nonce: 32 × 0x42.
     const TEST_NONCE: [u8; 32] = [0x42; 32];
 
-    /// Returns the fixed test funder pubkey. We pick an x-coordinate
-    /// that is a valid x-only point: derived from a deterministic
-    /// scalar `1` (which gives the secp256k1 generator G).
+    /// The fixed test funder pubkey: the secp256k1 generator G (x = 0x79be667e…,
+    /// even y), a known-valid x-only point.
     fn test_funder_pubkey() -> XOnlyPublicKey {
         let secp = Secp256k1::verification_only();
-        // Generator G has x = 0x79be667e..., y even.
-        // We construct it by deriving from the trivial scalar 1·G; here
-        // we just hard-code its x-only x-coordinate.
         const G_X: [u8; 32] = [
             0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
             0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
             0x16, 0xf8, 0x17, 0x98,
         ];
         let xo = XOnlyPublicKey::from_slice(&G_X).expect("G_X is a valid x-only pubkey");
-        // Round-trip through full pubkey to assert validity.
-        let _full = xo.public_key(bitcoin::key::Parity::Even);
-        let _ = &secp; // silence unused
+        let _full = xo.public_key(bitcoin::key::Parity::Even); // assert validity
+        let _ = &secp;
         xo
     }
 
     #[test]
     fn nums_h_matches_nums_constant() {
-        // The NUMS_H_X constant must lift_x to a valid point.
         let h = nums_h();
         assert_eq!(h.serialize(), NUMS_H_X);
-        // Double-check raw bytes match the pinned hex literal.
         let expected_hex = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
         let mut actual_hex = String::with_capacity(64);
         for b in NUMS_H_X.iter() {
@@ -271,15 +222,11 @@ mod tests {
 
     #[test]
     fn compute_cm_pinned_vector() {
-        // Hand-computed reference: SHA256(SHA256(tag) || SHA256(tag) ||
-        // mint_pubkey || ts_be || nonce || funder_xonly), tag =
-        // "PoPCommit/v1". Re-derived here from primitives so the test
-        // catches any future bug in compute_cm without trusting the
-        // implementation's own output.
+        // Re-derived from raw sha256 primitives so the test catches a compute_cm
+        // bug without trusting the implementation's own output.
         let funder = test_funder_pubkey();
         let cm = compute_cm(&TEST_MINT_PUBKEY, TEST_TS_EXPIRY, &TEST_NONCE, &funder);
 
-        // Reference re-derivation from raw sha256 primitives.
         let tag_hash = sha256::Hash::hash(b"PoPCommit/v1");
         let mut eng = sha256::Hash::engine();
         eng.input(tag_hash.as_ref());
@@ -291,8 +238,7 @@ mod tests {
         let expected = sha256::Hash::from_engine(eng).to_byte_array();
         assert_eq!(cm, expected);
 
-        // Pin the actual byte value so any drift in any input field
-        // (tag bytes, encoding, ordering) breaks this test loudly.
+        // Pin the byte value so any input-field drift breaks this loudly.
         let mut hex = String::with_capacity(64);
         for b in cm.iter() {
             hex.push_str(&format!("{:02x}", b));
@@ -305,9 +251,7 @@ mod tests {
 
     #[test]
     fn compute_cm_pre_image_size_is_105_bytes() {
-        // Pre-image is exactly 105 bytes (33 + 8 + 32 + 32). Guard
-        // against future drift via a local length check on every
-        // component.
+        // 33 + 8 + 32 + 32 = 105.
         assert_eq!(TEST_MINT_PUBKEY.len(), 33);
         assert_eq!(TEST_TS_EXPIRY.to_be_bytes().len(), 8);
         assert_eq!(TEST_NONCE.len(), 32);
@@ -324,7 +268,6 @@ mod tests {
         let funder = test_funder_pubkey();
         let cm = compute_cm(&TEST_MINT_PUBKEY, TEST_TS_EXPIRY, &TEST_NONCE, &funder);
         let p_internal = compute_internal_key(&cm);
-        // Pin x-only x-coordinate.
         let mut hex = String::with_capacity(64);
         for b in p_internal.serialize().iter() {
             hex.push_str(&format!("{:02x}", b));
@@ -337,14 +280,12 @@ mod tests {
 
     #[test]
     fn compute_internal_key_reconstructs_via_combine() {
-        // Cross-check: NUMS_H + cm·G must equal compute_internal_key(cm).
-        // Computed two different ways: via add_exp_tweak (inside
-        // compute_internal_key) and via explicit PublicKey::combine.
+        // Cross-check via explicit PublicKey::combine (vs add_exp_tweak inside
+        // compute_internal_key).
         let funder = test_funder_pubkey();
         let cm = compute_cm(&TEST_MINT_PUBKEY, TEST_TS_EXPIRY, &TEST_NONCE, &funder);
         let p_internal = compute_internal_key(&cm);
 
-        // Independent reconstruction: cm·G via SecretKey, then combine.
         let secp = Secp256k1::new();
         let cm_secret = bitcoin::secp256k1::SecretKey::from_slice(&cm).expect("valid scalar");
         let cm_g = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &cm_secret);
@@ -375,20 +316,18 @@ mod tests {
             "04001e3b6ab1692079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
             "compute_leaf_script vector drifted; check locktime encoding or opcode order"
         );
-        // The script always has the same length: 1 + 4 + 1 + 1 + 1 + 32 + 1 = 41 bytes.
+        // Fixed length: 1 + 4 + 1 + 1 + 1 + 32 + 1 = 41 bytes.
         assert_eq!(bytes.len(), 41);
     }
 
     #[test]
     fn compute_leaf_hash_pinned() {
-        // TapLeafHash = sha256t("TapLeaf", leaf_version
-        // || compact_size(script) || script). Verified by re-derivation
-        // through the bitcoin crate's primitive.
+        // TapLeafHash = sha256t("TapLeaf", leaf_version || compact_size(script)
+        // || script).
         let funder = test_funder_pubkey();
         let script = compute_leaf_script(TEST_TS_EXPIRY, &funder);
         let leaf_hash = compute_leaf_hash(&script);
 
-        // Pin the leaf hash bytes.
         let bytes = leaf_hash.to_byte_array();
         let mut hex = String::with_capacity(64);
         for b in bytes.iter() {
@@ -399,9 +338,7 @@ mod tests {
             "compute_leaf_hash vector drifted; check LeafVersion::TapScript (0xc0)"
         );
 
-        // Independent re-derivation through TapLeafHash::from_script
-        // with explicit LeafVersion — the same primitive, so this test
-        // mostly guards against a future API rename.
+        // Re-derive via the explicit-LeafVersion primitive (guards an API rename).
         let reference = TapLeafHash::from_script(&script, LeafVersion::TapScript);
         assert_eq!(leaf_hash, reference);
     }
@@ -415,7 +352,6 @@ mod tests {
         let leaf_hash = compute_leaf_hash(&script);
         let tweak = compute_tap_tweak(&p_internal, &leaf_hash);
 
-        // Pin the tweak bytes.
         let mut hex = String::with_capacity(64);
         for b in tweak.iter() {
             hex.push_str(&format!("{:02x}", b));
@@ -425,8 +361,7 @@ mod tests {
             "compute_tap_tweak vector drifted; check TapTweakHash inputs"
         );
 
-        // Cross-check against TapTweakHash::from_key_and_tweak called
-        // independently with Some(TapNodeHash::from(leaf_hash)).
+        // Cross-check against TapTweakHash::from_key_and_tweak directly.
         let reference =
             TapTweakHash::from_key_and_tweak(p_internal, Some(TapNodeHash::from(leaf_hash)))
                 .to_byte_array();
@@ -455,10 +390,8 @@ mod tests {
 
     #[test]
     fn compute_output_key_matches_tap_tweak_trait() {
-        // Cross-check against the bitcoin crate's UntweakedPublicKey::tap_tweak
-        // trait method, which performs the entire tweak in one call.
-        // If our staged decomposition matches the canonical path, both
-        // produce the identical output key.
+        // Cross-check our staged decomposition against the canonical one-call
+        // UntweakedPublicKey::tap_tweak.
         use bitcoin::key::TapTweak;
         let secp = Secp256k1::new();
         let funder = test_funder_pubkey();
@@ -491,9 +424,8 @@ mod tests {
         );
 
         let signet = compute_bech32m_address(&output_key, Network::Signet);
-        // Signet differs only in the bech32 HRP ("tb" vs "bcrt"); both
-        // wrap the same 32-byte output key, so the data section is
-        // identical until the bech32m checksum (which is HRP-dependent).
+        // Signet differs only in the bech32 HRP ("tb" vs "bcrt"); same 32-byte
+        // output key, so only the HRP-dependent checksum changes.
         assert_eq!(
             signet, "tb1psjw4ymy3cl0a2cp32nnh4kjj9fus8m5daust4kd4hzwnkm7ctmhq8ugvmh",
             "signet bech32m address drifted; check Network::Signet HRP or output key"
@@ -510,7 +442,6 @@ mod tests {
             &funder,
             Network::Regtest,
         );
-        // Must match the pinned regtest address from the staged test.
         assert_eq!(
             address, "bcrt1psjw4ymy3cl0a2cp32nnh4kjj9fus8m5daust4kd4hzwnkm7ctmhq29z2wd",
             "convenience wrapper output diverges from staged composition"

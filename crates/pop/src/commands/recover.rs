@@ -1,11 +1,10 @@
-//! `pop recover` — reclaim CLTV-matured deposits via a taproot script-path
-//! spend.
+//! `pop recover` — reclaim CLTV-matured deposits via a taproot script-path spend.
 //!
-//! Refuses (with an ETA) if the chain tip's MTP is below `ts_expiry` (BIP-113;
-//! never signs an immature deposit). For each matured deposit it rebuilds the
-//! construction from stored params, derives the funder privkey from the seed,
-//! fetches the funding UTXO, asserts the on-chain scriptPubKey matches, builds
-//! + signs the `nLockTime = ts_expiry` spend, and broadcasts.
+//! Refuses (with an ETA) if the tip's MTP is below `ts_expiry` (BIP-113; never
+//! signs an immature deposit). For each matured deposit: rebuild the construction
+//! from stored params, derive the funder privkey, fetch the UTXO, assert the
+//! on-chain scriptPubKey matches, build + sign the `nLockTime = ts_expiry` spend,
+//! broadcast.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -26,21 +25,14 @@ use crate::signer::{HotKeySigner, Signer};
 use crate::wallet::Wallet;
 use crate::SCHEMA_VERSION;
 
-/// Maps a kernel [`RecoverError`] to the wallet's [`PopError`] contract code.
-///
-/// Only [`RecoverError::ValueBelowFee`] has a first-class wallet code
-/// (`value_below_fee`, carrying the structured value/fee). Every other variant
-/// is an internal invariant or security stop the kernel proves should never
-/// happen for a self-consistent deposit — these surface as `internal_error`,
-/// carrying the kernel's stable `code()` + `Display` in the message so the
-/// failure is still diagnosable.
-///
-/// FLAG (keeper decision): the security/invariant variants
+/// Maps a kernel [`RecoverError`] to a [`PopError`] code. Only
+/// [`RecoverError::ValueBelowFee`] has a first-class code; every other variant is
+/// an internal-invariant or security stop that should never happen for a
+/// self-consistent deposit, so it folds into `internal_error` (carrying the
+/// kernel's stable `code()` + `Display` for diagnosis). The security stops
 /// (`ScriptPubkeyMismatch`, `ScriptMismatch`, `OutputKeyMismatch`,
 /// `SignatureInvalid`, `ControlBlockInvalid`, `WrongFunderKey`) are real
-/// "do-not-broadcast" stops; if agents need to distinguish them from a generic
-/// bug, they could earn dedicated contract codes (e.g. a `recovery_invariant`
-/// or `address_mismatch`-like code). For v1 they fold into `internal_error`.
+/// "do-not-broadcast" stops that could earn dedicated codes later.
 fn map_recover_error(e: RecoverError) -> PopError {
     match e {
         RecoverError::ValueBelowFee {
@@ -103,11 +95,9 @@ pub async fn run(
     let wallet = Wallet::open(wallet_dir)?;
     let network = wallet.network();
 
-    // Parse the destination once. A malformed address is invalid_input; an
-    // address for the wrong network is network_mismatch{expected, got}.
-    // NOTE: the raw bitcoin-crate parse error misleadingly mentions "base58" even
-    // for a malformed bech32 string, so we DON'T surface it — we give a clear,
-    // address-type-agnostic message (echoing the offending input, not the prose).
+    // Malformed → invalid_input; wrong-network → network_mismatch. We DON'T
+    // surface the raw parse error (it misleadingly says "base58" even for bech32);
+    // give an address-type-agnostic message echoing the input.
     let dest_unchecked = Address::from_str(args.dest.trim()).map_err(|_| {
         PopError::invalid_input(format!(
             "--dest is not a valid bitcoin address (got `{}`)",
@@ -125,13 +115,10 @@ pub async fn run(
         }
     };
 
-    // Select deposits.
     let deposits = select_deposits(&wallet, args)?;
     if deposits.is_empty() {
-        // Only reachable via `--all` (a single `--deposit` resolves or errors
-        // deposit_not_found). An empty sweep is a no-op SUCCESS, not an error: we
-        // return an empty `results` and — crucially — do NOT touch the chain, so
-        // an empty sweep can never fail with chain_unreachable.
+        // Only reachable via `--all`. An empty sweep is a no-op SUCCESS that does
+        // NOT touch the chain (so it can never fail with chain_unreachable).
         if json {
             println!(
                 "{}",
@@ -148,19 +135,12 @@ pub async fn run(
         return Ok(());
     }
 
-    // Tip MTP for maturity checks.
     let esplora = Esplora::new(&wallet.config.esplora_url);
     let (tip_mtp, tip_height) = esplora.tip_mtp_and_height().await?;
 
-    // Resolve the fee policy ONCE (shared by every deposit/UTXO in a sweep):
-    //  - `--fee <sats>` is an absolute override and wins outright.
-    //  - otherwise fetch the mempool feerate for `--target` blocks; on a
-    //    fetch/parse failure DO NOT abort (funds are safe in the UTXO and the
-    //    spend is RBF-enabled) — warn loudly and fall back to a conservative
-    //    default feerate, still floored at min-relay inside build_and_sign.
+    // Resolve the fee policy ONCE for the whole sweep (see `resolve_fee_policy`).
     let fee_policy = resolve_fee_policy(&esplora, args).await;
 
-    // Load the seed (needed to derive each funder privkey).
     let seed = wallet.load_seed()?;
 
     let single = deposits.len() == 1;
@@ -168,10 +148,9 @@ pub async fn run(
     for dep in &deposits {
         match recover_one(&wallet, &esplora, &seed, dep, &dest, network, fee_policy, tip_mtp, args.no_broadcast).await {
             Ok(Outcome::Immature { recover_after }) if single => {
-                // A single targeted deposit that isn't mature yet is a typed,
-                // retriable error so the agent gets the structured wait signal
-                // (matures_at / now). In a multi-deposit --all sweep, immature
-                // stays a per-deposit status instead (see below).
+                // A single immature deposit is a typed, retriable error (the agent
+                // gets matures_at/now); in an --all sweep immature stays a
+                // per-deposit status.
                 return Err(PopError::CltvNotExpired {
                     matures_at: recover_after,
                     now: tip_mtp,
@@ -204,8 +183,6 @@ pub async fn run(
             }))?
         );
     } else {
-        // Human result to stdout (progress already went to stderr). One concise
-        // line per deposit outcome.
         println!("tip height {tip_height}, MTP {tip_mtp}");
         for (id, o) in &results {
             println!("  {id}: {}", o.human_summary());
@@ -231,17 +208,12 @@ fn detect_address_network(addr: &Address<bitcoin::address::NetworkUnchecked>) ->
     "unknown".to_string()
 }
 
-/// Resolves the [`FeePolicy`] for this `recover` invocation.
-///
-/// `--fee` is an absolute override and takes precedence over any mempool
-/// estimate. Otherwise we fetch `/fee-estimates` and pick the feerate for
-/// `--target` blocks. If that fetch/parse fails we DO NOT fail recovery: the
-/// BTC is safe in the UTXO and the spend is RBF-enabled, so we print a loud
-/// warning and fall back to a conservative default feerate (the min-relay
-/// floor is applied later, in `build_and_sign`).
+/// Resolves the [`FeePolicy`]: `--fee` is an absolute override; else fetch
+/// `/fee-estimates` for `--target` blocks. A fetch/parse failure does NOT fail
+/// recovery (the BTC is safe + the spend is RBF-enabled) — warn and fall back to
+/// a conservative feerate.
 async fn resolve_fee_policy(esplora: &Esplora, args: &RecoverArgs) -> FeePolicy {
     if let Some(sat) = args.fee {
-        // Absolute override wins. If the user *also* passed --target, say so.
         if args.target != DEFAULT_TARGET_BLOCKS {
             eprintln!(
                 "note: --fee {sat} (absolute) overrides --target {} (mempool estimate ignored)",
@@ -372,27 +344,22 @@ async fn recover_one(
         });
     }
 
-    // Rebuild typed construction params from the stored hex.
     let internal_key = parse_xonly(&dep.p_internal, "p_internal")?;
     let leaf_script = parse_script(&dep.leaf_script)?;
 
-    // The funder signing seam, bound to this deposit's index. Recovery signing
-    // is custody-free at the kernel boundary: build_unsigned -> signer.sign ->
-    // apply_signature. (Hot-key today; the trait keeps hardware/remote open.)
+    // Custody-free at the kernel boundary (build_unsigned → signer.sign →
+    // apply_signature); hot-key today, the trait keeps hardware/remote open.
     let signer = HotKeySigner::new(seed, network, dep.funder_index);
     let funder_pubkey = signer
         .funder_pubkey(dep.funder_index)
         .map_err(|e| PopError::internal(format!("funder key derivation failed: {e}")))?
         .xonly;
 
-    // Determine the funding outpoint: prefer the stored one; else discover via
-    // the address. Sweep every UTXO at the address (handles double-funds).
+    // Sweep every UTXO at the address (handles double-funds).
     let utxos = collect_recoverable_utxos(esplora, dep).await?;
     if utxos.is_empty() {
-        // Either already recovered out-of-band, or never funded.
         eprintln!("deposit {}: no spendable UTXO at the funding address (already recovered?).", dep.id);
-        // If we previously recorded a funding outpoint and it's now gone, mark
-        // Recovered.
+        // A previously-recorded outpoint now gone ⇒ mark Recovered.
         if dep.funding_txid.is_some() {
             wallet.db.set_state(&dep.id, DepositState::Recovered)?;
             return Ok(Outcome::AlreadySpent);
@@ -409,9 +376,8 @@ async fn recover_one(
         let funding_txid = Txid::from_str(&txid_str)
             .map_err(|e| PopError::internal(format!("stored funding txid invalid: {e}")))?;
 
-        // Build the unsigned spend (pure construction: all non-signing sanity
-        // checks happen here), have the signer sign the kernel's sighash, then
-        // apply the signature (early sig + control-block + vsize self-verify).
+        // build_unsigned does all non-signing sanity checks; sign the sighash;
+        // apply_signature self-verifies (sig + control-block + vsize).
         let unsigned = build_unsigned(RecoverInputs {
             funder_pubkey,
             funding_txid,
@@ -439,7 +405,7 @@ async fn recover_one(
             output_sat: built.output_value_sat,
         };
 
-        // Show the user the full fee math before any broadcast (stderr).
+        // Full fee math before any broadcast (stderr).
         eprintln!(
             "deposit {} | utxo {txid_str}:{vout} -> {dest}\n  \
              feerate {:.2} sat/vB x {} vB = {} sat fee | in {} sat -> sweep {} sat",
@@ -460,8 +426,8 @@ async fn recover_one(
             });
         }
 
-        // Broadcast; on failure, enrich the broadcast_failed details with the
-        // txid we tried (the chain layer can't know it).
+        // On failure, enrich broadcast_failed with the txid (the chain layer
+        // can't know it).
         let server = esplora.broadcast(&built.tx_hex).await.map_err(|e| {
             match crate::error::from_boxed(e) {
                 PopError::BroadcastFailed { reject_reason, .. } => PopError::BroadcastFailed {
@@ -478,8 +444,7 @@ async fn recover_one(
     }
 
     wallet.db.set_state(&dep.id, DepositState::Recovered)?;
-    // The loop ran (utxos was non-empty, checked above) and the broadcast path
-    // sets last_fee on every iteration, so this is always Some here.
+    // utxos was non-empty and the broadcast path sets last_fee each iteration.
     let fee = last_fee.expect("broadcast path always records fee info");
     Ok(Outcome::Broadcast {
         txid: last_txid,
@@ -496,7 +461,7 @@ async fn collect_recoverable_utxos(
     let mut out = Vec::new();
     let utxos = esplora.address_utxos(&dep.funding_address).await?;
     for u in utxos {
-        // Fetch the scriptPubKey from the tx (utxo endpoint omits it).
+        // Fetch the scriptPubKey from the tx (the utxo endpoint omits it).
         let (value, spk) = esplora.utxo_value_and_script(&u.txid, u.vout).await?;
         debug_assert_eq!(value, u.value);
         out.push((u.txid, u.vout, value, spk));
@@ -521,8 +486,7 @@ fn select_deposits(
     }
     if args.all {
         let all = wallet.db.list_deposits()?;
-        // Recoverable candidates: those that may have BTC locked and not yet
-        // recovered.
+        // Candidates: states that may hold reclaimable BTC.
         let candidates = all
             .into_iter()
             .filter(|d| {

@@ -1,42 +1,18 @@
-//! Axum middleware that gates a route behind a `Payment` authentication
-//! challenge for the cashu method (native only).
+//! Axum middleware gating a route behind a `Payment` authentication challenge
+//! for the cashu method (native only). Drop into an `axum::Router` with
+//! [`axum::middleware::from_fn_with_state`].
 //!
-//! Drop into an `axum::Router` with [`axum::middleware::from_fn_with_state`]
-//! to enforce the v1 happy path:
+//! Flow: a request without `Authorization: Payment <blob>` gets a 402 carrying a
+//! `WWW-Authenticate: Payment` challenge (whose `request="…"` wraps the
+//! [`CashuRequirement`][crate::challenge::CashuRequirement] `creqA`). The client
+//! retries with the credentials blob; the middleware verify+redeems through the
+//! generic [`Credential`] seam and, on success, attaches the
+//! [`Redeemed`][crate::credential::Redeemed] to `request.extensions_mut()`.
 //!
-//! 1. Request arrives without an `Authorization: Payment <blob>`
-//!    header — middleware responds `402 Payment Required` and places
-//!    `WWW-Authenticate: Payment id="…", realm="…", method="cashu",
-//!    intent="charge", request="<base64url-nopad>"` on the response
-//!    along with `Cache-Control: no-store`. The `request` value wraps
-//!    the [`CashuRequirement`][crate::challenge::CashuRequirement] in its
-//!    `creqA…` encoding via [`encode_request_envelope`].
-//! 2. Client retries the same URL and method with `Authorization:
-//!    Payment <base64url-nopad-JSON>` where the JSON has the shape
-//!    described in [`crate::envelope::PaymentCredentials`]. The
-//!    middleware extracts the `cashuB…` token from
-//!    `payload.cashu_token`, runs verify+redeem through the generic
-//!    [`Credential`] seam, and on success attaches the
-//!    [`Redeemed`][crate::credential::Redeemed] result to
-//!    `request.extensions_mut()` so the downstream handler can read it via
-//!    `Extension<Redeemed>`.
-//!
-//! ## Failure mapping
-//!
-//! The middleware returns `402 Payment Required` with a fresh
-//! `WWW-Authenticate: Payment` re-challenge on *any* validation failure
-//! — bad header, bad token, wrong unit, wrong mint, wrong amount (the
-//! charge is exact-amount, so an over- or under-funded token is rejected),
-//! malformed proof, or a mint that refused the swap. Only transport-level
-//! failures to reach the mint (DNS/TCP/TLS/timeout) surface as
-//! `503 Service Unavailable`.
-//!
-//! Every 402 carries `Cache-Control: no-store`.
-//!
-//! ## Response body
-//!
-//! 402 bodies are plain-text descriptions of why the previous attempt
-//! failed (e.g. `unit mismatch: expected pop_…, got sat`).
+//! Status mapping: ANY validation failure (bad header/token, wrong
+//! unit/mint/amount, refused swap) → 402 + a fresh re-challenge (plain-text body
+//! naming the reason); ONLY transport failures to reach the mint → 503. Every
+//! 402 carries `Cache-Control: no-store`.
 
 use std::sync::Arc;
 
@@ -58,39 +34,29 @@ use crate::envelope::{
     PAYMENT_SCHEME,
 };
 
-/// Default `realm` value emitted in `WWW-Authenticate: Payment`. The
-/// value is operator-defined; this hardcoded identifier serves v1 until
-/// operator-configurable wiring lands (see TODO at use site).
+/// Default `realm` emitted in `WWW-Authenticate: Payment`. Operator-defined;
+/// hardcoded until operator-configurable wiring lands (TODO at use site).
 pub const DEFAULT_REALM: &str = "pops-core-verify";
 
-/// `intent` value the verifier emits. `charge` means "the server
-/// consumes the payment as a one-shot charge" — matches the
-/// transfer-on-use semantics.
+/// The `intent` the verifier emits: `charge` = the server consumes the payment
+/// as a one-shot charge (transfer-on-use).
 pub const INTENT_CHARGE: &str = "charge";
 
-/// State the middleware needs at request time: the [`CashuRequirement`]
-/// to advertise on 402 (it builds the cashu `creqA`) and the
-/// [`Credential`] that verifies + redeems the presented credential on retry.
+/// Request-time state: the [`CashuRequirement`] to advertise on 402 and the
+/// [`Credential`] that verifies + redeems on retry.
 ///
-/// Generic over `C: Credential` — the MVP wires a single
-/// `CashuCredential<CdkMintClient>` (see [`require_charge`]); a second ecash
-/// method would slot a different `C` in with no middleware change.
-///
-/// Constructed once at router-build time and shared (`Arc`) across requests.
+/// Generic over `C` so a second ecash method slots in with no middleware change;
+/// constructed once at router-build time and shared (`Arc`).
 #[derive(Debug)]
 pub struct ChargeMiddlewareState<C: Credential> {
-    /// What the verifier requires from the holder. Used to build the
-    /// `creqA` wrapped into the `request="…"` auth-param of
-    /// `WWW-Authenticate: Payment` on the 402.
+    /// What the verifier requires; built into the 402's `request="…"` `creqA`.
     pub requirement: CashuRequirement,
-    /// The credential the middleware delegates to once the client retries
-    /// with an `Authorization: Payment` proof header.
+    /// The credential the middleware delegates to on retry.
     pub credential: Arc<C>,
 }
 
 impl<C: Credential> ChargeMiddlewareState<C> {
-    /// Convenience constructor: wraps `credential` in an [`Arc`] and
-    /// pairs it with the [`CashuRequirement`] to advertise.
+    /// Wraps `credential` in an [`Arc`] and pairs it with the requirement.
     pub fn new(requirement: CashuRequirement, credential: C) -> Self {
         Self {
             requirement,
@@ -100,21 +66,16 @@ impl<C: Credential> ChargeMiddlewareState<C> {
 }
 
 /// Build a native [`ChargeMiddlewareState`] for the default
-/// `CashuCredential<CdkMintClient>` from a cashu requirement — the MVP
-/// wiring convenience. Mirrors the demo's router-build step.
+/// `CashuCredential<CdkMintClient>` — the MVP wiring convenience.
 pub fn require_charge_state(
     requirement: CashuRequirement,
 ) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>> {
     ChargeMiddlewareState::new(requirement, CashuCredential::new(CdkMintClient::new()))
 }
 
-/// Axum middleware entry point: enforces the Payment Authentication
-/// envelope on the request.
-///
-/// Register with `axum::middleware::from_fn_with_state(state, require_charge)`
-/// where `state` is `Arc<ChargeMiddlewareState<C>>`. The `'static` bound on
-/// `C` is what axum's `from_fn_with_state` requires to spawn the handler
-/// future.
+/// Axum middleware entry point enforcing the Payment Authentication envelope.
+/// The `'static` bound on `C` is what `from_fn_with_state` requires to spawn
+/// the handler future.
 pub async fn require_charge<C>(
     State(ctx): State<Arc<ChargeMiddlewareState<C>>>,
     mut req: Request,
@@ -123,16 +84,11 @@ pub async fn require_charge<C>(
 where
     C: Credential + Send + Sync + 'static,
 {
-    // Step 1: client must present an `Authorization: Payment <blob>`
-    // header. Missing header or any non-`Payment` scheme is treated as
-    // "no payment attempt" → 402 with a fresh challenge.
+    // A missing header or any non-`Payment` scheme is "no payment attempt" → 402.
     let Some(header_raw) = req.headers().get(http::header::AUTHORIZATION) else {
         return challenge_response(&ctx.requirement, None);
     };
 
-    // Step 2: header must be valid UTF-8. A non-UTF-8 value never
-    // carries a valid Payment auth envelope, so it gets a 402
-    // re-challenge.
     let header_value = match header_raw.to_str() {
         Ok(v) => v,
         Err(_) => {
@@ -143,11 +99,8 @@ where
         }
     };
 
-    // Step 3: parse the Payment Authentication envelope. `UnknownScheme`
-    // means "the client used Basic/Bearer/whatever — they didn't try
-    // Payment", which is identical from a control-flow perspective to
-    // "no header at all". Every other parse error is a validation
-    // failure and must be a 402 re-challenge.
+    // `UnknownScheme` (Basic/Bearer/…) is control-flow-identical to no header at
+    // all; every OTHER parse error is a validation failure → 402 re-challenge.
     let credentials = match parse_payment_authorization(header_value) {
         Ok(c) => c,
         Err(AuthParseError::UnknownScheme) => {
@@ -156,12 +109,8 @@ where
         Err(e) => return challenge_response(&ctx.requirement, Some(&e.to_string())),
     };
 
-    // Step 4: verify + redeem the presented credential via the generic
-    // `Credential` seam. The decoupled `ChargeRequirement` is derived from
-    // the advertised cashu requirement. Decode/structural/swap failures all
-    // surface as `ChargeError`; the contract's variant decides the status
-    // (`MintUnreachable` → 503, `MalformedRequest` → 400, everything else →
-    // 402 + re-challenge).
+    // Verify + redeem via the generic seam; the `ChargeError` variant decides the
+    // status (see `charge_error_to_response`).
     let charge_req = charge_requirement_from_cashu(&ctx.requirement);
     let redeemed = match ctx
         .credential
@@ -172,33 +121,23 @@ where
         Err(e) => return charge_error_to_response(e, &ctx.requirement),
     };
 
-    // Step 5: hand the redeemed result to downstream handlers. They can
-    // extract it via `Extension<Redeemed>`. The verifier makes no change —
-    // the holder presented the exact amount and is responsible for any local
-    // split done before presentation.
+    // Downstream reads this via `Extension<Redeemed>`.
     req.extensions_mut().insert(redeemed);
     next.run(req).await
 }
 
-/// Build a 402 response carrying a fresh Payment Authentication
-/// challenge. Always emits `Cache-Control: no-store`.
-///
-/// `failure_reason`, when provided, becomes the response body — it
-/// lets the client see why the previous attempt was rejected. A bare
-/// "no attempt yet" 402 (the client never sent an `Authorization`
-/// header) gets an empty body.
+/// Build a 402 carrying a fresh challenge (always `Cache-Control: no-store`).
+/// `failure_reason`, when set, becomes the body so the client sees why the
+/// previous attempt failed; a bare "no attempt yet" 402 gets an empty body.
 fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&str>) -> Response {
-    // `id` must be a unique challenge identifier; a random UUIDv4
-    // suffices. Stateless binding (computing `id` as an HMAC over the
+    // A random UUIDv4 `id` suffices; stateless binding (id as an HMAC over the
     // challenge params) is a deliberate non-goal for v1.
     let id = Uuid::new_v4().to_string();
 
     let creq_a = encode_challenge(requirement);
     let request_envelope = encode_request_envelope(&creq_a);
 
-    // TODO(operator-configurable): wire `realm` through middleware
-    // state once an operator-side config story lands. A fixed
-    // identifier is fine for v1.
+    // TODO(operator-configurable): wire `realm` through middleware state.
     let realm = DEFAULT_REALM;
 
     let header = format!(
@@ -206,8 +145,7 @@ fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&st
         PAYMENT_SCHEME, id, realm, INTENT_CHARGE, request_envelope,
     );
 
-    // All values produced above are base64url-nopad alphabet or
-    // ASCII-printable. `HeaderValue::from_str` still validates as a
+    // Values are all ASCII-printable; the `from_str` validation is a
     // belt-and-braces guard against a future encoder regression.
     let www_auth = match HeaderValue::from_str(&header) {
         Ok(hv) => hv,
@@ -235,41 +173,26 @@ fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&st
         .into_response()
 }
 
-/// Map a [`ChargeError`] (the committed cross-slice contract) to an HTTP
-/// response.
-///
-/// The contract's three non-collapsing concerns drive the status:
-/// - `MintUnreachable` → `503 Service Unavailable` (transport; the client
-///   keeps its token and may retry — NEVER a 402).
-/// - `MalformedRequest` → `400 Bad Request` (framework status; the request
-///   was not a well-formed payment attempt — e.g. a malformed server-side
-///   requirement).
-/// - every other (verification / malformed-credential) variant → `402
-///   Payment Required` with a fresh `WWW-Authenticate: Payment` re-challenge.
-///
-/// The 402 body is the `ChargeError` Display string so the client can see
-/// why the previous attempt was rejected. Every 402 carries
-/// `Cache-Control: no-store` (via [`challenge_response`]).
+/// Map a [`ChargeError`] to an HTTP response. The three non-collapsing concerns
+/// drive the status (the 402 body is the Display string; every 402 is no-store):
+/// `MintUnreachable` → 503 (transport, token NOT consumed, NEVER a 402),
+/// `MalformedRequest` → 400 (not a well-formed payment attempt), everything else
+/// (verification / malformed-credential) → 402 + fresh re-challenge.
 fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
     match &e {
-        // (A) transport → 503, retryable, token NOT consumed.
         ChargeError::MintUnreachable { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
         }
-        // (C) not a well-formed payment attempt at all → 400 framework status.
         ChargeError::MalformedRequest(_) => {
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
-        // (B + the rest of C) verification / malformed-credential → 402 +
-        // fresh re-challenge.
         _ => challenge_response(requirement, Some(&e.to_string())),
     }
 }
 
-/// Pluck the echoed challenge fields out of a successfully-parsed
-/// credentials blob. Surfaced for test helpers; the middleware itself
-/// doesn't need to consult them past the `method` check that
-/// [`parse_payment_authorization`] already did.
+/// Pluck the echoed challenge fields out of a parsed credentials blob — for test
+/// helpers; the middleware doesn't consult them past `parse_payment_authorization`'s
+/// `method` check.
 #[allow(dead_code)]
 pub(crate) fn echoed_challenge_for_test(creds: &crate::envelope::PaymentCredentials) -> &EchoedChallenge {
     &creds.challenge
@@ -306,13 +229,11 @@ mod tests {
     enum SwapResponse {
         Echo,
         Unreachable,
-        /// A post-submit (indeterminate) swap transport failure — exercises the
-        /// `MintUnreachable { indeterminate: true }` → 503 mapping end-to-end.
+        /// Post-submit (indeterminate) failure → exercises the 503 mapping.
         UnreachableIndeterminate,
         RejectedSwap,
-        /// Swap-output DLEQ gate rejected the mint's returned blind signatures
-        /// (missing/invalid DLEQ). Drives the end-to-end money-safety path:
-        /// must yield 402 + re-challenge with the resource NOT served.
+        /// Swap-output DLEQ gate rejected the mint's blind signatures →
+        /// money-safety path: 402 + re-challenge, resource NOT served.
         DleqInvalid,
     }
 
@@ -413,10 +334,9 @@ mod tests {
     /// backed by the mock mint client.
     type TestCredential = CashuCredential<MockMintClient>;
 
-    /// Construct an axum router with the middleware in front of a tiny
-    /// echo handler. The handler returns 200 on success and writes the
-    /// redeemed amount into the body so tests can assert the `Redeemed`
-    /// result made it through the extensions.
+    /// Router with the middleware in front of an echo handler that writes the
+    /// redeemed amount into the body, so tests can assert the `Redeemed` made it
+    /// through the extensions.
     fn router_with(state: Arc<ChargeMiddlewareState<TestCredential>>) -> Router {
         async fn echo(Extension(redeemed): Extension<Redeemed>) -> String {
             format!("ok:{}", redeemed.amount)
@@ -469,10 +389,9 @@ mod tests {
             .expect("build request with header")
     }
 
-    /// Wrap a raw `cashuB…` token in the Payment Authentication
-    /// envelope, echoing a fake-but-shapely challenge. The middleware
-    /// does not validate that `challenge.id` matches what it previously
-    /// issued, so any well-formed echo works.
+    /// Wrap a raw `cashuB…` token in the Payment envelope with a fake-but-shapely
+    /// echoed challenge. The middleware does not validate `challenge.id`, so any
+    /// well-formed echo works.
     fn payment_header_with_token(token: &str) -> String {
         let creds = PaymentCredentials {
             challenge: EchoedChallenge {
@@ -495,11 +414,9 @@ mod tests {
         request_with_authorization(&payment_header_with_token(token))
     }
 
-    /// Build a GET /gated request with raw header bytes (used for the
-    /// non-utf8 test case).
+    /// GET /gated with raw header bytes (for the non-utf8 case). `header()`
+    /// rejects non-ASCII at builder time, so reach down to `from_bytes`.
     fn request_with_raw_authorization(value: &[u8]) -> HttpRequest<Body> {
-        // `header()` rejects non-ASCII at builder time; reach down to
-        // HeaderValue::from_bytes which accepts arbitrary bytes.
         let mut req = HttpRequest::builder()
             .uri("/gated")
             .body(Body::empty())
@@ -529,7 +446,6 @@ mod tests {
         let response = app.oneshot(bare_request()).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let header = www_authenticate(&response);
-        // Cover all five required challenge fields.
         assert!(header.starts_with("Payment "), "got: {header}");
         assert!(header.contains(r#"id=""#), "missing id: {header}");
         assert!(header.contains(r#"realm=""#), "missing realm: {header}");
@@ -546,7 +462,6 @@ mod tests {
 
     #[tokio::test]
     async fn www_authenticate_includes_id_realm_method_intent_request() {
-        // Each required challenge field appears with a non-empty value.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app.oneshot(bare_request()).await.expect("oneshot");
         let header = www_authenticate(&response);
@@ -575,9 +490,8 @@ mod tests {
 
     #[tokio::test]
     async fn realm_default_is_pops_core_verify() {
-        // Lock the default `realm` so an operator-configurable change
-        // later is a visible diff. Doc-comment on DEFAULT_REALM
-        // explains the operator-configurable plan.
+        // Lock the default `realm` so an operator-configurable change is a
+        // visible diff later.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app.oneshot(bare_request()).await.expect("oneshot");
         let header = www_authenticate(&response);
@@ -589,9 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn www_authenticate_request_is_base64url_nopad_envelope() {
-        // The `request` param's contents are base64url-nopad encoded
-        // JSON `{ "cashu_request": "creqA..." }` — confirm the encoded
-        // string round-trips back to a creqA payload.
+        // The `request` param round-trips back to a creqA payload.
         use crate::envelope::decode_request_envelope;
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app.oneshot(bare_request()).await.expect("oneshot");
@@ -649,9 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_blob_echoes_challenge_id() {
-        // The middleware does not enforce challenge-id binding, but the
-        // round-trip must work: we hand the server a credentials blob
-        // with our test id, get 200, and the handler runs.
+        // challenge-id binding is not enforced, but the round-trip must still 200.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -681,14 +591,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_header_encoding_returns_402() {
-        // 0xFF is not valid UTF-8.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
             .oneshot(request_with_raw_authorization(&[0xFFu8, 0xFE, 0xFD]))
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        // Must come with a fresh re-challenge.
         assert!(response
             .headers()
             .get(http::header::WWW_AUTHENTICATE)
@@ -715,8 +623,7 @@ mod tests {
 
     #[tokio::test]
     async fn validation_failure_returns_402_not_400() {
-        // A structurally-OK but unit-mismatched token must come back as
-        // 402 + re-challenge, NOT 400.
+        // A unit-mismatched token is a verification failure → 402, NOT 400.
         let token = make_token(mint_a(), CurrencyUnit::Sat, vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -726,10 +633,8 @@ mod tests {
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        // Fresh challenge present.
         let header = www_authenticate(&response);
         assert!(header.contains(r#"method="cashu""#));
-        // Cache-Control still no-store.
         assert_eq!(
             response
                 .headers()
@@ -739,7 +644,6 @@ mod tests {
                 .unwrap(),
             "no-store"
         );
-        // Body explains the failure.
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
@@ -752,8 +656,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_unreachable_returns_503() {
-        // Transport failure: stays as 503 per the comments on
-        // validation_error_to_response.
+        // Transport failure → 503 (see `charge_error_to_response`).
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -775,9 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_rejected_returns_402() {
-        // Swap rejected (expired, double-spent, etc.) is a *validation*
-        // failure — 402 with a fresh re-challenge so the client can try
-        // a different proof.
+        // A rejected swap is a verification failure → 402 + re-challenge.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -799,11 +700,10 @@ mod tests {
 
     #[tokio::test]
     async fn swap_output_dleq_invalid_returns_402_and_does_not_serve_resource() {
-        // Money-safety end-to-end: the mint returned blind signatures whose
-        // DLEQ is missing/invalid, the swap-output gate rejected them, and that
-        // maps to ChargeError::DleqInvalid → 402 + fresh re-challenge. The
-        // gated handler MUST NOT run (no `ok:` body), so a malicious/buggy mint
-        // never gets the resource served against unsigned ecash.
+        // Money-safety end-to-end: a missing/invalid swap-output DLEQ maps to
+        // ChargeError::DleqInvalid → 402 + re-challenge, and the gated handler
+        // MUST NOT run, so a malicious/buggy mint never gets the resource served
+        // against unsigned ecash.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -813,9 +713,7 @@ mod tests {
             .await
             .expect("oneshot");
 
-        // Verification failure (not transport): 402, NOT 503/200.
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        // A fresh re-challenge is present.
         assert!(response
             .headers()
             .get(http::header::WWW_AUTHENTICATE)
@@ -825,12 +723,10 @@ mod tests {
             .await
             .expect("collect body");
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        // The handler never ran — the gated resource was NOT served.
         assert!(
             !body.starts_with("ok:"),
             "gated resource must NOT be served on a DLEQ failure, got: {body}"
         );
-        // The failure reason names the DLEQ problem.
         assert!(
             body.to_ascii_lowercase().contains("dleq"),
             "expected a DLEQ failure message, got: {body}"
@@ -839,8 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn locked_proof_returns_402_and_does_not_serve_resource() {
-        // A NUT-10 P2PK-locked proof is a verification failure (LockedToken) →
-        // 402 + fresh re-challenge; the swap is never attempted and the gated
+        // LockedToken is a verification failure → 402; swap never attempted,
         // handler never runs.
         let token = make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]);
         let app = router_with(state_with(SwapResponse::Echo));
@@ -866,8 +761,8 @@ mod tests {
 
     #[tokio::test]
     async fn too_many_proofs_returns_402_and_does_not_serve_resource() {
-        // A 3-proof token against a credential capped at 2 → TooManyProofs →
-        // 402; swap not attempted, handler not run.
+        // 3-proof token against a cap of 2 → TooManyProofs → 402; swap not
+        // attempted, handler not run.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -892,12 +787,8 @@ mod tests {
 
     #[tokio::test]
     async fn indeterminate_swap_failure_returns_503() {
-        // An indeterminate swap-POST transport failure maps to MintUnreachable
-        // { indeterminate: true } → still 503 at the HTTP layer (the
-        // indeterminate flag never changes status, only the operator's
-        // checkstate obligation). Drive it through the real ceremony by stubbing
-        // the mock at MintHttp::post_swap level is overkill here; instead the
-        // validator-level mock returns the indeterminate error directly.
+        // indeterminate: true is still 503 at the HTTP layer — the flag never
+        // changes status, only the operator's checkstate obligation.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let app = router_with(state_with(SwapResponse::UnreachableIndeterminate));
         let response = app
@@ -915,8 +806,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_payment_scheme_returns_402_with_no_failure_body() {
-        // An unsupported scheme is identical to no attempt. Body should
-        // be empty (no failure to describe).
+        // An unsupported scheme is identical to no attempt → empty body.
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
             .oneshot(request_with_authorization("Bearer abcdef"))
@@ -936,8 +826,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_must_be_opaque_base64url_blob() {
-        // The `method="cashu", token="..."` param form is not accepted —
-        // base64 decode trips → 402 re-challenge.
+        // The `method=…, token=…` param form is not accepted (base64 decode trips).
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
             .oneshot(request_with_authorization(
@@ -1023,8 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_method_returns_402() {
-        // `Payment` scheme + valid envelope + `method="tempo"` →
-        // validation failure → 402 re-challenge.
+        // Valid envelope but `method="tempo"` → validation failure → 402.
         let creds = PaymentCredentials {
             challenge: EchoedChallenge {
                 id: "id".into(),
@@ -1069,9 +957,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_amount_presentation_passes_through() {
-        // Present exactly the required amount (8+2 = 10) → 200 OK, body
-        // reports the full 10 the verifier swapped. The verifier makes no
-        // change, so no change header exists to assert against.
+        // Exactly the required amount (8+2=10) → 200; the verifier makes no change.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -1096,10 +982,8 @@ mod tests {
 
     #[tokio::test]
     async fn overfunded_presentation_returns_402() {
-        // Present 16+4 = 20 against a requirement of 10. The charge is
-        // exact-amount: the verifier does NOT make change — it rejects the
-        // over-funded token with a 402 re-challenge. The holder must split
-        // down to exactly 10 locally before presenting.
+        // Exact-amount: a 20-against-10 over-funded token is rejected, NOT
+        // change-made — the holder splits to 10 locally before presenting.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -1111,7 +995,6 @@ mod tests {
             .await
             .expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        // Fresh re-challenge present.
         assert!(response
             .headers()
             .get(http::header::WWW_AUTHENTICATE)
@@ -1128,7 +1011,6 @@ mod tests {
 
     #[tokio::test]
     async fn underfunded_presentation_returns_402() {
-        // Present 8 against a requirement of 10 — under the exact amount.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(8, 0)]);
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app

@@ -1,24 +1,16 @@
 //! Swap-at-mint validator for cashu charge credentials.
 //!
-//! Given a decoded [`Token`] from a holder retrying a 402-gated request and a
-//! [`CashuRequirement`] the verifier originally advertised, [`ChargeValidator`]:
+//! A successful swap at the issuing mint is the proof of unspentness *and* of
+//! `final_expiry` not having passed — there is no separate check for either.
+//! The charge is transfer-on-use: the verifier swaps the whole token and keeps
+//! the value.
 //!
-//! 1. Confirms structural fit (unit, mint, amount) without touching the
-//!    network.
-//! 2. Calls the issuing mint's swap endpoint via [`MintClient`] — a
-//!    successful swap is the proof of unspentness *and* of
-//!    `final_expiry` not having passed.
-//! 3. Returns a [`ValidatedCharge`] holding the new proofs the verifier
-//!    received from the swap. The charge is transfer-on-use: the verifier
-//!    keeps the value.
+//! Structural checks (unit, mint, amount) run BEFORE the swap so an
+//! obviously-bad token — or a flood of them — never reaches the mint.
 //!
-//! Structural checks run first so an obviously-bad token never produces a
-//! network round trip to the mint.
-//!
-//! [`ChargeValidator`] is the cashu-typed internal engine; the public
-//! ecash-agnostic [`Credential`][crate::credential::Credential] impl
-//! ([`CashuCredential`]) wraps it, converting at the boundary to
-//! `String`/`u64` and to the [`pops_core_types`] contract.
+//! [`ChargeValidator`] is the cashu-typed engine; [`CashuCredential`] wraps it
+//! to expose the ecash-agnostic [`Credential`][crate::credential::Credential]
+//! seam (converting to `String`/`u64` and the [`pops_core_types`] contract).
 
 use std::str::FromStr;
 
@@ -34,64 +26,49 @@ use crate::error::Error as ChallengeError;
 use crate::mint_client::{MintClient, MintClientError};
 
 /// Result of a successful charge validation.
-///
-/// `new_proofs` are the proofs the verifier now controls (the mint signed
-/// them against blinded outputs the swap call generated). `mint_url`,
-/// `unit`, and `amount` echo the validated facts about the original token so
-/// callers do not have to re-derive them.
 #[derive(Debug, Clone)]
 pub struct ValidatedCharge {
-    /// Proofs returned by the mint's swap response, now under verifier
-    /// secrets.
+    /// Proofs the verifier now controls: the mint signed these against blinded
+    /// outputs the swap generated, so they are under verifier secrets.
     pub new_proofs: Proofs,
     /// Mint that signed both the original and the new proofs.
     pub mint_url: MintUrl,
-    /// Currency unit of the swapped value (matches the
-    /// [`CashuRequirement`]).
+    /// Currency unit of the swapped value.
     pub unit: CurrencyUnit,
-    /// Total amount of the swapped proofs (sum of `new_proofs.amount`).
+    /// Total amount of the swapped proofs.
     pub amount: Amount,
 }
 
-/// Errors a [`ChargeValidator`] can return.
-///
-/// Variants split into two groups: structural (`UnitMismatch`,
+/// Errors a [`ChargeValidator`] can return. The pre-swap arms (`UnitMismatch`,
 /// `MintNotAllowed`, `AmountMismatch`, `TokenEmpty`, `LockedToken`,
-/// `MultiMintOrUnit`, `TooManyProofs`) — raised before any network call OR
-/// before the swap, so the swap is NEVER attempted on them — and mint-mediated
-/// (`MintRejectedSwap`, `SwapOutputDleqInvalid`, `MintUnreachable`,
-/// `MintUnreachableIndeterminate`) — raised at/after the swap attempt.
-///
-/// These are the cashu-typed internal arms; the public
-/// [`CashuCredential`] maps them onto
-/// [`pops_core_types::ChargeError`][pops_core_types::ChargeError].
+/// `MultiMintOrUnit`, `TooManyProofs`) are raised BEFORE the swap is ever
+/// attempted; the rest are raised at/after it. [`CashuCredential`] maps these
+/// onto [`pops_core_types::ChargeError`][pops_core_types::ChargeError].
 #[derive(Debug, Error)]
 pub enum ValidationError {
     /// Token unit does not match the requirement's unit.
     #[error("token unit {got:?} does not match requirement unit {expected:?}")]
     UnitMismatch {
-        /// Unit advertised by the verifier in the challenge.
+        /// Unit the verifier advertised.
         expected: CurrencyUnit,
-        /// Unit found on the presented token.
+        /// Unit found on the token.
         got: CurrencyUnit,
     },
 
-    /// One or more proofs carry a NUT-10 well-known spending-condition secret
-    /// (P2PK / HTLC) — a LOCKED token. This intent accepts plain-secret BEARER
-    /// proofs only; a locked proof is rejected BEFORE the swap (so the swap is
-    /// never attempted on it).
+    /// A proof carries a NUT-10 spending-condition secret (P2PK / HTLC). This
+    /// intent is BEARER-only; a locked proof is rejected before the swap, which
+    /// the bearer ceremony could not satisfy anyway.
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
 
-    /// The presented proofs are not homogeneous: a proof's keyset/unit differs
-    /// from the others, or from the declared requirement unit. Caught BEFORE the
-    /// swap so the `proofs[0]` output-keyset assumption the ceremony makes is
-    /// sound.
+    /// Proofs reference more than one keyset id. Rejected before the swap so the
+    /// ceremony's `proofs[0]` output-keyset assumption holds: a cashu keyset is
+    /// mint-AND-unit-specific, so a single shared id is what guarantees a single
+    /// mint and unit across the whole set.
     #[error("token references multiple keysets/units (must be a single keyset)")]
     MultiMintOrUnit,
 
-    /// The token carries more proofs than the validator's configured maximum — a
-    /// pre-swap DoS guard. Rejected BEFORE the swap.
+    /// More proofs than the configured cap — a pre-swap DoS guard.
     #[error("too many proofs: {got} exceeds max {max}")]
     TooManyProofs {
         /// Proof count the token carried.
@@ -103,76 +80,63 @@ pub enum ValidationError {
     /// Token was issued by a mint not in the requirement's allowlist.
     #[error("token mint {got} is not in the requirement's allowed mints: {allowed:?}")]
     MintNotAllowed {
-        /// Mint URL embedded in the token.
+        /// Mint the token names.
         got: MintUrl,
-        /// Mints the verifier explicitly allowed.
+        /// Mints the verifier allowed.
         allowed: Vec<MintUrl>,
     },
 
-    /// Token's total proof amount does not exactly equal the requirement.
-    ///
-    /// The charge is exact-amount (L402 / NUT-18 style): the holder must
-    /// present a token worth precisely `requirement.amount`. The verifier
-    /// makes no change — splitting an over-funded credential is the holder's
-    /// job, done locally and non-custodially before presentation. Both an
-    /// under- and an over-funded token are rejected with this error.
+    /// Total proof amount is not EXACTLY the requirement. The charge is
+    /// exact-amount: the verifier makes no change, so an over-funded token is
+    /// rejected just like an under-funded one (the holder splits locally,
+    /// non-custodially, before presenting).
     #[error("token amount {got} does not equal required {required}")]
     AmountMismatch {
-        /// Amount the verifier required in the challenge.
+        /// Amount required.
         required: Amount,
-        /// Total of all proof amounts in the presented token.
+        /// Total presented.
         got: Amount,
     },
 
-    /// Mint accepted the swap call but rejected the proofs (expired
-    /// credential, double-spent proof, invalid signature, keyset rotated,
-    /// etc.).
+    /// Mint accepted the call but rejected the proofs (expired, double-spent,
+    /// bad signature, keyset rotated, etc.).
     #[error("mint rejected swap: {0}")]
     MintRejectedSwap(String),
 
-    /// The swap returned blind signatures whose NUT-12 DLEQ proof is MISSING
-    /// or INVALID against the mint's advertised key (money-safety: unsigned /
-    /// wrong-key outputs that MUST NOT be redeemed). Distinct from
-    /// [`Self::MintRejectedSwap`] so it maps to the contract's
-    /// `DleqInvalid { location: SwapOutput }`, not a double-spend.
+    /// Swap-output blind signatures whose NUT-12 DLEQ is missing or invalid:
+    /// unsigned / wrong-key outputs that MUST NOT be redeemed. Kept distinct
+    /// from [`Self::MintRejectedSwap`] so it maps to `DleqInvalid`, not a
+    /// double-spend — collapsing the two would hide the mint-trust signal.
     #[error("swap-output DLEQ verification failed: {0}")]
     SwapOutputDleqInvalid(String),
 
-    /// Mint could not be reached on a DETERMINATE call (a pre-swap keysets/keys
-    /// GET, or a connect failure that never submitted the swap inputs). The
-    /// token was NOT consumed; a retry with the same token is authoritative.
+    /// DETERMINATE unreachable: a pre-swap GET or a connect failure that never
+    /// submitted the inputs. The token was NOT consumed; retry is authoritative.
     #[error("mint unreachable: {0}")]
     MintUnreachable(String),
 
-    /// The swap POST itself failed in transport (5xx / read-timeout AFTER the
-    /// inputs were submitted), so the outcome is INDETERMINATE — the mint may
-    /// already have consumed the inputs. Same 503+retry as
-    /// [`Self::MintUnreachable`], but maps to the contract's
-    /// `indeterminate: true` so the operator does not assume the token is still
-    /// good without a checkstate.
+    /// The swap POST failed AFTER submitting inputs, so the outcome is
+    /// INDETERMINATE — the mint may already have consumed them. Maps to the
+    /// contract's `indeterminate: true` so the operator checkstates rather than
+    /// assuming the token is still good.
     #[error("mint unreachable (indeterminate swap outcome): {0}")]
     MintUnreachableIndeterminate(String),
 
-    /// Token carried zero proofs — nothing to validate or swap.
+    /// Token carried zero proofs.
     #[error("token contains no proofs")]
     TokenEmpty,
 
-    /// Token internals (proof extraction, value summation, mint-url
-    /// parsing) failed before the swap could be attempted.
+    /// Token internals (proof extraction, summation, mint-url parse) failed.
     #[error("malformed token: {0}")]
     MalformedToken(String),
 }
 
 /// Validates charge tokens against a [`CashuRequirement`] by calling the
-/// issuing mint's swap endpoint.
+/// issuing mint's swap endpoint. Holds no per-request state; construct once and
+/// reuse.
 ///
-/// Construct once with a configured [`MintClient`] and reuse for many
-/// validations. The validator holds no per-request state.
-///
-/// `max_proofs` is an optional pre-swap DoS guard: a token carrying more than
-/// this many proofs is rejected with [`ValidationError::TooManyProofs`] BEFORE
-/// the swap. `None` (the default from [`Self::new`]) imposes no cap; the
-/// gateway wires a concrete bound from its config.
+/// `max_proofs` is an optional pre-swap DoS guard ([`ValidationError::TooManyProofs`]);
+/// `None` imposes no cap.
 #[derive(Debug)]
 pub struct ChargeValidator<M: MintClient> {
     mint_client: M,
@@ -180,8 +144,7 @@ pub struct ChargeValidator<M: MintClient> {
 }
 
 impl<M: MintClient> ChargeValidator<M> {
-    /// Construct a validator backed by the supplied mint client, with NO
-    /// proof-count cap.
+    /// Construct with NO proof-count cap.
     pub fn new(mint_client: M) -> Self {
         Self {
             mint_client,
@@ -189,9 +152,7 @@ impl<M: MintClient> ChargeValidator<M> {
         }
     }
 
-    /// Construct a validator with a per-token `max_proofs` cap (pre-swap DoS
-    /// guard). A token carrying more than `max_proofs` proofs is rejected with
-    /// [`ValidationError::TooManyProofs`] before any swap.
+    /// Construct with a per-token `max_proofs` cap (pre-swap DoS guard).
     pub fn with_max_proofs(mint_client: M, max_proofs: usize) -> Self {
         Self {
             mint_client,
@@ -199,29 +160,21 @@ impl<M: MintClient> ChargeValidator<M> {
         }
     }
 
-    /// Borrow the underlying mint client (used by the [`CashuCredential`]
-    /// wrapper, which holds the validator).
+    /// Borrow the underlying mint client.
     pub fn mint_client(&self) -> &M {
         &self.mint_client
     }
 
-    /// Run the structural (network-free) checks plus proof extraction.
-    ///
-    /// Confirms unit, mint allowlist, non-emptiness, and exact amount,
-    /// fetching keysets only to resolve V1 short keyset IDs. Returns the
-    /// token's mint, its unit, and the extracted proofs — the inputs a
-    /// swap needs. [`Self::validate`] runs this prelude so an
-    /// obviously-bad token never reaches the swap endpoint.
+    /// The network-free structural checks plus proof extraction, returning the
+    /// swap inputs (mint, unit, proofs). Run as a prelude so an obviously-bad
+    /// token never reaches the swap endpoint.
     async fn check_and_extract(
         &self,
         token: &Token,
         requirement: &CashuRequirement,
     ) -> Result<(MintUrl, CurrencyUnit, Proofs), ValidationError> {
-        // Structural: unit.
-        //
-        // `Token::unit()` returns `Option<CurrencyUnit>` because V3 tokens
-        // make the unit optional on the wire. We treat a missing unit as a
-        // mismatch — the verifier always advertises one.
+        // `Token::unit()` is `Option` because V3 makes the unit optional on the
+        // wire; a missing unit is a mismatch — the verifier always advertises one.
         let token_unit = token
             .unit()
             .ok_or_else(|| ValidationError::UnitMismatch {
@@ -235,11 +188,7 @@ impl<M: MintClient> ChargeValidator<M> {
             });
         }
 
-        // Structural: mint allowlist.
-        //
-        // An empty `requirement.mints` means "any mint" — see
-        // `CashuRequirement` docs. Otherwise the token's mint must be a
-        // member.
+        // Empty `requirement.mints` means "any mint" (see `CashuRequirement`).
         let token_mint = token
             .mint_url()
             .map_err(|e| ValidationError::MalformedToken(e.to_string()))?;
@@ -250,17 +199,11 @@ impl<M: MintClient> ChargeValidator<M> {
             });
         }
 
-        // Structural: proof-count DoS guard + locked-proof rejection.
-        //
-        // Both read `token_secrets()` — the raw per-proof secrets, available
-        // across V3/V4 WITHOUT a keyset-resolution network call — so an
-        // oversized or locked token short-circuits BEFORE we even fetch keysets,
-        // let alone swap.
+        // `token_secrets()` reads raw per-proof secrets across V3/V4 WITHOUT a
+        // keyset-resolution network call, so the DoS + locked checks below
+        // short-circuit before we even fetch keysets, let alone swap.
         let secrets = token.token_secrets();
 
-        // Pre-swap DoS guard: reject a token carrying more than the configured
-        // maximum proof count. Cheapest possible rejection (no network, no
-        // decode), so a flood of huge tokens cannot make us do swap work.
         if let Some(max) = self.max_proofs {
             if secrets.len() > max {
                 return Err(ValidationError::TooManyProofs {
@@ -270,12 +213,9 @@ impl<M: MintClient> ChargeValidator<M> {
             }
         }
 
-        // Locked-token rejection: this intent accepts plain-secret BEARER proofs
-        // only. A proof whose secret parses as a NUT-10 well-known secret (P2PK
-        // or HTLC) is LOCKED — reject BEFORE the swap so we never submit a
-        // spend-conditioned proof (which the bearer ceremony cannot satisfy).
-        // A plain 32-byte hex secret does NOT parse as NUT-10, so this only
-        // fires on genuinely locked proofs.
+        // A plain 32-byte hex secret does NOT parse as NUT-10, so this fires
+        // only on a genuinely locked (P2PK/HTLC) proof — which the bearer
+        // ceremony could not spend.
         if secrets
             .iter()
             .any(|s| cashu::nuts::nut10::Secret::try_from(*s).is_ok())
@@ -283,73 +223,47 @@ impl<M: MintClient> ChargeValidator<M> {
             return Err(ValidationError::LockedToken);
         }
 
-        // Network: fetch keysets for V1 short-id resolution.
-        //
-        // V0 keyset IDs round-trip locally; V1 short IDs are a 7-byte
-        // prefix on the wire and need a full 32-byte ID from the mint's
-        // `/v1/keysets` response to expand. We fetch up front so the
-        // proof-extraction step below works for both formats. If the
-        // mint is unreachable, surface that before the swap call — no
-        // point attempting swap when we can't even read the inputs.
+        // V0 keyset IDs round-trip locally, but V1 short IDs are a 7-byte prefix
+        // on the wire and need the full 32-byte ID from `/v1/keysets` to expand,
+        // so fetch keysets before extracting proofs. Surfacing unreachable here
+        // (before swap) means we never swap when we cannot even read the inputs.
         let keysets = self
             .mint_client
             .keysets(&token_mint)
             .await
             .map_err(|e| match e {
                 MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
-                // `keysets()` submits no swap inputs, so it cannot produce an
-                // indeterminate outcome; if it somehow surfaces here, treat it
-                // as the determinate pre-swap unreachable it is.
+                // `keysets()` submits no inputs and does no DLEQ work, so these
+                // two arms are unreachable here; map defensively (determinate
+                // unreachable / swap-rejection) to keep the match total.
                 MintClientError::UnreachableIndeterminate(msg) => {
                     ValidationError::MintUnreachable(msg)
                 }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
-                // `keysets()` does no DLEQ work, so this arm is unreachable in
-                // practice; map defensively to a swap-rejection rather than
-                // panic, keeping the match total.
                 MintClientError::SwapOutputDleqInvalid(msg) => {
                     ValidationError::MintRejectedSwap(msg)
                 }
             })?;
 
-        // Extract proofs against the fetched keyset list. Resolves V1
-        // short IDs cleanly; V0 short IDs do not consult the list. If a
-        // V1 ID has no matching keyset, this surfaces as MalformedToken
-        // (the cashu crate returns `UnknownShortKeysetId`).
+        // Resolves V1 short IDs against the list (V0 do not consult it). A V1 ID
+        // with no matching keyset surfaces as MalformedToken.
         let proofs = token
             .proofs(&keysets)
             .map_err(|e| ValidationError::MalformedToken(e.to_string()))?;
 
-        // Structural: non-empty.
         if proofs.is_empty() {
             return Err(ValidationError::TokenEmpty);
         }
 
-        // Structural: per-proof keyset homogeneity.
-        //
-        // Every extracted proof must reference the SAME keyset id. A cashu
-        // keyset is mint-AND-unit-specific, so a single shared keyset id implies
-        // a single mint and a single unit — which is what makes the swap
-        // ceremony's `proofs[0].keyset_id` resolution (it derives the active
-        // OUTPUT keyset from the first input alone) sound for the WHOLE set. A
-        // token mixing keysets (hence possibly mixing mints/units) is rejected
-        // here, before the swap, as `MultiMintOrUnit`. (The declared-unit match
-        // was already enforced against `token.unit()` above.)
+        // See `MultiMintOrUnit`: a single shared keyset id is what makes the
+        // ceremony's `proofs[0]` output-keyset resolution sound for the set.
         let first_keyset = proofs[0].keyset_id;
         if proofs.iter().any(|p| p.keyset_id != first_keyset) {
             return Err(ValidationError::MultiMintOrUnit);
         }
 
-        // Structural: amount must match EXACTLY.
-        //
-        // The charge is exact-amount: the holder presents a token worth
-        // precisely `requirement.amount` and the verifier swaps the whole
-        // thing. The verifier never makes change — an over-funded token is
-        // rejected just like an under-funded one, and the holder is expected
-        // to split locally (non-custodially) down to the exact amount before
-        // presenting. We sum proof amounts directly (rather than
-        // `Token::value()`) so the comparison happens before any network
-        // call and an off-amount token short-circuits before swap.
+        // Exact-amount (see `AmountMismatch`). Summed directly rather than via
+        // `Token::value()` so an off-amount token short-circuits before swap.
         let token_amount = proofs
             .total_amount()
             .map_err(|e| ValidationError::MalformedToken(e.to_string()))?;
@@ -363,17 +277,8 @@ impl<M: MintClient> ChargeValidator<M> {
         Ok((token_mint, token_unit, proofs))
     }
 
-    /// Run the full validation pipeline on `token` against `requirement`.
-    ///
-    /// Structural checks run first; the mint swap is only attempted if the
-    /// token is structurally valid. This keeps obviously-bad tokens from
-    /// producing network traffic.
-    ///
-    /// Swaps the *whole* presented token — the verifier keeps all of it.
-    /// The charge is exact-amount, so the structural prelude already
-    /// guaranteed the token is worth precisely `requirement.amount`; the
-    /// verifier never returns change. Splitting an over-funded credential is
-    /// the holder's responsibility, done locally before presentation.
+    /// Run the full validation pipeline: structural prelude, then (only if it
+    /// passes) the mint swap, which redeems the WHOLE token to the verifier.
     pub async fn validate(
         &self,
         token: &Token,
@@ -382,28 +287,21 @@ impl<M: MintClient> ChargeValidator<M> {
         let (token_mint, token_unit, proofs) =
             self.check_and_extract(token, requirement).await?;
 
-        // Network: swap at the issuing mint.
-        //
-        // A successful swap proves both unspentness (nullifier check) and
-        // unexpired credential (`final_expiry` check) atomically.
+        // A successful swap atomically proves both unspentness (nullifier check)
+        // and unexpired credential (`final_expiry` check).
         let new_proofs = self
             .mint_client
             .swap(&token_mint, proofs)
             .await
             .map_err(|e| match e {
-                // A determinate transport failure (pre-POST GET, or a connect
-                // failure that never submitted the inputs): the token is NOT
-                // consumed, a retry is authoritative.
                 MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
-                // The swap POST itself failed after submitting inputs: the
-                // outcome is indeterminate (the mint MAY have spent them).
                 MintClientError::UnreachableIndeterminate(msg) => {
                     ValidationError::MintUnreachableIndeterminate(msg)
                 }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
-                // Money-safety: a missing/invalid swap-output DLEQ is its own
-                // outcome, NEVER collapsed into MintRejectedSwap (which would
-                // become a DoubleSpend 402 and hide the mint-trust signal).
+                // Money-safety: a bad swap-output DLEQ is its own outcome, NEVER
+                // collapsed into MintRejectedSwap (which would 402 as a
+                // DoubleSpend and hide the mint-trust signal).
                 MintClientError::SwapOutputDleqInvalid(msg) => {
                     ValidationError::SwapOutputDleqInvalid(msg)
                 }
@@ -423,9 +321,9 @@ impl<M: MintClient> ChargeValidator<M> {
 }
 
 /// Convert a cashu-typed [`CashuRequirement`] into the decoupled
-/// [`ChargeRequirement`] (`String`/`u64`) the [`Credential`] seam speaks.
-/// Used by callers that already hold the cashu-typed requirement (the
-/// middleware) and want to drive a generic `Credential`.
+/// [`ChargeRequirement`] the [`Credential`] seam speaks. For callers (the
+/// middleware) that hold the cashu-typed requirement but drive a generic
+/// `Credential`.
 pub fn charge_requirement_from_cashu(req: &CashuRequirement) -> ChargeRequirement {
     ChargeRequirement {
         amount: u64::from(req.amount),
@@ -437,11 +335,10 @@ pub fn charge_requirement_from_cashu(req: &CashuRequirement) -> ChargeRequiremen
     }
 }
 
-/// Build the cashu-typed [`CashuRequirement`] from the decoupled
-/// [`ChargeRequirement`]. Fallible: the `unit` / `mints` strings must parse
-/// into their cashu types. A bad requirement is server-side config, so a
-/// parse failure maps to [`ChargeError::MalformedRequest`] (a 400 framework
-/// status, NOT a 402 — the credential was never the problem).
+/// Build the cashu-typed [`CashuRequirement`] from the decoupled one. A bad
+/// requirement is server-side config, so a parse failure maps to
+/// [`ChargeError::MalformedRequest`] (a 400, NOT a 402 — the credential was
+/// never the problem).
 fn cashu_requirement_from_charge(req: &ChargeRequirement) -> Result<CashuRequirement, ChargeError> {
     let unit = CurrencyUnit::from_str(&req.unit).map_err(|e| {
         ChargeError::MalformedRequest(format!("requirement unit {:?}: {e}", req.unit))
@@ -462,46 +359,22 @@ fn cashu_requirement_from_charge(req: &ChargeRequirement) -> Result<CashuRequire
     })
 }
 
-/// SHA-256 of the EXACT presented credential string, lowercase hex. This is
-/// the receipt `reference` (`RedeemedProofs.token_hash`) — a stable,
-/// shareable settlement id that exposes no secret.
+/// SHA-256 of the EXACT presented credential string, lowercase hex. The receipt
+/// `reference` (`RedeemedProofs.token_hash`): a stable, shareable settlement id
+/// that exposes no secret.
 fn token_hash_hex(presented: &str) -> String {
     let digest = Sha256::digest(presented.as_bytes());
     let mut s = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        // lower-hex, fixed 2 chars/byte.
         s.push(char::from_digit((byte >> 4) as u32, 16).expect("nibble<16"));
         s.push(char::from_digit((byte & 0x0f) as u32, 16).expect("nibble<16"));
     }
     s
 }
 
-/// Map a cashu-typed [`ValidationError`] onto the cross-slice
-/// [`ChargeError`] contract. `mint_url` supplies the transport context the
-/// cashu arm does not carry.
-///
-/// The mapping:
-/// - `MintUnreachable` → `MintUnreachable { indeterminate: false }`
-///   (DETERMINATE transport failure — pre-swap GET or pre-submit connect fail;
-///   the token is not consumed, a retry is authoritative).
-/// - `MintUnreachableIndeterminate` → `MintUnreachable { indeterminate: true }`
-///   (the swap POST itself failed AFTER submitting inputs; same 503+retry but
-///   the operator must checkstate before assuming the token is still good).
-/// - `AmountMismatch`  → `AmountMismatch { expected_swap_fee: 0 }`
-///   (fee forced 0 today; `required == amount`).
-/// - `UnitMismatch`    → `WrongUnit`.
-/// - `MintNotAllowed`  → `MintNotAllowed`.
-/// - `LockedToken`     → `LockedToken` (NUT-10 locked proof; 402, pre-swap).
-/// - `MultiMintOrUnit` → `MultiMintOrUnit` (mixed keysets/units; 402, pre-swap).
-/// - `TooManyProofs`   → `TooManyProofs` (over the DoS cap; 402, pre-swap).
-/// - `TokenEmpty` / `MalformedToken` → `MalformedCredential`.
-/// - `MintRejectedSwap`→ `DoubleSpend` (SAFE interim — both swap-rejections
-///   collapse to DoubleSpend=402 until the NUT-03 error-body parse for
-///   `Expired` lands; that split is conformance backlog).
-/// - `SwapOutputDleqInvalid` → `DleqInvalid { location: SwapOutput }` (a mint
-///   that omitted or forged the output DLEQ — verification-failed → 402; the
-///   gateway does NOT serve the resource. Money-safety: NEVER collapsed into
-///   `DoubleSpend`).
+/// Map a cashu-typed [`ValidationError`] onto the cross-slice [`ChargeError`].
+/// `mint_url` supplies the transport context the cashu arm does not carry. The
+/// two money-safety arms (DoubleSpend interim, DLEQ) are noted inline.
 fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
     match e {
         ValidationError::MintUnreachable(detail) => ChargeError::MintUnreachable {
@@ -551,30 +424,24 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
     }
 }
 
-/// The ecash-agnostic [`Credential`] implementation for Cashu.
-///
-/// Wraps a [`ChargeValidator`] (the cashu-typed engine) and exposes the
-/// decoupled [`Credential`] seam: it converts the [`ChargeRequirement`] in,
-/// runs verify+swap, maps [`ValidationError`] → [`ChargeError`], and produces
-/// the cross-slice [`RedeemedProofs`] (computing `token_hash` from the
-/// presented bytes and `fresh_proofs` from the swap response). `token_hash`
-/// and `fresh_proofs` are computed HERE because both need data only the core
-/// holds (the raw presented string / the swap-returned proofs).
+/// The ecash-agnostic [`Credential`] implementation for Cashu: wraps a
+/// [`ChargeValidator`] and produces the cross-slice [`RedeemedProofs`].
+/// `token_hash` and `fresh_proofs` are computed HERE because both need data only
+/// the core holds (the raw presented string / the swap-returned proofs).
 #[derive(Debug)]
 pub struct CashuCredential<M: MintClient> {
     validator: ChargeValidator<M>,
 }
 
 impl<M: MintClient> CashuCredential<M> {
-    /// Construct from a configured [`MintClient`], with NO proof-count cap.
+    /// Construct with NO proof-count cap.
     pub fn new(mint_client: M) -> Self {
         Self {
             validator: ChargeValidator::new(mint_client),
         }
     }
 
-    /// Construct from a configured [`MintClient`] with a per-token `max_proofs`
-    /// cap (pre-swap DoS guard; see [`ChargeValidator::with_max_proofs`]).
+    /// Construct with a per-token `max_proofs` cap (pre-swap DoS guard).
     pub fn with_max_proofs(mint_client: M, max_proofs: usize) -> Self {
         Self {
             validator: ChargeValidator::with_max_proofs(mint_client, max_proofs),
@@ -592,8 +459,7 @@ impl<M: MintClient> CashuCredential<M> {
     }
 }
 
-// async_trait is `?Send` on wasm32 to match the `Credential` trait + the
-// `MintClient` seam this composes over.
+// `?Send` on wasm32 to match the `Credential` trait + `MintClient` seam.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl<M: MintClient> Credential for CashuCredential<M> {
@@ -602,8 +468,8 @@ impl<M: MintClient> Credential for CashuCredential<M> {
         presented: &str,
         req: &ChargeRequirement,
     ) -> Result<Redeemed, ChargeError> {
-        // Decode the presented credential. Any decode failure (bad prefix,
-        // bad base64/CBOR, cashuA-not-cashuB) is a malformed credential.
+        // Any decode failure (bad prefix, bad base64/CBOR, cashuA-not-cashuB) is
+        // a malformed credential — a 402 about the credential, not about value.
         let token = decode_token(presented).map_err(|e| match e {
             ChallengeError::InvalidHeader(m) => {
                 ChargeError::MalformedCredential(format!("invalid token: {m}"))
@@ -614,28 +480,23 @@ impl<M: MintClient> Credential for CashuCredential<M> {
             ChallengeError::EncodeFailed(m) => ChargeError::MalformedCredential(m),
         })?;
 
-        // Extract the token's mint up front: it supplies the transport
-        // context for a `MintUnreachable` and is the mint_url the fresh
-        // proofs are re-tokenized under. A token that cannot name its mint
-        // is malformed.
+        // Extracted up front: supplies the transport context for a
+        // `MintUnreachable` and is the mint_url the fresh proofs re-tokenize
+        // under. A token that cannot name its mint is malformed.
         let token_mint = token.mint_url().map_err(|e| {
             ChargeError::MalformedCredential(format!("token mint_url: {e}"))
         })?;
 
-        // Convert the decoupled requirement into the cashu-typed one the
-        // engine needs (fallible: server-config parse).
         let cashu_req = cashu_requirement_from_charge(req)?;
 
-        // Run verify + swap-to-redeem; map the cashu-typed error onto the
-        // cross-slice contract.
         let validated = self
             .validator
             .validate(&token, &cashu_req)
             .await
             .map_err(|e| map_validation_error(e, &token_mint.to_string()))?;
 
-        // Serialize the swap-returned proofs to a canonical cashuB token
-        // string (the cross-slice `fresh_proofs` carries no `cashu::Proofs`).
+        // Re-serialize to a canonical cashuB string (`fresh_proofs` carries no
+        // `cashu::Proofs`).
         let fresh_proofs = Token::new(
             validated.mint_url.clone(),
             validated.new_proofs.clone(),
@@ -644,8 +505,8 @@ impl<M: MintClient> Credential for CashuCredential<M> {
         )
         .to_string();
 
-        // The keyset the FRESH proofs are signed under (the mint's active
-        // keyset for the unit, which may differ from the input keyset).
+        // The mint's active keyset for the unit, which may differ from the input
+        // keyset.
         let active_keyset_id = validated
             .new_proofs
             .first()
@@ -690,41 +551,24 @@ mod tests {
 
     /// Canned outcome for the mock [`MintClient::swap`] call.
     enum SwapResponse {
-        /// Echo the incoming proofs back as the "new" proofs. Lets tests
-        /// assert amount preservation without constructing fresh proofs.
+        /// Echo the incoming proofs back, so tests can assert amount
+        /// preservation without constructing fresh proofs.
         Echo,
-        /// Return [`MintClientError::Unreachable`] with a fixed message (a
-        /// DETERMINATE transport failure).
         Unreachable,
-        /// Return [`MintClientError::UnreachableIndeterminate`] — the swap-POST
-        /// itself failed after submitting inputs (the ceremony's re-tag),
-        /// asserting the validator surfaces the indeterminate arm.
         UnreachableIndeterminate,
-        /// Return [`MintClientError::RejectedSwap`] with a fixed message.
         RejectedSwap,
-        /// Return [`MintClientError::SwapOutputDleqInvalid`] — the swap-output
-        /// DLEQ gate (in [`swap_to_redeem`][crate::swap_ceremony::swap_to_redeem])
-        /// rejected a missing/invalid DLEQ. Asserts the validator's mapping of
-        /// this distinct error (NOT collapsed into a double-spend). The gate
-        /// itself is exercised against a real signing mock in
-        /// `swap_ceremony`'s tests.
         DleqInvalid,
     }
 
     /// Canned outcome for the mock [`MintClient::keysets`] call.
     enum KeysetsResponse {
-        /// Return the supplied list of [`KeySetInfo`]s.
         Ok(Vec<KeySetInfo>),
-        /// Return [`MintClientError::Unreachable`] with a fixed message.
         Unreachable,
     }
 
-    /// Mock [`MintClient`] used in validator unit tests.
-    ///
-    /// `swap_response` and `keysets_response` are the canned outcomes for
-    /// each trait method. `swap_calls` and `keysets_calls` let tests
-    /// assert whether and how often each endpoint was actually contacted
-    /// (structural failures must short-circuit before any network call).
+    /// Mock [`MintClient`]. The `*_calls` counters let tests assert whether each
+    /// endpoint was contacted — structural failures must short-circuit before
+    /// any network call.
     struct MockMintClient {
         swap_response: SwapResponse,
         keysets_response: KeysetsResponse,
@@ -732,8 +576,6 @@ mod tests {
         keysets_calls: Arc<AtomicUsize>,
     }
 
-    /// Call counters returned by [`MockMintClient::new`] so tests can
-    /// observe behaviour without holding a reference to the mock itself.
     #[derive(Clone)]
     struct MockCounters {
         swap: Arc<AtomicUsize>,
@@ -762,9 +604,7 @@ mod tests {
             )
         }
 
-        /// Convenience: build a mock that returns the default empty
-        /// keyset list (sufficient for V0-format tokens) and the supplied
-        /// swap response.
+        /// Mock with an empty keyset list (sufficient for V0-format tokens).
         fn with_swap(swap_response: SwapResponse) -> (Self, MockCounters) {
             Self::new(swap_response, KeysetsResponse::Ok(Vec::new()))
         }
@@ -821,17 +661,15 @@ mod tests {
         MintUrl::from_str("https://mint-b.example.com").expect("valid mint url")
     }
 
-    /// Build a `Proof` with a deterministic-but-unique C point. The
-    /// `index` byte differentiates proofs so `Token` does not flag them as
-    /// duplicates.
+    /// Build a `Proof` with a deterministic-but-unique C point (the `index`
+    /// byte keeps `Token` from flagging duplicates). Uses a V0 keyset id, which
+    /// `Token::proofs(&[])` round-trips without needing KeySetInfo.
     fn make_proof(amount: u64, index: u8) -> Proof {
-        // V0 keyset id (`00` prefix); `Token::proofs(&[])` round-trips V0
-        // short ids without needing KeySetInfo.
         let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
         proof_with_keyset(amount, index, keyset_id)
     }
 
-    /// As [`make_proof`] but parameterised by keyset id so tests can mint
+    /// As [`make_proof`] but with an explicit keyset id, so tests can mint
     /// V1-format proofs (`01` prefix, 32 bytes of id).
     fn proof_with_keyset(amount: u64, index: u8, keyset_id: Id) -> Proof {
         let mut preimage = [0u8; 33];
@@ -841,16 +679,14 @@ mod tests {
         Proof::new(Amount::from(amount), keyset_id, Secret::generate(), c)
     }
 
-    /// A NUT-10 P2PK-LOCKED proof on the V0 test keyset: its secret is a
-    /// well-known `["P2PK", …]` NUT-10 secret rather than a plain 32-byte hex
-    /// string, so the locked-token gate must reject it.
+    /// A NUT-10 P2PK-LOCKED proof: its secret is a `["P2PK", …]` NUT-10 secret,
+    /// not a plain 32-byte hex string, so the locked-token gate must reject it.
     fn p2pk_locked_proof(amount: u64, index: u8) -> Proof {
         use cashu::nuts::nut10::SpendingConditions;
         use cashu::nuts::SecretKey;
 
         let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
         let pk = SecretKey::generate().public_key();
-        // A bare P2PK lock (no extra conditions) — the minimal NUT-10 secret.
         let nut10_secret: Secret = SpendingConditions::new_p2pk(pk, None)
             .try_into()
             .expect("P2PK spending-condition serializes to a NUT-10 secret");
@@ -861,11 +697,9 @@ mod tests {
         Proof::new(Amount::from(amount), keyset_id, nut10_secret, c)
     }
 
-    /// Build a representative V1 keyset id (`01` prefix + 32 bytes).
-    /// The bytes are arbitrary — V1 short-id resolution only checks
-    /// that the 7-byte token prefix matches the first 7 bytes of the
-    /// full id, so any well-formed 32-byte id round-trips through the
-    /// token codec.
+    /// A representative V1 keyset id (`01` prefix + 32 bytes). The bytes are
+    /// arbitrary: V1 short-id resolution only matches the 7-byte token prefix
+    /// against the first 7 bytes of the full id.
     fn v1_keyset_id() -> Id {
         Id::from_str(
             "01aabbccddeeff001122334455667788\
@@ -874,8 +708,6 @@ mod tests {
         .expect("valid v1 keyset id")
     }
 
-    /// Build a [`KeySetInfo`] for a V1 id that matches the proofs
-    /// produced via [`proof_with_keyset`] with that same id.
     fn keyset_info(id: Id, unit: CurrencyUnit) -> KeySetInfo {
         KeySetInfo {
             id,
@@ -966,7 +798,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_disallowed_mint() {
-        // Token issued by mint_b, requirement only allows mint_a.
         let token = make_token(mint_b(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -995,7 +826,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_underfunded_amount() {
-        // Token totals 5, requirement asks for 10 — under the exact amount.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(2, 0), make_proof(3, 1)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1019,10 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_overfunded_amount() {
-        // Token totals 20, requirement asks for exactly 10. The charge is
-        // exact-amount: an over-funded token is rejected, NOT charged with
-        // change. The holder must split down to 10 locally before
-        // presenting.
+        // Exact-amount: an over-funded token is rejected, NOT charged with change.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(16, 0), make_proof(4, 1)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1046,8 +873,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_accepts_exact_amount() {
-        // Token totals exactly 10 == requirement: the happy exact-amount
-        // path. (Reinforces the boundary the over/under tests bracket.)
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(8, 0), make_proof(2, 1)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1114,8 +939,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_propagates_mint_rejected_swap() {
-        // This is the case where `final_expiry` has passed or a nullifier
-        // collided (double-spend).
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1139,10 +962,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_propagates_swap_output_dleq_invalid() {
-        // Money-safety: a swap-output DLEQ failure (the gate in swap_to_redeem
-        // rejected missing/invalid DLEQ on the returned blind signatures) must
-        // surface as its OWN ValidationError arm, never collapsed into
-        // MintRejectedSwap — and produce no redeemed proofs.
+        // Money-safety: a swap-output DLEQ failure must surface as its OWN arm,
+        // never collapsed into MintRejectedSwap.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1166,17 +987,15 @@ mod tests {
 
     #[tokio::test]
     async fn validate_happy_path_v1_keyset() {
-        // Synthesize a V1-format token: proofs whose keyset id has the
-        // `01` version byte. On the wire the token serializes the id as
-        // a 7-byte short id; decoding back into proofs needs the matching
-        // full 32-byte `KeySetInfo` from the mint's keysets endpoint.
+        // A V1 token serializes its keyset id as a 7-byte short id on the wire;
+        // decoding back needs the full `KeySetInfo` from keysets(). Round-trip
+        // through encode/decode so the proofs lose their full id and force that
+        // resolution.
         let v1_id = v1_keyset_id();
         let proofs = vec![
             proof_with_keyset(7, 0, v1_id),
             proof_with_keyset(3, 1, v1_id),
         ];
-        // Round-trip the token through encode/decode so the proofs lose
-        // their full id and force the validator to resolve via keysets().
         let token_str = make_token(mint_a(), pop_unit(), proofs).to_string();
         let token = Token::from_str(&token_str).expect("v1 token round-trips");
 
@@ -1228,10 +1047,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_v1_token_with_no_matching_keyset() {
-        // V1 token but the mint returns an empty keysets list — the
-        // 7-byte short id cannot be resolved into a full id, so proof
-        // extraction surfaces as MalformedToken. Swap must not be
-        // attempted: we cannot construct a swap request without proofs.
+        // Empty keysets list ⇒ the 7-byte short id cannot resolve, so extraction
+        // fails as MalformedToken and no proofs exist to swap.
         let v1_id = v1_keyset_id();
         let proofs = vec![proof_with_keyset(10, 0, v1_id)];
         let token_str = make_token(mint_a(), pop_unit(), proofs).to_string();
@@ -1265,9 +1082,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_locked_p2pk_proof_before_swap() {
-        // A NUT-10 P2PK-locked proof: this intent is bearer-only, so the
-        // validator must reject it as LockedToken BEFORE any network call —
-        // neither keysets() nor swap() may be contacted.
+        // Bearer-only: a locked proof is rejected before any network call.
         let token = make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1296,8 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_locked_proof_mixed_with_plain() {
-        // Even ONE locked proof among otherwise-plain proofs rejects the whole
-        // token (the gate is `any`), and still before any swap.
+        // The gate is `any`: even one locked proof rejects the whole token.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -1325,12 +1139,9 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_mixed_keysets_before_swap() {
-        // Two proofs on DIFFERENT keyset ids (a V0 id and a V1 id) — a token
-        // mixing keysets (hence possibly mints/units) must be rejected as
-        // MultiMintOrUnit before the swap, so the `proofs[0]` output-keyset
-        // assumption stays sound. The V1 keyset is resolvable (we supply its
-        // KeySetInfo) so extraction itself succeeds and the homogeneity check is
-        // what fires.
+        // Two proofs on DIFFERENT keyset ids. The V1 keyset is resolvable (we
+        // supply its KeySetInfo) so extraction succeeds and the homogeneity
+        // check is what fires — not an extraction error.
         let v0 = make_proof(4, 0); // keyset 009a1f293253e41e
         let v1_id = v1_keyset_id();
         let v1 = proof_with_keyset(6, 1, v1_id);
@@ -1362,8 +1173,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_too_many_proofs_before_swap() {
-        // A validator with a max-proofs cap of 2; a 3-proof token must be
-        // rejected as TooManyProofs before any network call.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -1399,8 +1208,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_at_proof_cap_boundary_passes() {
-        // Exactly at the cap (2 proofs, cap 2) is allowed — the guard is
-        // strictly `>`, not `>=`.
+        // The guard is strictly `>`, not `>=`: a token exactly at the cap passes.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -1424,9 +1232,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_swap_unreachable_is_determinate_at_validator() {
-        // A `MintClientError::Unreachable` from the swap seam is a DETERMINATE
-        // failure (the validator's mock stubs MintClient::swap directly, which
-        // is the pre-submit-equivalent contract here): it maps to the plain
+        // `Unreachable` from the swap seam is DETERMINATE: it maps to the plain
         // MintUnreachable arm, NOT the indeterminate one.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
@@ -1446,9 +1252,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_swap_unreachable_indeterminate_maps_through() {
-        // An indeterminate swap-POST failure (the ceremony re-tags a post-submit
-        // transport failure as UnreachableIndeterminate) must surface as the
-        // distinct MintUnreachableIndeterminate validator arm.
+        // A post-submit swap-POST failure must surface as the distinct
+        // MintUnreachableIndeterminate arm.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1490,9 +1295,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_happy_produces_redeemed_proofs() {
-        // Echo swap, exact amount → Ok. Assert the RedeemedProofs shape:
-        // token_hash is 64 lowercase-hex, fresh_proofs re-parses to a cashuB
-        // token, amount matches, active_keyset_id is non-empty.
         let presented = make_token(
             mint_a(),
             pop_unit(),
@@ -1514,17 +1316,15 @@ mod tests {
         assert_eq!(redeemed.proofs.amount, 10);
         assert_eq!(redeemed.proofs.unit, "pop_1700000000");
 
-        // token_hash: 64 lowercase-hex chars (SHA-256).
         let th = &redeemed.proofs.token_hash;
         assert_eq!(th.len(), 64, "token_hash must be 64 hex chars, got {th:?}");
         assert!(
             th.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "token_hash must be lowercase hex: {th}"
         );
-        // And it must be the SHA-256 of the EXACT presented string.
+        // Must be the SHA-256 of the EXACT presented string.
         assert_eq!(th, &super::token_hash_hex(&presented));
 
-        // fresh_proofs: a cashuB string that re-parses to a Token.
         assert!(
             redeemed.proofs.fresh_proofs.starts_with("cashuB"),
             "fresh_proofs must be a cashuB token, got: {}",
@@ -1538,7 +1338,6 @@ mod tests {
             "re-parsed fresh_proofs must total the redeemed amount"
         );
 
-        // active_keyset_id: non-empty hex of the fresh proofs' keyset.
         assert!(
             !redeemed.proofs.active_keyset_id.is_empty(),
             "active_keyset_id must be populated"
@@ -1566,8 +1365,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_amount_mismatch_with_zero_fee() {
-        // Overfunded: present 20 against required 10 → AmountMismatch with
-        // expected_swap_fee 0 and required == amount.
         let presented = make_token(
             mint_a(),
             pop_unit(),
@@ -1601,7 +1398,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_rejected_swap_to_double_spend() {
-        // SAFE interim: any swap rejection collapses to DoubleSpend.
+        // SAFE interim: any swap rejection collapses to DoubleSpend (see
+        // `map_validation_error`).
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)])
             .to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
@@ -1621,10 +1419,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_swap_output_dleq_to_dleq_invalid_swap_output() {
-        // Money-safety: a swap-output DLEQ failure maps to the contract's
-        // DleqInvalid { location: SwapOutput } — NOT DoubleSpend — so the
-        // envelope renders `dleq-invalid` and the gateway serves nothing. No
-        // redeemed proofs are produced.
+        // Money-safety: a swap-output DLEQ failure maps to DleqInvalid{SwapOutput},
+        // NOT DoubleSpend — the gateway serves nothing and no proofs are produced.
         use pops_core_types::DleqLocation;
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
@@ -1650,8 +1446,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_unreachable_to_mint_unreachable() {
-        // Transport failure → MintUnreachable { indeterminate: false } with
-        // the token's mint threaded into mint_url.
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)])
             .to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
@@ -1678,8 +1472,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_rejects_malformed_credential() {
-        // A non-cashu string is a malformed credential (not a 402 reason
-        // about value).
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
         let (mock, _c) = MockMintClient::with_swap(SwapResponse::Echo);
         let cred = CashuCredential::new(mock);
@@ -1701,8 +1493,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_rejects_cashu_a_as_malformed() {
-        // cashuA is out of contract → MalformedCredential (a 402 about a
-        // malformed credential), not a verification failure about value.
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
         let (mock, _c) = MockMintClient::with_swap(SwapResponse::Echo);
         let cred = CashuCredential::new(mock);
@@ -1719,8 +1509,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_locked_token_to_locked_token() {
-        // A NUT-10 P2PK-locked proof maps to the contract's LockedToken (402,
-        // pre-swap) — the dead-but-defined variant is now wired.
         let presented =
             make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
@@ -1740,8 +1528,6 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_too_many_proofs_to_too_many_proofs() {
-        // The wired DoS cap: a CashuCredential built with_max_proofs rejects an
-        // over-cap token with the contract's TooManyProofs (carrying got/max).
         let presented = make_token(
             mint_a(),
             pop_unit(),
@@ -1768,9 +1554,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_indeterminate_unreachable_to_indeterminate_true() {
-        // An indeterminate swap-POST transport failure maps to the contract's
-        // MintUnreachable { indeterminate: true } (still 503 at the HTTP layer,
-        // but the operator must checkstate before assuming the token is good).
+        // indeterminate: true — still 503 at HTTP, but the operator must
+        // checkstate before assuming the token is good.
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
 

@@ -1,16 +1,11 @@
-//! The pluggable funder **Signer** seam.
+//! The pluggable funder Signer seam.
 //!
-//! The `pops-core-funder` kernel is custody-free: it builds an unsigned
-//! recovery spend and hands back a [`bitcoin::TapSighash`], expecting a
-//! [`schnorr::Signature`] in return. This module defines the [`Signer`] trait
-//! that supplies that signature (and the two pubkey encodings + the NUT-20
-//! issuance signature), and a [`HotKeySigner`] that derives the funder key
-//! from the wallet seed in-process.
-//!
-//! Splitting signing behind a trait is what keeps the door open for hardware /
-//! remote / air-gapped signers later: the kernel never sees a secret, and a
-//! non-hot signer just returns the 64 bytes that parse into a
-//! [`schnorr::Signature`]. The kernel stays SYNC; any async lives here.
+//! The `pops-core-funder` kernel is custody-free: it hands back a sighash and
+//! expects a signature. The [`Signer`] trait supplies that (plus the two pubkey
+//! encodings + the NUT-20 issuance signature); [`HotKeySigner`] derives the
+//! funder key from the wallet seed in-process. The trait keeps the door open for
+//! hardware/remote/air-gapped signers — the kernel never sees a secret and stays
+//! SYNC; any async lives here.
 
 use std::error::Error;
 use std::fmt;
@@ -23,12 +18,9 @@ use zeroize::Zeroizing;
 
 use crate::derive::derive_funder_key;
 
-/// A funder public key in the two encodings the PoP flow needs.
-///
-/// The **x-only** form is the `funder_pubkey` baked into `cm` + the CLTV
-/// recovery leaf (on-chain reclaim, what [`pops_core_funder::RecoverInputs`]
-/// takes); the **compressed** form is the NUT-20 quote-lock pubkey (issuance
-/// auth). Both derive from one secret.
+/// A funder public key in the two encodings the PoP flow needs (both from one
+/// secret): the x-only form is baked into `cm` + the CLTV leaf (on-chain
+/// reclaim); the compressed form is the NUT-20 quote-lock key (issuance auth).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunderPubkey {
     /// x-only pubkey — the on-chain recovery commitment key.
@@ -57,14 +49,10 @@ impl fmt::Display for SignerError {
 
 impl Error for SignerError {}
 
-/// The funder signing seam consumed by the recovery + issuance flows.
-///
-/// `index` is the per-deposit BIP-32 funder index. Recovery signing
-/// ([`Signer::sign`]) does not take an index — the kernel's
-/// [`pops_core_funder::build_unsigned`] already produced the sighash for a
-/// specific deposit, and a [`HotKeySigner`] is constructed bound to that
-/// deposit's key. **SYNC v1**: hardware/remote async signing would live in a
-/// different impl, never in the kernel.
+/// The funder signing seam for the recovery + issuance flows. `index` is the
+/// per-deposit BIP-32 funder index; [`Signer::sign`] takes no index because the
+/// sighash is already deposit-specific and a [`HotKeySigner`] is bound to that
+/// deposit's key. SYNC v1 (async signing would be a different impl).
 pub trait Signer {
     /// Returns the funder pubkey (both encodings) for the deposit at `index`.
     ///
@@ -95,15 +83,10 @@ pub trait Signer {
     ) -> Result<(), SignerError>;
 }
 
-/// A hot-key [`Signer`] backed by the wallet's in-process seed.
-///
-/// Holds the (zeroizing) seed + network so it can derive ANY funder index for
-/// [`Signer::funder_pubkey`] / [`Signer::sign_mint_request`]. For
-/// [`Signer::sign`] (which carries no index) it is bound at construction to a
-/// single deposit's `index` — the recovery flow builds one per deposit. The
-/// signing logic is byte-for-byte the former `recover_tx::build_and_sign`:
-/// `sign_schnorr_no_aux_rand` over the derived secret (deterministic, no aux
-/// randomness — sufficient for a one-shot recovery).
+/// A hot-key [`Signer`] backed by the wallet's in-process seed. Holds the
+/// (zeroizing) seed + network so it can derive any index; for [`Signer::sign`]
+/// (no index) it is bound at construction to a single deposit. Signs with
+/// `sign_schnorr_no_aux_rand` (deterministic — fine for a one-shot recovery).
 pub struct HotKeySigner {
     seed: Zeroizing<Vec<u8>>,
     network: Network,
@@ -138,8 +121,6 @@ impl Signer for HotKeySigner {
 
     fn sign(&self, sighash: TapSighash) -> Result<schnorr::Signature, SignerError> {
         let secp = Secp256k1::new();
-        // Derive the bound deposit's funder secret and schnorr-sign the sighash
-        // deterministically — exactly the former recover_tx::build_and_sign.
         let fk = derive_funder_key(&self.seed, self.network, self.index)
             .map_err(|e| SignerError::Derivation(e.to_string()))?;
         let keypair = Keypair::from_secret_key(&secp, &fk.secret_key);
@@ -152,8 +133,7 @@ impl Signer for HotKeySigner {
         index: u32,
         req: &mut MintRequest<String>,
     ) -> Result<(), SignerError> {
-        // Re-derive the funder secret and bridge it into cdk-common's secret-key
-        // type (hex round-trip — the same path the wallet used pre-fold), then
+        // Bridge the funder secret into cdk-common's key type (hex round-trip),
         // NUT-20-sign + self-verify in place.
         let fk = derive_funder_key(&self.seed, self.network, index)
             .map_err(|e| SignerError::Derivation(e.to_string()))?;
@@ -183,33 +163,29 @@ mod tests {
         0xce, 0x9e, 0x38, 0xe4,
     ];
 
-    /// `funder_pubkey` returns the SAME x-only the direct derivation does, and a
-    /// compressed pubkey whose x-only equals it (the two roles are one key).
+    /// `funder_pubkey` returns the SAME x-only as direct derivation, and a
+    /// compressed pubkey whose x-only equals it (one key, two roles).
     #[test]
     fn funder_pubkey_xonly_matches_derived_key() {
         let signer = HotKeySigner::new(&TEST_SEED, Network::Bitcoin, 7);
         let direct = derive_funder_key(&TEST_SEED, Network::Bitcoin, 7).unwrap();
         let fp = signer.funder_pubkey(7).unwrap();
         assert_eq!(fp.xonly, direct.xonly, "signer xonly must match the derived key");
-        // The compressed key's x-only is the same point.
         let (compressed_xonly, _) = fp.compressed.x_only_public_key();
         assert_eq!(compressed_xonly, fp.xonly);
     }
 
-    /// `sign` over a sighash yields a schnorr signature that VERIFIES against the
-    /// bound deposit's derived x-only key — the core "the signer signs the
-    /// kernel's sighash" property.
+    /// `sign` yields a schnorr signature that VERIFIES against the bound
+    /// deposit's derived x-only key.
     #[test]
     fn sign_yields_valid_schnorr_over_sighash() {
         let index = 3u32;
         let signer = HotKeySigner::new(&TEST_SEED, Network::Bitcoin, index);
 
-        // A deterministic, non-trivial 32-byte digest to stand in for a real
-        // BIP-341 sighash (the signer treats it as opaque bytes to sign).
+        // An opaque 32-byte digest standing in for a BIP-341 sighash.
         let sighash = TapSighash::from_byte_array([0x9au8; 32]);
         let sig = signer.sign(sighash).unwrap();
 
-        // Verify against the funder x-only the signer reports for this deposit.
         let secp = Secp256k1::new();
         let xonly = signer.funder_pubkey(index).unwrap().xonly;
         let msg = Message::from_digest(sighash.to_byte_array());

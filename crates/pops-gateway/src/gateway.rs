@@ -1,21 +1,10 @@
 //! The gateway's per-request orchestration: gate → persist → forward.
 //!
-//! This is the THIN HOST around the existing verify gate. The verify logic
-//! itself is fully reused from `pops-core-verify`
-//! ([`CashuCredential::verify_and_redeem`]); this module only:
-//!
-//! 1. decides whether a path is gated ([`crate::routes`]);
-//! 2. on a gated path, runs the gate (no/invalid credential → 402 with the
-//!    prebuilt challenge; else parse + `verify_and_redeem`);
-//! 3. **on success, persists `fresh_proofs` durably BEFORE forwarding**;
-//! 4. forwards the ORIGINAL request to `upstream_url` and streams the response
-//!    back;
-//! 5. maps a [`ChargeError`] to HTTP exactly as the Vercel `route.ts`
-//!    `errorToResponse` does (mint-unreachable → 503 + Retry-After; malformed
-//!    request → 400; everything else → 402 + fresh challenge).
-//!
-//! The 402 wire shape (`WWW-Authenticate: Payment …`) and the ChargeError
-//! mapping mirror `pops-core-verify`'s `middleware.rs` and the Vercel route.
+//! A THIN HOST around the reused verify gate
+//! ([`CashuCredential::verify_and_redeem`]): it decides whether a path is gated,
+//! runs the gate, **persists `fresh_proofs` durably BEFORE forwarding**, then
+//! proxies the ORIGINAL request to `upstream_url` and streams back. The
+//! `ChargeError` → HTTP mapping (503/400/402) mirrors `middleware.rs`.
 
 use std::sync::Arc;
 
@@ -37,44 +26,34 @@ use crate::config::ValidatedConfig;
 use crate::proofs_sink::ProofsSink;
 use crate::routes::{gate_for, Gate};
 
-/// `realm` advertised in the `WWW-Authenticate: Payment` challenge. v1 uses a
-/// fixed identifier (the verify core does the same); operator-configurable
-/// realm is out of scope for the gateway MVP.
+/// `realm` advertised in the challenge (fixed in v1).
 pub const REALM: &str = "pops-gateway";
 
 /// The `intent` value — a one-shot charge.
 pub const INTENT_CHARGE: &str = "charge";
 
-/// A fixed challenge `id`. The gate does NOT enforce challenge-id binding
-/// (stateless v1, same as the verify core + the Vercel demo), so a constant id
-/// is sufficient and keeps the prebuilt header truly constant.
+/// A fixed challenge `id`: the gate does NOT enforce challenge-id binding
+/// (stateless v1), so a constant keeps the prebuilt header truly constant.
 pub const CHALLENGE_ID: &str = "pops-gateway";
 
-/// Everything a request handler needs, built once at startup and shared
-/// (`Arc`) across requests.
-///
-/// `C` is the credential seam — production wires
-/// `CashuCredential<CdkMintClient>` ([`AppState::production`]); tests inject a
-/// `CashuCredential<MockMintClient>`.
+/// Per-request shared state, built once at startup (`Arc`). `C` is the credential
+/// seam (production: `CashuCredential<CdkMintClient>` via [`AppState::production`]).
 pub struct AppState<C: Credential> {
-    /// The pre-parsed config (upstream URL, routes, requirement, …).
+    /// The pre-parsed config.
     pub config: ValidatedConfig,
     /// The credential that verifies + redeems on retry.
     pub credential: Arc<C>,
     /// Durable sink for redeemed proofs (persist-before-forward).
     pub sink: Arc<ProofsSink>,
-    /// The prebuilt `WWW-Authenticate: Payment …` value (built ONCE from the
-    /// requirement at startup; cloned onto every 402).
+    /// The prebuilt `WWW-Authenticate: Payment …` value (cloned onto every 402).
     pub www_authenticate: HeaderValue,
-    /// HTTP client used to forward gated requests upstream.
+    /// HTTP client for forwarding gated requests upstream.
     pub upstream: reqwest::Client,
 }
 
 impl<C: Credential> AppState<C> {
-    /// Build the shared state from a validated config + credential + sink. The
-    /// `WWW-Authenticate` value is prebuilt here, and the forwarding HTTP client
-    /// is built with the configured request + connect timeout so a hung upstream
-    /// is bounded (and the `504` path is reachable).
+    /// Build the shared state. The forwarding client gets the configured request
+    /// + connect timeout so a hung upstream is bounded (and `504` is reachable).
     pub fn new(config: ValidatedConfig, credential: C, sink: ProofsSink) -> Self {
         let www_authenticate = build_www_authenticate(&config.requirement);
         let upstream = build_upstream_client(config.upstream_timeout);
@@ -88,11 +67,9 @@ impl<C: Credential> AppState<C> {
     }
 }
 
-/// Build the forwarding `reqwest::Client`, applying the configured upstream
-/// timeout as BOTH a total-request timeout and a connect timeout. `None`
-/// (config `upstream_timeout_secs = 0`) builds a client with no timeout. If the
-/// builder somehow fails we fall back to a default client rather than panic at
-/// startup; the timeout is a safety bound, not a correctness invariant.
+/// The forwarding client, with `timeout` as BOTH request + connect timeout
+/// (`None` ⇒ no timeout). A builder failure falls back to a default client
+/// rather than panic — the timeout is a safety bound, not a correctness invariant.
 fn build_upstream_client(timeout: Option<std::time::Duration>) -> reqwest::Client {
     let mut builder = reqwest::Client::builder();
     if let Some(t) = timeout {
@@ -114,10 +91,7 @@ impl AppState<CashuCredential<CdkMintClient>> {
     }
 }
 
-/// Build the `WWW-Authenticate: Payment id="…", realm="…", method="cashu",
-/// intent="charge", request="<creqA-envelope>"` value once, from the
-/// requirement. Mirrors `middleware::challenge_response` + the Vercel
-/// `wwwAuthenticate`.
+/// Build the `WWW-Authenticate: Payment …` value once from the requirement.
 fn build_www_authenticate(requirement: &CashuRequirement) -> HeaderValue {
     let creq_a = encode_challenge(requirement);
     let request_envelope = encode_request_envelope(&creq_a);
@@ -138,24 +112,21 @@ where
     let path = req.uri().path().to_string();
 
     match gate_for(&path, &state.config.routes) {
-        // Public path: forward straight through, no gate, no persist.
         Gate::Public => forward(&state, req).await,
-        // Gated path: run the full gate first.
         Gate::Charge => gate_then_forward(state, req).await,
     }
 }
 
 /// The gated path: enforce payment, persist on success, then forward.
 ///
-/// Ordering matters for value-safety and DoS-resistance:
-/// 1. extract the credential FIRST — a bare/malformed request gets a 402
-///    WITHOUT us ever buffering its body (so an unauthenticated caller cannot
-///    make us buffer up to the cap);
-/// 2. buffer the body (capped) BEFORE the swap — an over-cap body is a 413 and
-///    a body-read failure is a 4xx, BOTH before the pop is consumed (so we
-///    never spend a pop on a request we then can't read; cf. the value-loss
-///    edge where a post-charge read failure looked retriable);
-/// 3. swap + persist;
+/// The ORDERING is load-bearing for value-safety + DoS-resistance:
+/// 1. extract the credential FIRST — a bare/malformed request 402s without ever
+///    buffering its body (an unauthenticated caller can't make us buffer up to
+///    the cap);
+/// 2. buffer the body (capped) BEFORE the swap — over-cap → 413, read failure →
+///    4xx, BOTH while the pop is still UNSPENT (so we never spend a pop on a
+///    request we then can't read — the retriable-looking-400 value-loss edge);
+/// 3. swap + persist (BEFORE forwarding);
 /// 4. forward the already-buffered body (no read can fail after the charge).
 async fn gate_then_forward<C>(state: Arc<AppState<C>>, req: Request) -> Response
 where
@@ -163,20 +134,14 @@ where
 {
     let (parts, body) = req.into_parts();
 
-    // ── Step 1: extract + validate the Authorization: Payment credential. ──
+    // Step 1.
     let token = match extract_token(&parts.headers) {
         Ok(t) => t,
-        // No header / non-Payment scheme → a bare 402 (no failure body). Note we
-        // have NOT touched the body, so this is cheap for unauthenticated load.
         Err(TokenExtract::NoAttempt) => return challenge_402(&state, None),
-        // A malformed Payment attempt → 402 + a reason.
         Err(TokenExtract::Malformed(reason)) => return challenge_402(&state, Some(&reason)),
     };
 
-    // ── Step 2: buffer the request body (capped) BEFORE charging. ──
-    // Over the cap → 413; a read failure → 4xx. Both happen while the pop is
-    // still UNSPENT, so the value-loss edge (charge, then fail to read the body,
-    // returning a retriable-looking 400) cannot occur.
+    // Step 2.
     let body_bytes = match read_body_capped(body, state.config.max_body_bytes).await {
         Ok(b) => b,
         Err(BodyReadError::TooLarge) => return payload_too_large(state.config.max_body_bytes),
@@ -186,7 +151,7 @@ where
         }
     };
 
-    // ── Step 3: verify + NUT-03 swap via the reused credential. ──
+    // Step 3.
     let charge_req = charge_requirement_from_cashu(&state.config.requirement);
     let redeemed = match state
         .credential
@@ -197,10 +162,9 @@ where
         Err(e) => return charge_error_to_response(&state, e),
     };
 
-    // ── Step 4: PERSIST fresh_proofs DURABLY *before* forwarding. ──
-    // A crash between forward and persist loses already-consumed proofs. On
-    // failure we do NOT forward and emit the proofs + token_hash to stderr as a
-    // last resort so value is never silently lost.
+    // Step 4: PERSIST before forwarding — a crash between forward and persist
+    // would lose already-consumed proofs. On failure, do NOT forward; emit the
+    // proofs + token_hash to stderr so value is never silently lost.
     if let Err(e) = state.sink.persist(&redeemed.proofs) {
         eprintln!(
             "FATAL persist failure (value at risk): {e}\n  token_hash={}\n  fresh_proofs={}",
@@ -227,13 +191,12 @@ where
         "charge settled and persisted; forwarding upstream"
     );
 
-    // ── Step 5: forward the ORIGINAL request (buffered body), stream back. ──
+    // Step 5.
     forward_buffered(&state, parts, body_bytes).await
 }
 
-/// Forward a PUBLIC request: no gate, no persist. Buffers the body (capped →
-/// 413 on overflow) then forwards. This is the unauthenticated path, so the cap
-/// is the primary guard against an unbounded-body OOM.
+/// Forward a PUBLIC request (no gate, no persist). The body cap is the primary
+/// guard against an unbounded-body OOM on this unauthenticated path.
 async fn forward<C>(state: &AppState<C>, req: Request) -> Response
 where
     C: Credential,
@@ -258,13 +221,9 @@ enum BodyReadError {
     Read(axum::Error),
 }
 
-/// Buffer an axum request `body` into `Bytes`, capped at `max` bytes.
-///
-/// `axum::body::to_bytes(body, max)` returns an error BOTH when the stream
-/// errors AND when the body exceeds `max`; we disambiguate by checking
-/// `is_length_limit_error` so an over-cap body maps to `413` (not a generic
-/// 4xx). This caps the in-memory buffer so an attacker streaming an unbounded
-/// body on a public/unauthenticated path cannot OOM the process.
+/// Buffer a request `body` into `Bytes`, capped at `max` (the OOM guard).
+/// `to_bytes` errors on BOTH a stream error AND an over-cap body, so
+/// [`is_length_limit_error`] disambiguates over-cap → `413` from a 4xx.
 async fn read_body_capped(body: Body, max: usize) -> Result<axum::body::Bytes, BodyReadError> {
     match axum::body::to_bytes(body, max).await {
         Ok(b) => Ok(b),
@@ -273,12 +232,10 @@ async fn read_body_capped(body: Body, max: usize) -> Result<axum::body::Bytes, B
     }
 }
 
-/// Whether an `axum::Error` from `to_bytes` is the length-limit (over-cap)
-/// error vs an underlying stream/read error. axum's `LengthLimitError` is the
-/// source; it carries no public type to match, so we sniff the error chain's
-/// `Display` for the stable axum message. (Falls back to treating an
-/// unrecognized error as a read error — i.e. a 4xx — which is the safe default:
-/// on a gated path we have not yet charged.)
+/// Whether a `to_bytes` error is the over-cap length-limit vs a stream error.
+/// axum's `LengthLimitError` has no public type, so sniff the error chain's
+/// `Display`. An unrecognized error is treated as a read error (4xx) — safe,
+/// since on a gated path we have not yet charged.
 fn is_length_limit_error(e: &axum::Error) -> bool {
     let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(err) = src {
@@ -306,10 +263,9 @@ fn payload_too_large(max: usize) -> Response {
         .into_response()
 }
 
-/// Forward an already-buffered request (`parts` + `body_bytes`) to
-/// `upstream_url` and stream the upstream response back. Shared by the gated
-/// (post-charge) and public paths; the body is in memory so no read can fail
-/// here — crucially, on the gated path the pop is ALREADY spent by now.
+/// Forward an already-buffered request to `upstream_url` and stream the response
+/// back. The body is in memory so no read can fail here — crucial because on the
+/// gated path the pop is ALREADY spent by now.
 async fn forward_buffered<C>(
     state: &AppState<C>,
     parts: http::request::Parts,
@@ -335,9 +291,9 @@ where
     let upstream_resp = match upstream_req.send().await {
         Ok(r) => r,
         Err(e) => {
-            // Upstream down/unreachable. Proofs (if any) are ALREADY persisted —
-            // the operator keeps the value; the client loses the pop. This is
-            // the documented v1 edge. 504 if it was a timeout, else 502.
+            // Upstream down. The proofs are ALREADY persisted — the operator keeps
+            // the value; the client loses the pop (documented v1 edge). 504 on
+            // timeout, else 502.
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -348,7 +304,6 @@ where
         }
     };
 
-    // Map status + headers, then stream the body.
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let resp_headers = forward_response_headers(upstream_resp.headers());
@@ -362,13 +317,11 @@ where
     response
 }
 
-/// Build the upstream target URL = `upstream_url` base joined with the incoming
-/// request's path + query. The base's own path prefix (if any) is preserved.
+/// Upstream target = `upstream_url` base joined with the incoming path + query,
+/// preserving the base's path prefix (e.g. `http://up/api` + `/x` →
+/// `http://up/api/x`).
 fn upstream_target(base: &reqwest::Url, incoming: &Uri) -> Result<reqwest::Url, String> {
     let mut url = base.clone();
-    // Join the incoming path onto the base path. We append the incoming path to
-    // the base path so a base like `http://up/api` + `/x` → `http://up/api/x`,
-    // and a bare base `http://up/` + `/x` → `http://up/x`.
     let base_path = url.path().trim_end_matches('/');
     let incoming_path = incoming.path();
     let joined = format!("{base_path}{incoming_path}");
@@ -377,17 +330,14 @@ fn upstream_target(base: &reqwest::Url, incoming: &Uri) -> Result<reqwest::Url, 
     Ok(url)
 }
 
-/// `http::Method` (axum) → `reqwest::Method`. Both are the `http` crate's
-/// `Method` re-exported, so this is a cheap clone in practice.
+/// `http::Method` → `reqwest::Method` (both re-export the `http` crate's type).
 fn map_method(m: &Method) -> reqwest::Method {
     reqwest::Method::from_bytes(m.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
 }
 
-/// Headers to forward to the upstream: everything except hop-by-hop headers and
-/// `host` (reqwest sets the correct upstream `host`). `authorization` is
-/// dropped on the gated path (it carried the spent pop, not an upstream cred);
-/// for simplicity we drop it on all forwards — the upstream is the operator's
-/// own unmodified API and never sees the pop credential.
+/// Headers forwarded upstream: all except hop-by-hop, `host` (reqwest sets it),
+/// and `authorization` (it carried the spent pop, never an upstream cred — so the
+/// upstream never sees the credential).
 fn forward_request_headers(incoming: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in incoming.iter() {
@@ -399,9 +349,8 @@ fn forward_request_headers(incoming: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// Headers to copy from the upstream response back to the client: everything
-/// except hop-by-hop + `transfer-encoding`/`content-length` (the streaming body
-/// re-frames length/encoding).
+/// Response headers copied back to the client: all except hop-by-hop +
+/// `content-length` (the streaming body re-frames length).
 fn forward_response_headers(upstream: &reqwest::header::HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in upstream.iter() {
@@ -409,7 +358,6 @@ fn forward_response_headers(upstream: &reqwest::header::HeaderMap) -> HeaderMap 
         if is_hop_by_hop(n) || n == "content-length" {
             continue;
         }
-        // Re-wrap into the `http` crate's header types axum uses.
         if let (Ok(hn), Ok(hv)) = (
             header::HeaderName::from_bytes(name.as_ref()),
             HeaderValue::from_bytes(value.as_bytes()),
@@ -443,8 +391,8 @@ enum TokenExtract {
     Malformed(String),
 }
 
-/// Extract the `cashuB…` token from `Authorization: Payment <blob>`. Mirrors
-/// the verify middleware's Steps 1-3.
+/// Extract the `cashuB…` token from `Authorization: Payment <blob>`. A non-Payment
+/// scheme is treated as no attempt.
 fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
     let Some(raw) = headers.get(header::AUTHORIZATION) else {
         return Err(TokenExtract::NoAttempt);
@@ -454,15 +402,13 @@ fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
         .map_err(|_| TokenExtract::Malformed("invalid Authorization header encoding".into()))?;
     match parse_payment_authorization(value) {
         Ok(creds) => Ok(creds.payload.cashu_token),
-        // Some other scheme (Basic/Bearer) — treat as no attempt.
         Err(AuthParseError::UnknownScheme) => Err(TokenExtract::NoAttempt),
         Err(e) => Err(TokenExtract::Malformed(e.to_string())),
     }
 }
 
-/// Build a 402 carrying the prebuilt challenge + a JSON body. Mirrors the
-/// Vercel route's `challenge402`: body `{"error":"payment_required", realm,
-/// [code, detail]}`. `Cache-Control: no-store` always.
+/// Build a 402 carrying the prebuilt challenge + a JSON body (always
+/// `Cache-Control: no-store`).
 fn challenge_402<C>(state: &AppState<C>, failure: Option<&str>) -> Response
 where
     C: Credential,
@@ -489,20 +435,15 @@ where
         .into_response()
 }
 
-/// Map a [`ChargeError`] to an HTTP response, mirroring the Vercel
-/// `errorToResponse` + the verify middleware's `charge_error_to_response`:
-///
-/// - [`ChargeError::MintUnreachable`] → `503` + `Retry-After` (token NOT
-///   consumed, retryable). NEVER a 402.
-/// - [`ChargeError::MalformedRequest`] → `400` (server-side config / method).
-/// - everything else (incl. malformed-credential, verification failures) →
-///   `402` + a fresh challenge.
+/// Map a [`ChargeError`] to an HTTP response (mirrors `middleware.rs`):
+/// [`ChargeError::MintUnreachable`] → `503` + `Retry-After` (token NOT consumed;
+/// NEVER a 402), [`ChargeError::MalformedRequest`] → `400`, everything else
+/// (verification / malformed-credential) → `402` + a fresh challenge.
 fn charge_error_to_response<C>(state: &AppState<C>, e: ChargeError) -> Response
 where
     C: Credential,
 {
     match &e {
-        // (A) transport → 503, retryable.
         ChargeError::MintUnreachable { .. } => (
             StatusCode::SERVICE_UNAVAILABLE,
             [
@@ -520,7 +461,6 @@ where
         )
             .into_response(),
 
-        // (C) not a well-formed payment attempt → 400, not 402.
         ChargeError::MalformedRequest(_) => (
             StatusCode::BAD_REQUEST,
             [
@@ -537,14 +477,12 @@ where
         )
             .into_response(),
 
-        // (B + rest of C) verification / malformed-credential → 402 + challenge.
         _ => challenge_402(state, Some(&e.to_string())),
     }
 }
 
-/// Minimal JSON string escaper for embedding a detail message in a hand-built
-/// JSON body. Handles the characters that would break JSON; everything else is
-/// passed through. (Bodies are advisory; we keep the dep surface small.)
+/// Minimal JSON string escaper for a hand-built JSON body (advisory bodies; keeps
+/// the dep surface small).
 fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

@@ -1,20 +1,11 @@
-//! Shared NUT-03 swap ceremony — the crypto, lifted out of any one
-//! transport so native (`cdk`) and wasm (injected `fetch`) clients share it.
+//! Shared NUT-03 swap ceremony — the crypto, lifted out of any one transport so
+//! native (`cdk`) and wasm (injected `fetch`) clients share it.
 //!
-//! The ceremony (resolve the active output keyset → blind fresh outputs →
-//! POST the swap → unblind the mint's signatures into spendable proofs) is
-//! `cashu`-pure: it touches `PreMintSecrets::random`, `SwapRequest`, and
-//! `cashu::dhke::construct_proofs`, never an HTTP type. The only thing that
-//! differs between native and wasm is the *transport* — the three raw mint
-//! HTTP calls — so that is the seam:
-//!
-//! * [`MintHttp`] is the thin raw-transport trait (`get_keysets` /
-//!   `get_keyset_keys` / `post_swap`) returning `cashu` wire types.
-//! * [`swap_to_redeem`] is the shared, transport-generic ceremony that holds
-//!   ALL the crypto. [`CdkMintClient`][crate::cdk_mint_client::CdkMintClient]
-//!   and [`WasmMintClient`][crate::wasm_mint_client::WasmMintClient] each
-//!   implement only the three `MintHttp` methods and delegate their
-//!   [`MintClient::swap`][crate::mint_client::MintClient::swap] to this fn.
+//! The ceremony is `cashu`-pure (it never touches an HTTP type); the ONLY thing
+//! that differs between native and wasm is the transport — the three raw mint
+//! HTTP calls — so [`MintHttp`] is that seam, and [`swap_to_redeem`] holds ALL
+//! the crypto. Each transport implements only the three `MintHttp` methods and
+//! delegates its [`MintClient::swap`][crate::mint_client::MintClient::swap] here.
 
 use async_trait::async_trait;
 use cashu::amount::{FeeAndAmounts, SplitTarget};
@@ -29,41 +20,32 @@ use cashu::{MintUrl, Proofs};
 
 use crate::mint_client::MintClientError;
 
-/// STRICTLY verify every swap-output blind signature's NUT-12 DLEQ proof
-/// against the active keyset's signing key, BEFORE the outputs are unblinded
-/// into redeemable proofs.
+/// THE money-safety gate: STRICTLY verify every swap-output blind signature's
+/// NUT-12 DLEQ against the active keyset's signing key BEFORE the outputs are
+/// unblinded. `cashu::dhke::construct_proofs` silently accepts a `dleq: None`
+/// signature, so without this a malicious/buggy mint could return UNSIGNED (or
+/// wrong-key) outputs and the verifier would treat the resulting proofs as
+/// redeemed bearer value — and the gateway would serve the resource against them.
 ///
-/// This is the money-safety gate: `cashu::dhke::construct_proofs` silently
-/// accepts blind signatures whose `dleq` is `None`, so without this check a
-/// malicious or buggy mint could return UNSIGNED (or wrong-key) blind
-/// signatures and the verifier would treat the resulting proofs as redeemed
-/// bearer value — and the gateway would serve the gated resource against them.
+/// Mirrors the wallet's `verify_blind_signatures` with ONE deliberate
+/// difference: a redeemed-VALUE path MUST NOT tolerate a missing DLEQ. Where the
+/// wallet treats [`nut12::Error::MissingDleqProof`] as acceptable (optional
+/// offline check), here it is a HARD REJECT.
 ///
-/// Mirrors the wallet-side `pop::mint_client::verify_blind_signatures` check
-/// pattern (same `BlindSignature::verify_dleq(key, B_)` call, same `amount_key`
-/// lookup) with ONE deliberate difference: a redeemed-VALUE path MUST NOT
-/// tolerate a missing DLEQ. Where that wallet helper treats
-/// [`nut12::Error::MissingDleqProof`] as acceptable (an optional offline
-/// check), here a missing proof is a HARD REJECT — the mint failed to prove it
-/// signed these outputs at all.
+/// Pairs each signature with its blinded message by position — `construct_proofs`
+/// consumes signatures and secrets in lockstep, so the same positional zip is
+/// the correct `B_`. A count mismatch is itself a reject.
 ///
-/// Pairs each returned signature with its originating blinded message by
-/// position: `construct_proofs` consumes `response.signatures` and
-/// `pre_mint.secrets()` in lockstep, so the same positional zip is the correct
-/// `B_` for each signature. A signature/secret count mismatch (the mint
-/// returned the wrong number of outputs) is itself a reject.
-///
-/// On any failure returns [`MintClientError::SwapOutputDleqInvalid`] (NOT
-/// `RejectedSwap`): the cross-slice contract distinguishes a mint that omitted
-/// or forged the output DLEQ from an ordinary swap refusal.
+/// Any failure returns [`MintClientError::SwapOutputDleqInvalid`] (NOT
+/// `RejectedSwap`): the contract distinguishes an omitted/forged output DLEQ
+/// from an ordinary swap refusal.
 fn verify_swap_output_dleq(
     signatures: &[BlindSignature],
     pre_mint: &PreMintSecrets,
     keys: &Keys,
 ) -> Result<(), MintClientError> {
-    // A count mismatch means we cannot pair every signature with the blinded
-    // message it must verify against — reject rather than silently verify a
-    // prefix and unblind an unverified tail.
+    // A count mismatch ⇒ we cannot pair every signature with its blinded message;
+    // reject rather than verify a prefix and unblind an unverified tail.
     if signatures.len() != pre_mint.secrets.len() {
         return Err(MintClientError::SwapOutputDleqInvalid(format!(
             "swap returned {} blind signatures but {} were requested",
@@ -73,9 +55,8 @@ fn verify_swap_output_dleq(
     }
 
     for (sig, premint) in signatures.iter().zip(pre_mint.secrets.iter()) {
-        // The advertised signing key for this output's amount. Its absence
-        // means the mint signed an amount it never published a key for — a
-        // reject, not a tolerated case.
+        // No advertised key for this amount ⇒ the mint signed an amount it never
+        // published a key for — reject.
         let key = keys.amount_key(sig.amount).ok_or_else(|| {
             MintClientError::SwapOutputDleqInvalid(format!(
                 "active keyset has no key for swap-output amount {}",
@@ -83,8 +64,8 @@ fn verify_swap_output_dleq(
             ))
         })?;
 
-        // STRICT: present-but-invalid AND missing both reject here. This is the
-        // single line that diverges from the wallet's lenient check.
+        // STRICT: both present-but-invalid AND missing reject here — the single
+        // line that diverges from the wallet's lenient check.
         sig.verify_dleq(key, premint.blinded_message.blinded_secret)
             .map_err(|e| match e {
                 nut12::Error::MissingDleqProof => MintClientError::SwapOutputDleqInvalid(
@@ -99,17 +80,11 @@ fn verify_swap_output_dleq(
     Ok(())
 }
 
-/// The raw mint HTTP the swap ceremony needs, abstracted so the crypto stays
-/// transport-agnostic. Three calls only — the NUT-02 keyset list, a single
-/// keyset's NUT-01 keys, and the NUT-03 swap.
-///
-/// Implementors return the `cashu` wire types and map their transport
-/// failures onto the coarse [`MintClientError`] split (unreachable vs.
-/// mint-refused). The ceremony in [`swap_to_redeem`] owns everything else.
-///
-/// On `wasm32` the trait is `#[async_trait(?Send)]` (single-threaded, matching
-/// the [`MintClient`][crate::mint_client::MintClient] seam it backs); on native
-/// it is `Send + Sync`.
+/// The raw mint HTTP the swap ceremony needs (three calls only: NUT-02 keyset
+/// list, one keyset's NUT-01 keys, NUT-03 swap), abstracted so the crypto stays
+/// transport-agnostic. Implementors return `cashu` wire types and map transport
+/// failures onto the coarse [`MintClientError`] split; [`swap_to_redeem`] owns
+/// everything else. `?Send` on wasm32, `Send + Sync` on native.
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait MintHttp: Send + Sync {
@@ -161,18 +136,12 @@ pub trait MintHttp {
     ) -> Result<SwapResponse, MintClientError>;
 }
 
-/// Resolve the active output keyset for the unit carried on the input
-/// keyset id.
-///
-/// Returns the active keyset's id, its signing [`Keys`] (needed to unblind
-/// the swap response), and the canonical ascending denomination list (its
-/// signing amounts). The input keyset may have rotated; outputs are always
-/// requested against the currently-active keyset for the same unit. Errors
-/// if the input keyset is unknown, no active keyset exists for the unit, or
-/// the keyset charges a non-zero fee (PoP v1 is zero-fee).
-///
-/// Pure given the two HTTP responses the caller fetched through [`MintHttp`];
-/// kept here (not on the transport) because it is ceremony logic, not I/O.
+/// Resolve the active output keyset for the unit on the input keyset id,
+/// returning its id, signing [`Keys`] (to unblind the swap), and ascending
+/// denomination list. The input keyset may have rotated; outputs are ALWAYS
+/// requested against the currently-active keyset for the same unit. Errors if
+/// the input keyset is unknown, no active keyset exists, or it charges a
+/// non-zero fee (PoP v1 is zero-fee).
 async fn resolve_output_keyset<H: MintHttp + ?Sized>(
     http: &H,
     mint_url: &MintUrl,
@@ -207,9 +176,8 @@ async fn resolve_output_keyset<H: MintHttp + ?Sized>(
 
     let active_keyset_full = http.get_keyset_keys(mint_url, active_keyset.id).await?;
 
-    // `Keys::keys()` returns `&BTreeMap<Amount, _>` — already sorted ascending
-    // by `Amount`, so its keys are the canonical denomination list the mint
-    // can sign.
+    // `Keys::keys()` is a `BTreeMap`, already sorted ascending by `Amount`, so
+    // its keys are the canonical denomination list the mint can sign.
     let signing_amounts: Vec<u64> = active_keyset_full
         .keys
         .keys()
@@ -220,48 +188,32 @@ async fn resolve_output_keyset<H: MintHttp + ?Sized>(
     Ok((active_keyset.id, active_keyset_full.keys, signing_amounts))
 }
 
-/// The shared NUT-03 swap-to-redeem ceremony.
+/// The shared NUT-03 swap-to-redeem ceremony: resolve the active output keyset,
+/// blind fresh outputs summing to the input total (PoP v1 is zero-fee), POST the
+/// swap, DLEQ-verify the returned signatures, then unblind into spendable
+/// [`Proofs`] under fresh verifier secrets. Only the two GETs and the POST cross
+/// the [`MintHttp`] seam, so native and wasm share this body. The blinding RNG is
+/// why the `wasm` feature must select a js `getrandom` backend.
 ///
-/// Given a concrete [`MintHttp`] transport, the mint, and the input
-/// `proofs`, this:
-///
-/// 1. resolves the active output keyset for the inputs' unit,
-/// 2. blinds fresh outputs (`PreMintSecrets::random`) summing to the input
-///    total (PoP v1 is zero-fee),
-/// 3. POSTs the [`SwapRequest`],
-/// 4. STRICTLY DLEQ-verifies every returned blind signature against the active
-///    keyset key ([`verify_swap_output_dleq`]) — rejecting a missing OR invalid
-///    proof — so a malicious/buggy mint cannot get unsigned outputs treated as
-///    redeemed value, and
-/// 5. unblinds the verified [`SwapResponse`] signatures via
-///    [`construct_proofs`] into spendable [`Proofs`] under fresh,
-///    verifier-owned secrets.
-///
-/// All five steps are `cashu`-pure; only the two GETs and the POST cross the
-/// [`MintHttp`] seam, so native and wasm callers share this entire body. The
-/// blinding RNG (`PreMintSecrets::random`) is why the `wasm` feature must
-/// select a js `getrandom` backend.
-///
-/// MONEY-SAFETY INVARIANT: step 4 runs BEFORE step 5, so this function never
-/// returns proofs whose swap-output DLEQ was not verified. A DLEQ failure
-/// surfaces as [`MintClientError::SwapOutputDleqInvalid`].
+/// MONEY-SAFETY INVARIANT: the DLEQ verification ([`verify_swap_output_dleq`])
+/// runs BEFORE the unblind, so this never returns proofs whose swap-output DLEQ
+/// was not verified. A DLEQ failure surfaces as
+/// [`MintClientError::SwapOutputDleqInvalid`].
 pub async fn swap_to_redeem<H: MintHttp + ?Sized>(
     http: &H,
     mint_url: &MintUrl,
     proofs: Proofs,
 ) -> Result<Proofs, MintClientError> {
     if proofs.is_empty() {
-        // Defensive: the validator short-circuits on TokenEmpty before ever
-        // reaching swap, and a zero-input swap is malformed at the mint
-        // anyway. Surface as RejectedSwap rather than make a wasted call.
+        // Defensive: the validator already short-circuits on TokenEmpty; surface
+        // as RejectedSwap rather than make a wasted call.
         return Err(MintClientError::RejectedSwap(
             "cannot swap empty proof set".to_string(),
         ));
     }
 
-    // All inputs share a unit (the validator verified that against the
-    // requirement upstream); resolve the active output keyset from the first
-    // input's keyset id.
+    // All inputs share a unit (validated upstream); resolve the active output
+    // keyset from the first input's keyset id.
     let input_keyset_id = proofs[0].keyset_id;
     let (active_keyset_id, active_keys, signing_amounts) =
         resolve_output_keyset(http, mint_url, input_keyset_id).await?;
@@ -271,13 +223,10 @@ pub async fn swap_to_redeem<H: MintHttp + ?Sized>(
         .total_amount()
         .map_err(|e| MintClientError::RejectedSwap(e.to_string()))?;
 
-    // FeeAndAmounts drives the power-of-two split; the amounts list must come
-    // from the keyset's signing denominations so we only request outputs the
-    // mint can sign.
+    // The amounts list must be the keyset's signing denominations so we only
+    // request outputs the mint can sign.
     let fee_and_amounts: FeeAndAmounts = (0u64, signing_amounts).into();
 
-    // Generate blinded outputs against the active keyset id with fresh
-    // verifier secrets.
     let pre_mint = PreMintSecrets::random(
         active_keyset_id,
         total,
@@ -288,14 +237,12 @@ pub async fn swap_to_redeem<H: MintHttp + ?Sized>(
 
     let swap_request = SwapRequest::new(proofs, pre_mint.blinded_messages());
 
-    // The swap POST is the point of no return: once the inputs are submitted, a
-    // transport failure (5xx / read-timeout) leaves the outcome INDETERMINATE —
-    // the mint may have consumed the inputs even though we never read a
-    // response. Re-tag a determinate `Unreachable` from THIS call as
-    // `UnreachableIndeterminate` so the validator surfaces
-    // `indeterminate: true`. The pre-POST GETs above keep plain `Unreachable`
-    // (no inputs submitted yet → a retry is authoritative). `RejectedSwap` /
-    // `SwapOutputDleqInvalid` are definitive mint answers and pass through.
+    // The swap POST is the point of no return: once inputs are submitted, a
+    // transport failure leaves the outcome INDETERMINATE (the mint may have
+    // consumed them though we never read a response), so re-tag a determinate
+    // `Unreachable` from THIS call as `UnreachableIndeterminate`. The pre-POST
+    // GETs keep plain `Unreachable` (no inputs submitted → retry is
+    // authoritative); `RejectedSwap` / `SwapOutputDleqInvalid` are definitive.
     let response = http
         .post_swap(mint_url, swap_request)
         .await
@@ -304,15 +251,11 @@ pub async fn swap_to_redeem<H: MintHttp + ?Sized>(
             other => other,
         })?;
 
-    // MONEY-SAFETY GATE (must precede construct_proofs): STRICTLY DLEQ-verify
-    // every returned blind signature against the active keyset key. A missing
-    // OR invalid proof is rejected — `construct_proofs` would otherwise
-    // silently accept `dleq: None` and we would treat unsigned outputs as
-    // redeemed bearer value. See `verify_swap_output_dleq`.
+    // MONEY-SAFETY GATE — must precede construct_proofs (see
+    // `verify_swap_output_dleq`): without it, a `dleq: None` signature would be
+    // silently unblinded and treated as redeemed bearer value.
     verify_swap_output_dleq(&response.signatures, &pre_mint, &active_keys)?;
 
-    // Unblind: combine the mint's (now DLEQ-verified) signatures with our
-    // blinding factors and secrets to produce spendable proofs.
     let new_proofs = construct_proofs(
         response.signatures,
         pre_mint.rs(),
@@ -326,14 +269,10 @@ pub async fn swap_to_redeem<H: MintHttp + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    //! Money-safety tests for the swap-output DLEQ gate.
-    //!
-    //! These drive [`swap_to_redeem`] over a hand-rolled mock [`MintHttp`] that
-    //! signs the ceremony's blinded outputs as a real mint would, then attaches
-    //! one of three DLEQ behaviours: VALID (happy path), MISSING (`dleq: None`),
-    //! or PRESENT-BUT-INVALID (DLEQ computed against the wrong key). The
-    //! invariant under test: NO redeemed proofs are ever produced unless every
-    //! swap-output blind signature carried a DLEQ that verifies against the
+    //! Money-safety tests for the swap-output DLEQ gate. A mock [`MintHttp`] signs
+    //! the blinded outputs as a real mint would, then attaches VALID, MISSING, or
+    //! PRESENT-BUT-INVALID DLEQ. Invariant under test: NO redeemed proofs unless
+    //! every swap-output signature carried a DLEQ that verifies against the
     //! mint's advertised key.
 
     use std::str::FromStr;
@@ -366,11 +305,9 @@ mod tests {
         ValidButOneMissing,
     }
 
-    /// Deterministic per-amount mint secret keys for the test keyset. Distinct
-    /// 32-byte scalars; any valid secp256k1 scalars work.
+    /// Deterministic per-amount mint secret key: the amount goes into the low
+    /// bytes of a fixed scalar so each denomination has its own (non-zero) key.
     fn mint_secret_for_amount(amount: u64) -> SecretKey {
-        // Encode the amount into the low bytes of an otherwise-fixed scalar so
-        // each denomination has its own key (and none is the zero scalar).
         let mut bytes = [0u8; 32];
         bytes[0] = 0x11;
         bytes[31] = amount as u8;
@@ -384,10 +321,8 @@ mod tests {
         vec![1, 2, 4, 8]
     }
 
-    /// A mock mint: one keyset (acting as both the input keyset and the active
-    /// output keyset) over [`signing_amounts`], signing the ceremony's blinded
-    /// outputs with the matching per-amount secret key and attaching a DLEQ per
-    /// the configured [`DleqMode`].
+    /// A mock mint with one keyset (both input and active output) that signs the
+    /// ceremony's blinded outputs and attaches a DLEQ per the [`DleqMode`].
     struct MockMint {
         unit: CurrencyUnit,
         mode: DleqMode,
@@ -521,9 +456,8 @@ mod tests {
         MintUrl::from_str("https://mint.example.com").expect("valid mint url")
     }
 
-    /// One input proof carrying the mock mint's keyset id. The C point is
-    /// deterministic-but-arbitrary — the mock never verifies inputs, it only
-    /// reads the keyset id off `proofs[0]`.
+    /// One input proof carrying the mock's keyset id. The C point is arbitrary —
+    /// the mock never verifies inputs, it only reads `proofs[0].keyset_id`.
     fn input_proof(amount: u64, index: u8, keyset_id: Id) -> Proof {
         let mut preimage = [0u8; 33];
         preimage[0] = 2;
@@ -547,7 +481,6 @@ mod tests {
             .await
             .expect("valid-DLEQ swap must redeem");
 
-        // Produced spendable proofs summing to the input total.
         let total: u64 = redeemed.iter().map(|p| u64::from(p.amount)).sum();
         assert_eq!(
             total, 10,
@@ -558,9 +491,8 @@ mod tests {
 
     #[tokio::test]
     async fn swap_missing_dleq_rejects_and_yields_no_proofs() {
-        // THE BUG: mint returns blind signatures with `dleq: None`. The gate
-        // must REJECT (a redeemed-value path does NOT tolerate a missing DLEQ),
-        // producing no proofs.
+        // THE BUG: `dleq: None` signatures. A redeemed-value path does NOT
+        // tolerate a missing DLEQ, so the gate must REJECT with no proofs.
         let mint = MockMint::new(DleqMode::Missing);
         let proofs = inputs_for(&mint);
 
@@ -595,8 +527,7 @@ mod tests {
         );
     }
 
-    /// A mock that drives the ceremony's keyset GETs successfully but lets a
-    /// chosen call fail with a transport `Unreachable`, to prove the ceremony
+    /// A mock that fails a chosen call with `Unreachable`, to prove the ceremony
     /// re-tags ONLY a `post_swap` transport failure as indeterminate.
     struct TransportFailMint {
         inner: MockMint,
@@ -638,9 +569,8 @@ mod tests {
 
     #[tokio::test]
     async fn swap_post_transport_failure_is_retagged_indeterminate() {
-        // A transport `Unreachable` from the swap POST itself must surface as
-        // `UnreachableIndeterminate` — the inputs were submitted, so the
-        // outcome is unknown.
+        // post_swap `Unreachable` → `UnreachableIndeterminate`: inputs were
+        // submitted, so the outcome is unknown.
         let inner = MockMint::new(DleqMode::Valid);
         let proofs = inputs_for(&inner);
         let mint = TransportFailMint {
@@ -660,9 +590,8 @@ mod tests {
 
     #[tokio::test]
     async fn swap_pre_post_keysets_failure_stays_determinate() {
-        // A transport `Unreachable` from a PRE-POST keysets GET (no inputs
-        // submitted yet) must stay the plain determinate `Unreachable` — NOT
-        // re-tagged indeterminate.
+        // Pre-POST keysets `Unreachable` (no inputs submitted) stays plain
+        // determinate — NOT re-tagged indeterminate.
         let inner = MockMint::new(DleqMode::Valid);
         let proofs = inputs_for(&inner);
         let mint = TransportFailMint {

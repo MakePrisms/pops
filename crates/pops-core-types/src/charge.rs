@@ -1,106 +1,80 @@
 //! Cross-slice charge contract: [`ChargeError`], [`DleqLocation`], and
-//! [`RedeemedProofs`].
+//! [`RedeemedProofs`] — the single committed shape the funder slice, the verify
+//! crate, and its SDK consumer all map off.
 //!
-//! These are the verify/charge types `pops-core-types` exposes so the funder
-//! slice (`pops-core-funder`) can compile against them without itself
-//! producing them, and so the verify crate (`pops-core-verify`) and its SDK
-//! consumer can map off a single committed shape.
+//! CASHU-FREE: every field is plain data; `RedeemedProofs.fresh_proofs` is a
+//! serialized `cashuB…` token string (NOT `cashu::Proofs`), keeping this crate
+//! WASM-lean and cashu/cdk-free. The verify impl converts at its boundary.
 //!
-//! CASHU-FREE: every field is plain data (`String`/`u64`/`usize`/`bool`/
-//! `Vec<String>`/[`DleqLocation`]). `RedeemedProofs.fresh_proofs` is a
-//! serialized `cashuB…` token string and `.token_hash` is a hex digest — NOT
-//! `cashu::Proofs` — so this crate stays WASM-lean and free of any cashu/cdk
-//! dependency. The verify impl converts at its boundary.
-//!
-//! TYPE ONLY: the variant → HTTP-status → problem-type → retryability mapping
-//! documented per variant is the contract the verifier SDK maps off; the SDK
-//! owns emission. No `to_status()` / `problem_type()` / `is_retryable()` lives
-//! here — this module defines the type, not the mapping.
+//! TYPE ONLY: the per-variant status/problem-type/retryability docs ARE the
+//! contract the SDK maps off, but the SDK owns emission — no `to_status()` etc.
+//! lives here.
 
-/// Error returned by `Credential::verify_and_redeem` (pops-core-verify),
-/// defined in pops-core-types as the cross-slice contract.
+/// Error returned by `Credential::verify_and_redeem`. The per-variant docs are
+/// AUTHORITATIVE on each variant's status; this banner gives the invariant.
 ///
-/// Top-level variants encode THREE NON-COLLAPSING concerns the HTTP envelope
-/// must keep distinct (the load-bearing invariant):
-///   (A) TRANSPORT failure          -> 503, token NOT consumed, RETRYABLE same token
-///   (B) client-re-pay VERIFICATION -> 402 + fresh challenge, terminal for THIS token
-///   (C) MALFORMED request/credential -> 400 OR 402, depending on WHAT is malformed
+/// Variants encode THREE NON-COLLAPSING concerns the HTTP envelope must keep
+/// distinct:
+///   (A) TRANSPORT          -> 503, token NOT consumed, RETRYABLE same token
+///   (B) VERIFICATION       -> 402 + fresh challenge, terminal for THIS token
+///   (C) MALFORMED          -> 400 (request frame) OR 402 (credential), per variant
 ///
-/// The per-variant docs below are AUTHORITATIVE on each variant's status; this
-/// banner summarizes. Note (C) is NOT a blanket 400: only a malformed *request*
-/// frame (`MalformedRequest` — unsupported method / multi-credential) is the
-/// framework `400`; a malformed *credential* (`MalformedCredential`,
-/// `TooManyProofs`) is a `402` problem-type `malformed-credential`, because a
-/// bad credential is still a payment attempt the client should re-make with a
-/// good token (spec §Errors `malformed-credential`). This matches the envelope
-/// mapping: `MintUnreachable` -> 503, `MalformedRequest` -> 400, EVERY other
-/// variant (verification + malformed-credential) -> 402.
+/// Net envelope mapping: `MintUnreachable` -> 503, `MalformedRequest` -> 400,
+/// EVERY other variant (verification + malformed-credential) -> 402.
 ///
-/// A mint-unreachable / timeout MUST NEVER collapse into a 402: a 402 tells the
-/// client "your payment was wrong, re-pay"; a 503 tells it "we couldn't check —
-/// keep your token and retry". Collapsing them would burn a valid token on a
-/// transient backend blip. `MintUnreachable` is therefore a SEPARATE top-level
-/// variant, never folded into any 402 sub-reason.
+/// THE load-bearing invariant: a mint-unreachable / timeout MUST NEVER collapse
+/// into a 402 — a 402 says "your payment was wrong, re-pay"; a 503 says "we
+/// couldn't check, keep your token and retry". Collapsing them burns a valid
+/// token on a transient blip, so `MintUnreachable` is a SEPARATE top-level
+/// variant, never folded into a 402 sub-reason.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ChargeError {
     // ─────────────────────────────────────────────────────────────────────
     // (A) TRANSPORT — 503, retryable, token NOT consumed. ONE variant only.
     // ─────────────────────────────────────────────────────────────────────
-    /// Mint could not be reached (DNS, TCP, TLS, connect/read timeout), OR a
-    /// swap outcome could not be resolved after a 5xx/timeout per
-    /// {{durability}} (checkstate could not settle whether inputs were spent).
-    /// The token is NOT consumed; the caller MAY retry the SAME token.
+    /// Mint unreachable (DNS/TCP/TLS/timeout), OR a swap outcome unresolved after
+    /// a 5xx/timeout. The token is NOT consumed; the caller MAY retry the SAME
+    /// token.
     ///
-    /// HTTP 503 · problem-type `mint-unavailable` · **RETRYABLE** ·
-    /// SHOULD carry `Retry-After`. (spec §Errors `mint-unavailable`, §Durability)
+    /// HTTP 503 · problem-type `mint-unavailable` · RETRYABLE · SHOULD carry
+    /// `Retry-After`. (spec §Errors `mint-unavailable`, §Durability)
     ///
-    /// NOTE (deviation from the contract block): the contract names this field
-    /// `source: String`, but `thiserror` reserves the field name `source` for
-    /// the error-chain link (`std::error::Error::source()`) and requires it to
-    /// `impl Error`; a plain `String` named `source` does not compile on
-    /// `thiserror` 1.x or 2.x. The field is renamed to `transport_detail`
-    /// (matching its doc comment) to keep it a plain display string. The
-    /// rendered `Display` message is byte-identical to the contract's.
+    /// NOTE: the contract names this field `source`, but `thiserror` reserves
+    /// `source` for the error-chain link (must `impl Error`), so a plain `String`
+    /// named `source` will not compile — renamed to `transport_detail`. The
+    /// `Display` output is byte-identical to the contract's.
     #[error("mint unavailable at {mint_url}: {transport_detail}")]
     MintUnreachable {
-        /// Mint endpoint that could not be reached / resolved. Lets the
-        /// envelope log + the operator alert without parsing the message.
+        /// Mint endpoint that could not be reached, for envelope log / alert.
         mint_url: String,
-        /// Underlying transport detail (boxed so the type is cashu/reqwest-free).
+        /// Underlying transport detail (a `String` to stay cashu/reqwest-free).
         transport_detail: String,
-        /// True iff the failure is an INDETERMINATE swap outcome (5xx/timeout
-        /// AFTER the swap was sent, checkstate unresolved) vs. a pre-swap
-        /// connect failure. Both are 503+retry, but an indeterminate outcome
-        /// means the operator MUST NOT assume the token is still good without
-        /// a checkstate (spec §Durability) — surfaced so the envelope can pick
-        /// the right `Retry-After` / operator log line. Never affects status.
+        /// True iff an INDETERMINATE swap outcome (5xx/timeout AFTER submit) vs a
+        /// pre-swap connect failure. Both are 503+retry, but indeterminate means
+        /// the operator MUST NOT assume the token is still good without a
+        /// checkstate (spec §Durability). Never affects status.
         indeterminate: bool,
     },
 
-    // ─────────────────────────────────────────────────────────────────────
-    // (B) VERIFICATION — 402 + fresh re-challenge. Sub-reasons are DISTINCT
-    //     variants so the envelope picks the precise problem-type. Terminal
-    //     for THIS token (client must present a different/correct token).
-    // ─────────────────────────────────────────────────────────────────────
+    // ── (B) VERIFICATION — 402 + fresh re-challenge, terminal for THIS token.
+    //    Sub-reasons are distinct variants so the envelope picks the precise
+    //    problem-type. ──
     /// Presented value does not equal `amount + expected_swap_fee` (over- OR
-    /// under-funded; the server makes no change). Carries both sides so the
-    /// body can say exactly how far off.
+    /// under-funded; the server makes no change).
     ///
     /// HTTP 402 · problem-type `payment-insufficient` · terminal.
-    /// (spec step 12, §Fees, §Amount-and-Fee-Determinism)
+    /// (spec step 12, §Fees)
     #[error("amount mismatch: presented {presented}, required {required} (= amount {amount} + swap_fee {expected_swap_fee})")]
     AmountMismatch {
         /// `amount + expected_swap_fee` the server requires.
         required: u64,
-        /// Total value the presented token actually carried.
+        /// Total value the presented token carried.
         presented: u64,
-        /// The bare requested `amount` (net the server must receive).
+        /// The bare requested `amount` (net the server receives).
         amount: u64,
-        /// Server-recomputed swap fee over the presented proofs' keyset(s)
-        /// (0 for fee-free keysets, e.g. pop_<ts> today). `required = amount +
-        /// expected_swap_fee`. Carried so the body is self-explaining and the
-        /// holder can see the fee component. (spec §Fees)
+        /// Server-recomputed swap fee (0 for fee-free keysets, e.g. pop_<ts>);
+        /// `required = amount + expected_swap_fee`. (spec §Fees)
         expected_swap_fee: u64,
     },
 
@@ -109,145 +83,119 @@ pub enum ChargeError {
     /// HTTP 402 · problem-type `verification-failed` · terminal. (spec step 8)
     #[error("wrong unit: expected {expected}, got {got}")]
     WrongUnit {
-        /// Unit the challenge advertised (the required `currency`).
+        /// Unit the challenge advertised.
         expected: String,
-        /// Unit found on the presented token.
+        /// Unit found on the token.
         got: String,
     },
 
-    /// Token's mint is not a member of the challenge's accepted mint set.
-    /// (A reachable-but-disallowed mint is `verification-failed`, NOT a policy
-    /// 403 — spec §Errors final para.)
+    /// Token's mint is not in the challenge's accepted set. A reachable-but-
+    /// disallowed mint is `verification-failed`, NOT a policy 403 (spec §Errors).
     ///
     /// HTTP 402 · problem-type `verification-failed` · terminal. (spec step 9)
     #[error("mint not allowed: {got} not in {allowed:?}")]
     MintNotAllowed {
-        /// Mint identity the token named (URL or, preferably, NUT-01 key str).
+        /// Mint the token named (URL or NUT-01 key str).
         got: String,
-        /// The server-chosen accepted mint set.
+        /// The accepted mint set.
         allowed: Vec<String>,
     },
 
-    /// Token's proofs reference MORE THAN ONE mint or MORE THAN ONE unit.
+    /// Token's proofs reference more than one mint or unit.
     ///
     /// HTTP 402 · problem-type `verification-failed` · terminal. (spec step 3)
     #[error("token references multiple mints or units")]
     MultiMintOrUnit,
 
-    /// A proof carries a NUT-10 well-known (P2PK / HTLC) spending-condition
-    /// secret. This intent accepts plain-secret BEARER proofs only; a locked
-    /// proof is rejected BEFORE the swap.
+    /// A proof carries a NUT-10 (P2PK/HTLC) spending-condition secret. This
+    /// intent is BEARER-only; a locked proof is a verification failure (402 not
+    /// 400), rejected BEFORE the swap.
     ///
-    /// HTTP 402 · problem-type `verification-failed` · terminal.
-    /// (spec step 10, §Spending-Condition-Locked Tokens — a locked token is a
-    ///  verification failure, hence 402 not 400; see the enum-level banner.)
+    /// HTTP 402 · problem-type `verification-failed` · terminal. (spec step 10)
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
 
-    /// A present DLEQ proof (NUT-12) is INVALID — either on a presented input
-    /// proof, or (security-critical) on a blind signature the swap RETURNED.
-    /// Absence of an input-proof DLEQ is NOT this error (it must not reject);
-    /// a mint that OMITS DLEQ on swap-returned sigs IS this error.
+    /// A present DLEQ proof (NUT-12) is INVALID — on a presented input proof, or
+    /// (security-critical) on a blind signature the swap RETURNED. ABSENCE of an
+    /// input-proof DLEQ is NOT this error; a mint that OMITS output DLEQ IS.
     ///
     /// HTTP 402 · problem-type `verification-failed` · terminal.
     /// (spec steps 13-14, §DLEQ Verification)
     #[error("DLEQ verification failed ({location})")]
     DleqInvalid {
-        /// Where the bad/missing DLEQ was found — disambiguates the lenient
-        /// input case (present-but-invalid) from the strict swap-output case
-        /// (invalid OR omitted). Both map to verification-failed; carried for
-        /// the body + operator triage (a mint omitting output DLEQ is a
-        /// mint-trust signal, not a client error).
+        /// Disambiguates the lenient input case (present-but-invalid) from the
+        /// strict swap-output case (invalid OR omitted — a mint-trust signal,
+        /// not a client error).
         location: DleqLocation,
     },
 
-    /// A proof's keyset id is a short (v1, 8-byte) id that does NOT resolve, or
-    /// resolves AMBIGUOUSLY, against the mint's published keyset list.
+    /// A proof's short (v1) keyset id does NOT resolve, or resolves ambiguously,
+    /// against the mint's published keysets.
     ///
-    /// HTTP 402 · problem-type `verification-failed` · terminal.
-    /// (spec step 11, §Short Keyset Identifiers)
+    /// HTTP 402 · problem-type `verification-failed` · terminal. (spec step 11)
     #[error("unresolvable or ambiguous short keyset id: {short_id}")]
     ShortKeysetIdUnresolved {
-        /// The unresolvable short id, hex. Carried for the operator log.
+        /// The unresolvable short id, hex.
         short_id: String,
     },
 
-    /// Swap rejected because a proof was already spent (double-spend / replay
-    /// of a token already redeemed).
+    /// Swap rejected because a proof was already spent (double-spend / replay).
     ///
-    /// HTTP 402 · problem-type `verification-failed` · terminal.
-    /// (spec step 14: "already spent ... is a verification-failed condition";
-    ///  §Token Replay)
+    /// HTTP 402 · problem-type `verification-failed` · terminal. (spec step 14)
     #[error("double-spend: a proof in the token is already spent")]
     DoubleSpend,
 
-    /// Swap rejected because the token's keyset has RETIRED or its
-    /// `final_expiry` (NUT-02) has passed. THIS IS A DISTINCT outcome from
-    /// double-spend (above): the spec mandates a separate `payment-expired`.
-    /// For pop_<ts> credentials, `final_expiry` is where the CLTV time-lock
-    /// surfaces — but the verifier never computes it; the mint enforces it at
-    /// swap time.
+    /// Swap rejected because the keyset RETIRED or its `final_expiry` (NUT-02)
+    /// passed — a DISTINCT outcome from double-spend (the spec mandates a
+    /// separate `payment-expired`). For pop_<ts> this is where the CLTV
+    /// time-lock surfaces, enforced by the MINT at swap, never by the verifier.
     ///
-    /// HTTP 402 · problem-type `payment-expired` · terminal.
-    /// (spec step 14, §Keyset Rotation and Expiry)
+    /// HTTP 402 · problem-type `payment-expired` · terminal. (spec step 14)
     #[error("payment expired: keyset retired or final_expiry passed")]
     Expired,
 
-    /// The echoed `challenge.expires` auth-param is in the PAST (the sole
-    /// challenge-level expiry signal; a creqA has no expiry of its own).
-    /// Distinct from `Expired` (which is mint-side keyset/`final_expiry`):
-    /// this is the framework challenge clock, caught BEFORE any swap.
+    /// The echoed `challenge.expires` is in the PAST — the framework challenge
+    /// clock, caught BEFORE any swap. Distinct from `Expired` (mint-side keyset
+    /// /`final_expiry`).
     ///
     /// HTTP 402 · problem-type `payment-expired` · terminal. (spec step 7)
     #[error("challenge expired (echoed `expires` is in the past)")]
     ChallengeExpired,
 
-    /// The echoed `credential.challenge` is not a faithful echo of an issued
-    /// challenge: `id`-HMAC fails (stateless), or no stored challenge matches
-    /// (stored), or an echoed field / `digest` was tampered. Replay of a token
-    /// against a DIFFERENT challenge lands here (stateless: may instead surface
-    /// as `DoubleSpend` at swap).
+    /// The echoed `credential.challenge` is not a faithful echo: `id`-HMAC fails,
+    /// no stored challenge matches, or a field/`digest` was tampered. A token
+    /// replayed against a DIFFERENT challenge lands here.
     ///
     /// HTTP 402 · problem-type `invalid-challenge` · terminal.
     /// (spec steps 4-6, §Challenge Binding)
     #[error("invalid challenge: echo does not match an issued challenge")]
     InvalidChallenge,
 
-    // ─────────────────────────────────────────────────────────────────────
-    // (C) MALFORMED — the request/credential is not a well-formed payment
-    //     attempt. STATUS SPLITS per variant (see each variant's doc, which is
-    //     authoritative): a malformed *request* frame (`MalformedRequest`) is
-    //     400 framework status; a malformed *credential* (`MalformedCredential`,
-    //     `TooManyProofs`) is 402 problem-type `malformed-credential`.
-    // ─────────────────────────────────────────────────────────────────────
-    /// The credential token could not be decoded / parsed: bad base64url, the
-    /// JSON did not parse, a required field (`challenge`, `payload`,
-    /// `payload.cashu_token`) is absent or wrong-typed, `cashu_token` does not
-    /// decode as a Cashu token, OR the token is a `cashuA...` (TokenV3)
-    /// serialization (this intent is cashuB/TokenV4 only — REJECT cashuA).
+    // ── (C) MALFORMED — not a well-formed payment attempt. Status SPLITS: a
+    //    malformed *request* frame is 400, a malformed *credential* is 402
+    //    `malformed-credential` (a bad credential is still a re-makeable attempt).
+    // ──
+    /// The credential could not be decoded/parsed: bad base64url, bad JSON, a
+    /// required field absent/wrong-typed, `cashu_token` not a Cashu token, OR a
+    /// `cashuA…` (TokenV3) — this intent is cashuB/TokenV4 only, so REJECT cashuA.
     ///
-    /// HTTP 402 · problem-type `malformed-credential`. (spec §Errors
-    /// `malformed-credential` — note: the spec scopes a malformed *credential*
-    /// to 402, NOT the framework 400; see the enum-level banner for the (C)
-    /// request-vs-credential split.)
+    /// HTTP 402 · problem-type `malformed-credential` (NOT the framework 400 —
+    /// see the (C) split). (spec §Errors `malformed-credential`)
     #[error("malformed credential: {0}")]
     MalformedCredential(String),
 
-    /// The credential names an unsupported method, or the request bore more
-    /// than one `Authorization: Payment` credential. This is the framework's
-    /// `method-unsupported` / multi-credential case.
+    /// The credential names an unsupported method, or the request bore more than
+    /// one `Authorization: Payment` credential.
     ///
-    /// HTTP 400 · framework status (NOT a 402 problem-type).
-    /// (spec §Errors para 2; base httpauth-payment)
+    /// HTTP 400 · framework status (NOT a 402 problem-type). (spec §Errors para 2)
     #[error("unsupported method or malformed request: {0}")]
     MalformedRequest(String),
 
-    /// Token carries MORE proofs than the server's configured maximum (DoS
-    /// guard). SHOULD be rejected before the swap.
+    /// Token carries more proofs than the configured maximum (DoS guard). SHOULD
+    /// be rejected before the swap.
     ///
-    /// HTTP 402 · problem-type `malformed-credential` (over-large token is a
-    /// malformed credential per spec §DoS framing) · terminal.
-    /// (spec step 2, §Denial of Service)
+    /// HTTP 402 · problem-type `malformed-credential` · terminal. (spec step 2,
+    /// §Denial of Service)
     #[error("too many proofs: {got} exceeds max {max}")]
     TooManyProofs {
         /// Proof count the token carried.
@@ -278,42 +226,32 @@ impl std::fmt::Display for DleqLocation {
     }
 }
 
-/// The value the operator now holds after a successful verify+redeem, plus
-/// exactly what the SDK needs to emit a Payment-Receipt. Defined in
-/// pops-core-types; returned inside `Redeemed` by `verify_and_redeem`.
+/// The value the operator holds after a successful verify+redeem, plus what the
+/// SDK needs to emit a Payment-Receipt.
 ///
-/// SECURITY: this struct MUST NOT be logged whole and MUST NOT be placed in a
-/// shared receipt — `fresh_proofs` are spendable bearer secrets. The receipt
-/// uses `token_hash` (a SHA-256 of the PRESENTED token), never the proofs and
-/// never the presented token string. (spec §Receipt `reference`, §Privacy)
+/// SECURITY: MUST NOT be logged whole or placed in a shared receipt —
+/// `fresh_proofs` are spendable bearer secrets. The receipt uses `token_hash`
+/// (a SHA-256 of the presented token), never the proofs or the token string.
+/// (spec §Receipt `reference`, §Privacy)
 #[derive(Debug, Clone)]
 pub struct RedeemedProofs {
-    // ── (a) confirm value received ──────────────────────────────────────
-    /// The fresh proofs the operator now controls, blinded against the unit's
-    /// ACTIVE keyset by the swap. Serialized as the canonical cashu token
-    /// string (`cashuB…`) so pops-core-types carries NO `cashu::Proofs` in its
-    /// public API (keeps it WASM-lean + funder-slice-independent). The verify
-    /// crate produces it from the swap response; the operator/wallet re-parses
-    /// to spend. (cashu Proofs ⇄ token string is the de/serialization seam.)
+    /// Fresh proofs the operator now controls, blinded against the unit's ACTIVE
+    /// keyset. A serialized `cashuB…` string (NOT `cashu::Proofs`, to keep this
+    /// crate WASM-lean); the operator/wallet re-parses to spend.
     pub fresh_proofs: String,
-    /// Net value the operator received = the requested `amount` exactly (the
-    /// mint deducted `swap_fee` from the inputs; outputs sum to `amount`).
-    /// The caller asserts `amount == challenge.amount` to confirm settlement.
+    /// Net value received = the requested `amount` exactly (the mint deducted
+    /// the swap fee). The caller asserts `amount == challenge.amount` to confirm
+    /// settlement.
     pub amount: u64,
     /// Unit of the redeemed value (echoes the challenge `currency`).
     pub unit: String,
     /// Keyset id (hex) the FRESH proofs are signed under — the mint's ACTIVE
-    /// keyset for the unit, which MAY differ from the input proofs' keyset
-    /// (spec §Settlement). Carried so the operator can spend without re-fetching
-    /// keysets, and for audit.
+    /// keyset, which MAY differ from the input proofs' keyset. For spending
+    /// without re-fetching keysets, and for audit. (spec §Settlement)
     pub active_keyset_id: String,
-
-    // ── (b) emit a Payment-Receipt (spec §Receipt) ──────────────────────
-    /// SHA-256, lowercase hex, of the EXACT `cashu_token` credential string as
-    /// received from the client (NOT a re-encoding). This is the receipt
-    /// `reference` — a stable, shareable settlement id that exposes no secret.
-    /// Computed in core (it needs the presented bytes) so the SDK never has to
-    /// re-hold the raw token. (spec §Receipt `reference`)
+    /// SHA-256 (lowercase hex) of the EXACT presented `cashu_token` (NOT a
+    /// re-encoding) — the receipt `reference`: a stable, shareable settlement id
+    /// that exposes no secret. (spec §Receipt `reference`)
     pub token_hash: String,
 }
 
@@ -357,7 +295,6 @@ mod tests {
             indeterminate: true,
         };
         assert_eq!(err.to_string(), "mint unavailable at https://m: timeout");
-        // Field access confirms the struct shape (indeterminate is plain bool).
         if let ChargeError::MintUnreachable { indeterminate, .. } = err {
             assert!(indeterminate);
         } else {

@@ -97,25 +97,18 @@ pub struct Deposit {
 }
 
 impl Deposit {
-    /// Whether this deposit holds **locked BTC**: funding was actually sent (so
-    /// sats sit in the CLTV address) and it has not yet been recovered.
-    ///
-    /// The single source of truth shared by `balance` (its `total_locked_sats`
-    /// and `recoverable_now` candidate set) and `status` (its recoverability
-    /// overlay), so the two can never drift.
-    ///
-    /// Funding-gated, NOT state-gated: `Paid`/`Minted` always carry funding (the
-    /// mint credited them), but `Expired` only holds BTC if funding was sent —
-    /// an `Expired` quote that was never funded holds nothing. `Unpaid` was never
-    /// funded; `Recovered` was swept back out.
+    /// Whether this deposit holds LOCKED BTC: funding was sent and it isn't yet
+    /// recovered. The single source of truth shared by `balance` and `status`, so
+    /// they can't drift. FUNDING-gated, not state-gated: `Paid`/`Minted` always
+    /// carry funding, but `Expired` only holds BTC if funding was sent; `Unpaid`/
+    /// `Recovered` never.
     pub fn is_locked(&self) -> bool {
         matches!(self.state, DepositState::Paid | DepositState::Minted)
             || (self.state == DepositState::Expired && self.funding_txid.is_some())
     }
 
-    /// Whether this deposit can be swept **right now** at the given chain-tip
-    /// median-time-past: it holds locked BTC ([`Self::is_locked`]) AND its CLTV
-    /// has matured (`mtp >= ts_expiry`, BIP-113 — the same gate `recover` enforces).
+    /// Whether this deposit can be swept NOW at chain-tip `mtp`: locked
+    /// ([`Self::is_locked`]) AND matured (`mtp >= ts_expiry`, BIP-113).
     pub fn is_recoverable_now(&self, mtp: u64) -> bool {
         self.is_locked() && mtp >= self.ts_expiry
     }
@@ -140,8 +133,8 @@ impl Db {
     pub fn open(wallet_dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let conn = Connection::open(Self::path_in(wallet_dir))
             .map_err(|e| format!("failed to open wallet.db: {e}"))?;
-        // Durability: WAL + synchronous NORMAL is the standard safe combo, and
-        // foreign-key + busy-timeout make concurrent invocations well-behaved.
+        // WAL + synchronous NORMAL = the standard durable combo; busy-timeout
+        // makes concurrent invocations well-behaved.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| format!("failed to set WAL: {e}"))?;
         conn.pragma_update(None, "synchronous", "NORMAL")
@@ -292,7 +285,7 @@ impl Db {
         Ok(())
     }
 
-    /// Records the funding outpoint (and moves to Paid is left to the caller).
+    /// Records the funding outpoint (the state transition is the caller's job).
     pub fn set_funding_outpoint(
         &self,
         id: &str,
@@ -397,7 +390,6 @@ fn row_to_deposit(
     let funding_vout: Option<i64> = row.get(17)?;
     let created_at: i64 = row.get(19)?;
 
-    // Build the deposit; any state-parse error is carried out as the inner Err.
     let build = || -> Result<Deposit, Box<dyn std::error::Error>> {
         Ok(Deposit {
             id: row.get(0)?,
@@ -511,20 +503,17 @@ mod tests {
         assert!(db.get_deposit("nope").unwrap().is_none());
     }
 
-    /// `is_locked` is funding-gated, not state-gated: Paid/Minted always hold
-    /// BTC, Expired only if funding was sent, Unpaid/Recovered never. This is the
-    /// shared definition `balance` and `status` both consume.
+    /// `is_locked` is funding-gated: Paid/Minted always hold BTC, Expired only if
+    /// funded, Unpaid/Recovered never (the shared `balance`/`status` definition).
     #[test]
     fn is_locked_is_funding_gated() {
         let mut d = sample("x", 0);
 
-        // Paid / Minted: locked regardless of the funding_txid field.
         d.state = DepositState::Paid;
         assert!(d.is_locked(), "paid holds locked BTC");
         d.state = DepositState::Minted;
         assert!(d.is_locked(), "minted holds locked BTC");
 
-        // Unpaid / Recovered: never locked.
         d.state = DepositState::Unpaid;
         assert!(!d.is_locked(), "unpaid was never funded");
         d.state = DepositState::Recovered;
@@ -538,9 +527,8 @@ mod tests {
         assert!(d.is_locked(), "funded-expired still holds locked BTC");
     }
 
-    /// `is_recoverable_now` = locked AND matured (mtp >= ts_expiry), inclusive at
-    /// the boundary — and an unfunded-expired deposit is never recoverable even
-    /// once its CLTV has passed.
+    /// `is_recoverable_now` = locked AND matured (inclusive boundary); an
+    /// unfunded-expired deposit never recovers.
     #[test]
     fn is_recoverable_now_gates_on_lock_and_maturity() {
         let mut d = sample("y", 0); // ts_expiry = 1_782_259_200

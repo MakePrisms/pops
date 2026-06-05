@@ -1,19 +1,12 @@
-//! Esplora chain I/O — UTXO lookup, tip MTP (for CLTV maturity), and
-//! broadcast.
+//! Esplora chain I/O — UTXO lookup, tip MTP (CLTV maturity gates on
+//! median-time-past per BIP-113), fee estimates, and broadcast.
 //!
-//! Uses raw reqwest against the Esplora REST API, mirroring `pop_test_tool`'s
-//! proven calls (`/tx/<txid>`, `/tx`) so the wire behavior is identical. Adds
-//! address-history lookup (to discover the funding outpoint after funding) and
-//! tip-MTP fetch (recovery maturity gates on median-time-past, not wall-clock,
-//! per BIP-113).
-//!
-//! Error split: a transport failure reaching esplora on a **GET/read**
-//! (tip-MTP, UTXO lookup, fee estimate) surfaces as the typed, transient
+//! Error split: a transport failure on a GET/read → the transient
 //! [`PopError::ChainUnreachable`] (the chain-read mirror of
-//! [`PopError::MintUnreachable`]); the **POST/broadcast** path is
-//! [`PopError::BroadcastFailed`] instead. A non-network esplora error (non-2xx
-//! status, malformed body) is NOT "unreachable" — it stays a plain boxed error
-//! that resolves to `internal_error`.
+//! [`PopError::MintUnreachable`]); the POST/broadcast path →
+//! [`PopError::BroadcastFailed`]. A non-network esplora error (non-2xx,
+//! malformed body) is NOT "unreachable" — it stays a plain boxed
+//! `internal_error`.
 
 use bitcoin::ScriptBuf;
 
@@ -54,11 +47,8 @@ pub struct UtxoStatus {
     pub confirmed: bool,
 }
 
-/// Esplora `/blocks/tip/height` returns a bare integer; `/block/<hash>` and
-/// `/blocks/tip/hash` give us the path to MTP. We instead use
-/// `/blocks/tip/height` then `/block-height/<h>` then `/block/<hash>` to get
-/// `mediantime`. To keep it simple and robust we read the latest block summary
-/// from `/blocks` (array of recent blocks) whose first element is the tip.
+/// A recent-block summary from `/blocks` (tip first); carries `mediantime` for
+/// the MTP-based CLTV gate.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct BlockSummary {
     mediantime: u64,
@@ -88,14 +78,10 @@ impl Esplora {
         }
     }
 
-    /// Maps a `reqwest` transport failure on a GET/read to the typed, transient
-    /// [`PopError::ChainUnreachable`] (the chain-read mirror of
-    /// [`PopError::MintUnreachable`]). `esplora_url` in `details` is the
-    /// configured base; `operation` is the read that failed (`"tip_mtp"`,
-    /// `"utxo_fetch"`, `"fee_estimate"`). The raw error goes to stderr so the
-    /// human sees the cause while stdout stays the pure envelope. (Non-network
-    /// failures — non-2xx, malformed bodies — are NOT routed here; they stay
-    /// `internal_error`.)
+    /// Maps a GET/read transport failure to the transient
+    /// [`PopError::ChainUnreachable`] (`operation` ∈ `tip_mtp`/`utxo_fetch`/
+    /// `fee_estimate`). The raw error goes to stderr (stdout stays pure
+    /// envelope). Non-network failures are NOT routed here.
     fn unreachable(
         &self,
         operation: &str,
@@ -114,9 +100,8 @@ impl Esplora {
     ///
     /// # Errors
     ///
-    /// A transport failure reaching esplora is [`PopError::ChainUnreachable`]
-    /// (transient, `operation = "utxo_fetch"`). A non-2xx or a parse failure is a
-    /// plain boxed error (→ `internal_error`).
+    /// Transport failure → [`PopError::ChainUnreachable`] (`utxo_fetch`); a
+    /// non-2xx / parse failure → `internal_error` (see the module split).
     pub async fn tx_vouts(&self, txid: &str) -> Result<Vec<Vout>, Box<dyn std::error::Error>> {
         let url = format!("{}/tx/{txid}", self.base);
         let resp = self
@@ -159,9 +144,8 @@ impl Esplora {
     ///
     /// # Errors
     ///
-    /// A transport failure reaching esplora is [`PopError::ChainUnreachable`]
-    /// (transient, `operation = "utxo_fetch"`). A non-2xx or a parse failure is a
-    /// plain boxed error (→ `internal_error`).
+    /// Transport failure → [`PopError::ChainUnreachable`] (`utxo_fetch`); a
+    /// non-2xx / parse failure → `internal_error` (see the module split).
     pub async fn address_utxos(
         &self,
         address: &str,
@@ -183,16 +167,13 @@ impl Esplora {
         Ok(parsed)
     }
 
-    /// Returns the chain tip's `(median_time_past, height)`.
-    ///
-    /// CLTV maturity is evaluated against MTP per BIP-113. `/blocks` returns
-    /// the most recent blocks (tip first), each carrying `mediantime`.
+    /// The chain tip's `(median_time_past, height)`. `/blocks` returns recent
+    /// blocks (tip first), each carrying `mediantime`.
     ///
     /// # Errors
     ///
-    /// A transport failure reaching esplora is [`PopError::ChainUnreachable`]
-    /// (transient, `operation = "tip_mtp"`). A non-2xx, parse failure, or empty
-    /// `/blocks` response is a plain boxed error (→ `internal_error`).
+    /// Transport failure → [`PopError::ChainUnreachable`] (`tip_mtp`); a non-2xx /
+    /// parse failure / empty `/blocks` → `internal_error`.
     pub async fn tip_mtp_and_height(&self) -> Result<(u64, u64), Box<dyn std::error::Error>> {
         let url = format!("{}/blocks", self.base);
         let resp = self
@@ -214,20 +195,15 @@ impl Esplora {
         Ok((tip.mediantime, tip.height))
     }
 
-    /// Fetches the mempool fee estimates from `/fee-estimates`.
-    ///
-    /// Esplora returns a JSON object mapping a confirmation target (in blocks,
-    /// as a string key) to the estimated feerate in sat/vB, e.g.
-    /// `{"1":12.3,"6":4.1,"144":1.0}`. We parse it into a `target -> sat/vB`
-    /// map; use [`pick_feerate`] to select a target.
+    /// Fetches `/fee-estimates` (a `{ target-blocks-string: sat/vB }` object,
+    /// e.g. `{"1":12.3,"6":4.1}`) into a `target -> sat/vB` map; select via
+    /// [`pick_feerate`].
     ///
     /// # Errors
     ///
-    /// A transport failure reaching esplora is [`PopError::ChainUnreachable`]
-    /// (transient, `operation = "fee_estimate"`). A non-2xx or a parse failure is
-    /// a plain boxed error (→ `internal_error`). NOTE: `recover` treats ANY
-    /// fee-estimate failure as non-fatal (it warns + falls back to a conservative
-    /// feerate), so this typed error is informational there rather than aborting.
+    /// Transport failure → [`PopError::ChainUnreachable`] (`fee_estimate`); a
+    /// non-2xx / parse failure → `internal_error`. NOTE: `recover` treats ANY
+    /// fee-estimate failure as non-fatal (warns + uses a fallback feerate).
     pub async fn fee_estimates(&self) -> Result<FeeEstimates, Box<dyn std::error::Error>> {
         let url = format!("{}/fee-estimates", self.base);
         let resp = self
@@ -241,7 +217,6 @@ impl Esplora {
         if !status.is_success() {
             return Err(format!("esplora GET {url} returned {status}: {text}").into());
         }
-        // Keys are block-target strings, values are sat/vB floats.
         let raw: std::collections::HashMap<String, f64> = serde_json::from_str(&text)
             .map_err(|e| format!("esplora /fee-estimates parse failed: {e}\nbody: {text}"))?;
         let mut by_target = std::collections::BTreeMap::new();
@@ -256,15 +231,13 @@ impl Esplora {
         Ok(FeeEstimates { by_target })
     }
 
-    /// Broadcasts a raw transaction (hex). Returns the server response body
-    /// (the txid on success).
+    /// Broadcasts a raw transaction (hex); returns the body (txid on success).
     ///
     /// # Errors
     ///
-    /// [`PopError::BroadcastFailed`] (transient) on a network failure reaching
-    /// esplora or a non-2xx rejection (the node's message is the reject reason).
-    /// The recovery spend is RBF-enabled and the funds stay safe in the UTXO, so
-    /// a rejected broadcast is retriable.
+    /// [`PopError::BroadcastFailed`] on a network failure or non-2xx rejection.
+    /// Retriable: the recovery spend is RBF-enabled and the funds stay safe in
+    /// the UTXO.
     pub async fn broadcast(&self, tx_hex: &str) -> Result<String, Box<dyn std::error::Error>> {
         let url = format!("{}/tx", self.base);
         let resp = self
@@ -301,23 +274,18 @@ pub struct FeeEstimates {
 }
 
 impl FeeEstimates {
-    /// Picks the feerate (sat/vB) for `target` confirmation blocks.
-    ///
-    /// Esplora keys are sparse (commonly 1,2,3,4,5,6,...,144,504,1008). If the
-    /// exact `target` is absent we fall to the nearest available *higher*
-    /// target (a more-confident / higher feerate, never a slower one). If
-    /// `target` is larger than every key (i.e. the user asked for a very slow
-    /// confirmation the server doesn't quote), we use the largest available
-    /// target (the slowest/cheapest quote on offer). The result is floored at
-    /// the min-relay feerate so we never emit a sub-relay tx.
+    /// Picks the feerate (sat/vB) for `target` confirmation blocks. Esplora keys
+    /// are sparse, so an absent `target` falls to the nearest HIGHER key (never a
+    /// slower one); a `target` above every key uses the largest (slowest) key.
+    /// Floored at min-relay so we never emit a sub-relay tx.
     pub fn pick_feerate(&self, target: u32) -> f64 {
-        // First key whose target is >= the requested target (nearest higher).
+        // First key >= target (nearest higher).
         let chosen = self
             .by_target
             .range(target..)
             .next()
             .map(|(_, v)| *v)
-            // None means target exceeds all keys: take the largest (slowest) key.
+            // None ⇒ target exceeds all keys: take the largest (slowest).
             .or_else(|| self.by_target.values().next_back().copied())
             .unwrap_or(MIN_RELAY_FEERATE_SAT_PER_VB);
         chosen.max(MIN_RELAY_FEERATE_SAT_PER_VB)
