@@ -1,8 +1,7 @@
 //! The FROZEN output & error contract — typed errors + the JSON envelope.
 //!
-//! Every `pop` invocation emits **exactly one** top-level JSON object to stdout
-//! (json is the default mode; `--human` switches to text). On failure the
-//! object is the error envelope:
+//! Every `pop` invocation emits exactly one top-level JSON object to stdout. On
+//! failure it is the error envelope:
 //!
 //! ```json
 //! { "schema_version": 1,
@@ -10,42 +9,35 @@
 //!              "message": "<human>", "details": { ... }? } }
 //! ```
 //!
-//! `code` is a **closed, documented, additive-only** enum (see the variants of
-//! [`PopError`]). `retriable` is true iff the failure is transient (safe to
-//! retry as-is). `message` is HUMAN help only — agents MUST parse `code` +
-//! `details`, never the prose. `details` is REQUIRED-populated for the codes the
-//! contract marks (each carrying variant captures the data locally at error
-//! time).
+//! Agents MUST parse `code` + `details`, never the prose `message`. `code` is a
+//! closed, additive-only enum (see [`PopError`]); `retriable` is true iff the
+//! failure is transient (safe to retry as-is).
 //!
-//! The wallet's internal modules still propagate `Box<dyn std::error::Error>`
-//! for plumbing. A site that wants a precise contract code constructs the
-//! matching [`PopError`] variant and returns it (it boxes transparently because
-//! [`PopError`] is an `std::error::Error`). At the top level, [`crate::run`]
-//! downcasts the boxed error back to a [`PopError`]; anything that isn't one of
-//! ours becomes [`PopError::Internal`] (`internal_error`) — an unmapped,
-//! unexpected failure.
+//! Internal modules propagate `Box<dyn Error>`; a site wanting a precise code
+//! returns the matching [`PopError`] (it boxes transparently). At the top,
+//! [`crate::run`] downcasts back — anything not ours becomes
+//! [`PopError::Internal`].
 
 use serde_json::{json, Value};
 
-/// The frozen top-level schema version stamped on EVERY json output (success
-/// and failure).
+/// The frozen schema version stamped on EVERY json output (success and failure).
 pub const SCHEMA_VERSION: u64 = 1;
 
 /// A typed `pop` error mapping 1:1 to a contract `code`. Each variant carries
-/// exactly the `details` data the contract requires (locally available at error
-/// time), so an agent repairs its call from structured fields, never prose.
+/// exactly the `details` the contract requires, so an agent repairs its call
+/// from structured fields, never prose.
 ///
-/// The enum is **closed and additive-only**: never remove or rename a variant
-/// or its `code` string; a new failure mode gets a new variant; a breaking
-/// change bumps [`SCHEMA_VERSION`].
+/// CLOSED and additive-only: never remove or rename a variant or its `code`
+/// string; a new failure mode gets a new variant; a breaking change bumps
+/// [`SCHEMA_VERSION`].
 #[derive(Debug)]
 pub enum PopError {
     // ---- needs_input (false) ----
     /// Spend exceeds available balance. (`insufficient_funds`)
     InsufficientFunds {
-        /// Sats the operation needed.
+        /// Sats needed.
         required_sats: u64,
-        /// Sats actually available.
+        /// Sats available.
         available_sats: u64,
     },
     /// A deposit id was not found in the local ledger. (`deposit_not_found`)
@@ -53,29 +45,27 @@ pub enum PopError {
         /// The id that wasn't found.
         deposit_id: String,
     },
-    /// `--dest` (or another address) is for a different network than the wallet.
-    /// (`network_mismatch`)
+    /// An address is for a different network than the wallet. (`network_mismatch`)
     NetworkMismatch {
         /// Network the wallet is pinned to.
         expected: String,
-        /// Network the supplied value was for.
+        /// Network the value was for.
         got: String,
     },
-    /// The mint credited a different amount than was quoted (PoP is exact-amount;
-    /// the on-chain funds are safe in the CLTV address — recover them).
-    /// (`amount_mismatch`)
+    /// The mint credited a different amount than quoted. PoP is exact-amount; the
+    /// on-chain funds are safe in the CLTV address — recover them. (`amount_mismatch`)
     AmountMismatch {
         /// Sats the quote expected.
         expected_sats: u64,
         /// Sats the mint saw funded.
         funded_sats: u64,
     },
-    /// The funding quote's window closed before funding credited; stop polling
-    /// and re-quote. (`quote_expired`)
+    /// The funding quote's window closed before funding credited; re-quote.
+    /// (`quote_expired`)
     QuoteExpired {
         /// The expired quote id.
         quote_id: String,
-        /// Unix seconds the quote expired at.
+        /// Unix seconds it expired at.
         expired_at: u64,
     },
     /// A recovery UTXO is uneconomical to sweep (value <= fee). (`value_below_fee`)
@@ -85,26 +75,25 @@ pub enum PopError {
         /// Computed fee, sats.
         fee_sats: u64,
     },
-    /// A wallet is required but none is initialized at the wallet dir.
-    /// (`wallet_not_initialized`)
+    /// A wallet is required but none is initialized. (`wallet_not_initialized`)
     WalletNotInitialized {
-        /// Human help (message-only code).
+        /// Human help.
         message: String,
     },
     /// `init` refused because a wallet already exists. (`wallet_exists`)
     WalletExists {
-        /// Human help (message-only code).
+        /// Human help.
         message: String,
     },
-    /// An imported BIP-39 mnemonic failed validation. NEVER echoes the mnemonic.
-    /// (`invalid_mnemonic`)
+    /// An imported BIP-39 mnemonic failed validation. The `message` must NEVER
+    /// echo the phrase. (`invalid_mnemonic`)
     InvalidMnemonic {
-        /// Human help (message-only; must not contain the phrase).
+        /// Human help (must not contain the phrase).
         message: String,
     },
     /// Generic input/validation failure. (`invalid_input`)
     InvalidInput {
-        /// Human help (message-only code).
+        /// Human help.
         message: String,
     },
 
@@ -114,35 +103,32 @@ pub enum PopError {
         /// The mint base URL.
         mint_url: String,
     },
-    /// An esplora **GET/read** (tip-MTP, UTXO lookup, fee estimate) failed at the
-    /// transport layer — the chain backend was unreachable (network error).
-    /// MIRRORS [`PopError::MintUnreachable`] for the chain side. DISTINCT from
-    /// [`PopError::BroadcastFailed`], which is the esplora **POST/broadcast** path;
-    /// a non-network esplora error (e.g. a garbage response body) stays
-    /// `internal_error`, not this. (`chain_unreachable`)
+    /// An esplora GET/read (tip-MTP, UTXO lookup, fee estimate) failed at the
+    /// transport layer. Mirrors [`PopError::MintUnreachable`] for the chain side;
+    /// DISTINCT from [`PopError::BroadcastFailed`] (the POST path). A non-network
+    /// esplora error stays `internal_error`. (`chain_unreachable`)
     ChainUnreachable {
-        /// The esplora base URL that was unreachable.
+        /// The esplora base URL.
         esplora_url: String,
-        /// Which read failed: `"tip_mtp"`, `"utxo_fetch"`, or `"fee_estimate"`.
+        /// `"tip_mtp"`, `"utxo_fetch"`, or `"fee_estimate"`.
         operation: Option<String>,
     },
     /// Funding has not yet credited; keep polling. (`funding_pending`)
     FundingPending {
         /// The funding address.
         address: String,
-        /// Unix seconds the quote/funding window expires at.
+        /// Unix seconds the window expires at.
         expires_at: u64,
-        /// Confirmations seen so far, if known.
+        /// Confirmations seen, if known.
         confs_seen: Option<u64>,
         /// Confirmations required, if known.
         confs_required: Option<u64>,
-        /// On a NON-mainnet network, a machine-readable on-ramp hint for where to
-        /// get test coins (signet/testnet faucet URL, or a regtest note).
+        /// On NON-mainnet, where to get test coins (faucet URL / regtest note).
         /// `None` on mainnet (real BTC has no faucet).
         faucet_hint: Option<String>,
     },
-    /// The deposit's CLTV has not matured (MTP < ts_expiry); wait, then retry the
-    /// same call. (`cltv_not_expired`)
+    /// The deposit's CLTV has not matured (MTP < ts_expiry); wait, then retry.
+    /// (`cltv_not_expired`)
     CltvNotExpired {
         /// Unix seconds the deposit matures at (its `ts_expiry`).
         matures_at: u64,
@@ -154,44 +140,44 @@ pub enum PopError {
     BroadcastFailed {
         /// The node's reject reason, if any.
         reject_reason: Option<String>,
-        /// The tx id we tried to broadcast, if known.
+        /// The tx id, if known.
         txid: Option<String>,
     },
 
     // ---- terminal (false) ----
-    /// The mint returned an application-level error (non-2xx with a message).
-    /// (`mint_error`)
+    /// The mint returned an application-level error (non-2xx). (`mint_error`)
     MintError {
-        /// HTTP status code, if from an HTTP response.
+        /// HTTP status, if from a response.
         status: Option<u16>,
-        /// The mint's error message / response body.
+        /// The mint's error message / body.
         mint_message: String,
     },
     /// The independently reconstructed funding address did not match the mint's
-    /// quote address — a security stop, do NOT fund. (`address_mismatch`)
+    /// quote address — a security stop, do NOT fund (the mint may be returning an
+    /// address it can itself spend). (`address_mismatch`)
     AddressMismatch {
-        /// The address we independently reconstructed (expected).
+        /// The address we reconstructed.
         expected: String,
-        /// The address the mint returned (got).
+        /// The address the mint returned.
         got: String,
     },
     /// An unexpected / unmapped internal failure. (`internal_error`)
     Internal {
-        /// Human help (message-only code).
+        /// Human help.
         message: String,
     },
 
-    // ---- pay path (phase-2; defined now, used by `pay`) ----
+    // ---- pay path ----
     /// A URL the funder tried to pay did not answer with HTTP 402. (`not_402`)
     Not402 {
-        /// The URL that was probed.
+        /// The URL probed.
         url: String,
-        /// The status actually returned.
+        /// The status returned.
         status_got: u16,
     },
     /// A 402-gated payment was rejected by the service. (`payment_rejected`)
     PaymentRejected {
-        /// The amount the 402 required, if it told us.
+        /// The amount the 402 required, if told.
         required_amount: Option<u64>,
         /// The unit the 402 named.
         unit: Option<String>,
@@ -200,24 +186,23 @@ pub enum PopError {
     },
 
     // ---- pay path (the `pop pay` HTTP-402 client dance) ----
-    /// The resource returned HTTP 402 but carried no parseable
-    /// `WWW-Authenticate: Payment …` challenge (or its params were malformed),
-    /// so there is nothing to satisfy. (`no_payment_challenge`)
+    /// HTTP 402 with no parseable `WWW-Authenticate: Payment …` challenge, so
+    /// there is nothing to satisfy. (`no_payment_challenge`)
     NoPaymentChallenge {
-        /// The URL that was probed.
+        /// The URL probed.
         url: String,
-        /// Why the challenge could not be parsed (header absent / malformed).
+        /// Why the challenge could not be parsed.
         reason: String,
     },
     /// A 402 `Payment` challenge was present but could not be decoded into a
-    /// concrete charge (bad request envelope or `creqA` payment request, or a
-    /// charge missing its required amount). (`challenge_parse_failed`)
+    /// concrete charge (bad envelope / `creqA`, or missing amount).
+    /// (`challenge_parse_failed`)
     ChallengeParseFailed {
-        /// What specifically failed to decode.
+        /// What failed to decode.
         reason: String,
     },
-    /// The held token's unit does not match the unit the charge requires; paying
-    /// it would be wrong-currency. Send nothing. (`token_unit_mismatch`)
+    /// The held token's unit differs from the charge's; paying would be
+    /// wrong-currency. Send nothing. (`token_unit_mismatch`)
     TokenUnitMismatch {
         /// The unit the charge requires.
         required: String,
@@ -227,10 +212,10 @@ pub enum PopError {
     /// The held token is from a mint the charge does not accept. Send nothing.
     /// (`token_mint_mismatch`)
     TokenMintMismatch {
-        /// The mint URL the held token is from.
+        /// The mint the held token is from.
         token_mint: String,
-        /// The set of mint URLs the charge accepts (empty ⟹ the charge named no
-        /// mints, which this wallet treats as "must be explicit" and rejects).
+        /// Empty ⟹ the charge named no mints, which this wallet treats as
+        /// "must be explicit" and rejects.
         accepted_mints: Vec<String>,
     },
     /// The held token is worth less than the charge requires. Send nothing.
@@ -241,80 +226,68 @@ pub enum PopError {
         /// Sats the charge requires.
         need: u64,
     },
-    /// The charge's amount exceeds the caller's `--max-amount` safety cap; refuse
-    /// so a malicious 402 cannot trick an agent into overspending. Send nothing.
+    /// The charge exceeds the caller's `--max-amount` cap; refuse so a malicious
+    /// 402 cannot trick an agent into overspending. Send nothing.
     /// (`amount_exceeds_cap`)
     AmountExceedsCap {
         /// Sats the charge required.
         amount: u64,
-        /// The `--max-amount` cap, in sats.
+        /// The `--max-amount` cap, sats.
         cap: u64,
     },
-    /// The NUT-03 swap-to-exact failed (mint rejected it, or the unblind/DLEQ
-    /// check failed). The held token may be partially spent — surface the change
-    /// if any was produced. (`swap_failed`)
+    /// The NUT-03 swap-to-exact failed (mint rejected it, or unblind/DLEQ failed).
+    /// The held token may be partially spent — surface any change. (`swap_failed`)
     SwapFailed {
         /// The swap failure detail.
         reason: String,
     },
-    /// INTERNAL money-safety gate: the constructed send set did not sum to
-    /// EXACTLY the charge amount. This must never fire in practice — it means a
-    /// split/selection bug, and the payment is aborted before anything is sent.
-    /// (`exact_amount_assertion_failed`)
+    /// INTERNAL money-safety gate: the send set did not sum to EXACTLY the charge.
+    /// Must never fire (it means a split/selection bug); the payment is aborted
+    /// before anything is sent. (`exact_amount_assertion_failed`)
     ExactAmountAssertionFailed {
-        /// The amount the send set was required to equal.
+        /// The amount the send set had to equal.
         required: u64,
-        /// What the send set actually summed to.
+        /// What it actually summed to.
         got: u64,
     },
-    /// The gateway rejected the presented payment on retry (it answered non-2xx).
-    /// The gateway did NOT redeem, so BOTH the send set (the bigger half — the
-    /// `amount`) AND any change set are unspent, spendable ecash. Carries BOTH so
-    /// no value is silently lost. (`gateway_rejected_payment`)
+    /// The gateway rejected the presented payment on retry. It did NOT redeem, so
+    /// BOTH the send set (worth `amount`) AND any change are unspent ecash —
+    /// carried so no value is silently lost. (`gateway_rejected_payment`)
     GatewayRejectedPayment {
-        /// The HTTP status the retry returned (typically 402).
+        /// HTTP status the retry returned (typically 402).
         status: u16,
-        /// The gateway's response body verbatim (intelligible rejection reason).
+        /// The gateway's response body verbatim.
         body: String,
-        /// The send `cashuB` token — worth EXACTLY the charge. The gateway did
-        /// not redeem it, so it is unspent, valid ecash and MUST be recovered
-        /// (it is the bigger half of the value to save).
+        /// Worth EXACTLY the charge; unredeemed, so valid ecash that MUST be
+        /// recovered (the bigger half of the value).
         send_token: String,
-        /// The change `cashuB` token, if a swap produced one before the retry —
-        /// it is spendable and must not be lost.
+        /// Change token, if a swap produced one — also unspent.
         change_token: Option<String>,
     },
-    /// A freshly-minted proof set from the swap could not be encoded into its
-    /// `cashuB` token string (CBOR/Display serialization failed). The swap had
-    /// ALREADY spent the held input proofs, so the value survives ONLY as these
-    /// raw proofs — they are surfaced as JSON (the wire `Proof` shape:
-    /// `{amount, id, secret, C, ...}`) so the ecash is still recoverable by
-    /// re-encoding them. Must never happen in practice (proof CBOR does not fail);
-    /// it would indicate a serialization bug. (`token_encode_failed`)
+    /// A freshly-minted proof set could not be encoded to its `cashuB` string.
+    /// The swap had ALREADY spent the held inputs, so the value survives ONLY as
+    /// these raw proofs, surfaced as JSON (wire `Proof` shape) for re-encoding.
+    /// Must never happen (proof CBOR does not fail). (`token_encode_failed`)
     TokenEncodeFailed {
-        /// What failed to encode (which bucket + the underlying reason).
+        /// What failed to encode (bucket + reason).
         reason: String,
-        /// The send proofs as a JSON array (worth EXACTLY the charge), or `None`
-        /// if the send token DID encode and only the change failed.
+        /// Worth EXACTLY the charge, or `None` if only the change failed to encode.
         send_proofs_json: Option<String>,
-        /// The change proofs as a JSON array, if any were produced.
+        /// The change proofs as JSON, if any.
         change_proofs_json: Option<String>,
     },
-    /// The payment-retry HTTP call to the gateway failed at the transport layer
-    /// AFTER a swap had already spent the held proofs. The retry never reached
-    /// the gateway, so the freshly-minted send set (worth the `amount`) and any
-    /// change set are unspent, valid ecash that exist ONLY as these token
-    /// strings — losing them is permanent value loss. This is NOT retriable with
-    /// the original `--token` (those input proofs are already spent); retry
-    /// instead by presenting `send_token` to the gateway directly.
-    /// (`gateway_retry_failed`)
+    /// The payment-retry HTTP call failed in transport AFTER the swap spent the
+    /// held proofs. The retry never reached the gateway, so the send set (worth
+    /// `amount`) and any change are unspent ecash that exist ONLY as these
+    /// strings — losing them is permanent value loss. NOT retriable with the
+    /// original `--token` (its inputs are spent); instead present `send_token` to
+    /// the gateway directly. (`gateway_retry_failed`)
     GatewayRetryFailed {
-        /// The transport-layer failure reason (what the HTTP send reported).
+        /// The transport-layer failure reason.
         reason: String,
-        /// The send `cashuB` token — worth EXACTLY the charge, unspent (the
-        /// retry never reached the gateway). MUST be recovered.
+        /// Worth EXACTLY the charge, unspent — MUST be recovered.
         send_token: String,
-        /// The change `cashuB` token, if a swap produced one — also unspent.
+        /// Change token, if a swap produced one — also unspent.
         change_token: Option<String>,
     },
 }
@@ -357,8 +330,8 @@ impl PopError {
         }
     }
 
-    /// Whether retrying the SAME call as-is is safe (true ⟺ the documented
-    /// retry-class is `transient`). `needs_input` and `terminal` are both false.
+    /// True iff retrying the SAME call as-is is safe (the `transient` retry-class;
+    /// `needs_input` and `terminal` are both false).
     pub fn retriable(&self) -> bool {
         matches!(
             self,
@@ -416,7 +389,6 @@ impl PopError {
                 esplora_url,
                 operation,
             } => {
-                // esplora_url is REQUIRED-present; operation is emitted only if known.
                 let mut o = json!({ "esplora_url": esplora_url });
                 if let Some(op) = operation {
                     o["operation"] = json!(op);
@@ -440,7 +412,6 @@ impl PopError {
                 if let Some(c) = confs_required {
                     o["confs_required"] = json!(c);
                 }
-                // Non-mainnet on-ramp hint (where to get test coins); absent on mainnet.
                 if let Some(h) = faucet_hint {
                     o["faucet_hint"] = json!(h);
                 }
@@ -546,8 +517,7 @@ impl PopError {
                 send_token,
                 change_token,
             } => {
-                // Surface BOTH tokens: the gateway did not redeem, so the send
-                // set AND any change set are unspent ecash that must be recovered.
+                // Surface BOTH: unredeemed ⇒ send set AND any change are unspent.
                 let mut o = json!({
                     "status": status,
                     "body": body,
@@ -563,8 +533,7 @@ impl PopError {
                 send_token,
                 change_token,
             } => {
-                // The retry never reached the gateway after the swap: the send
-                // set (and any change) are unspent ecash — surface BOTH.
+                // Surface BOTH: retry never reached the gateway post-swap.
                 let mut o = json!({
                     "reason": reason,
                     "send_token": send_token,
@@ -579,8 +548,8 @@ impl PopError {
                 send_proofs_json,
                 change_proofs_json,
             } => {
-                // Surface the raw proofs (as parsed JSON when possible) so the
-                // ecash survives even though the cashuB string could not be built.
+                // Raw proofs (parsed JSON when possible) so the ecash survives
+                // the failed cashuB encode.
                 let parse =
                     |s: &str| -> Value { serde_json::from_str(s).unwrap_or_else(|_| json!(s)) };
                 let mut o = json!({ "reason": reason });
@@ -601,8 +570,8 @@ impl PopError {
         }
     }
 
-    /// The human help message for this error (stderr in `--human` mode; the
-    /// `message` field of the json envelope). Agents MUST NOT parse it.
+    /// Human help (the envelope `message` field; stderr in `--human` mode).
+    /// Agents MUST NOT parse it.
     pub fn message(&self) -> String {
         match self {
             PopError::InsufficientFunds {
@@ -771,8 +740,7 @@ impl PopError {
         }
     }
 
-    /// The full failure envelope as a JSON value:
-    /// `{ "schema_version", "error": { "code", "retriable", "message", "details"? } }`.
+    /// The full failure envelope (see the module-level shape).
     pub fn to_envelope(&self) -> Value {
         let mut err = json!({
             "code": self.code(),
@@ -788,13 +756,10 @@ impl PopError {
         })
     }
 
-    /// The recovery tokens an error carries, if any: `(send_token, change_token)`.
-    ///
-    /// Only the **post-swap** `pay` errors carry these — once the swap has spent
-    /// the held input proofs, the freshly-minted send/change ecash exists ONLY as
-    /// these token strings, so they MUST be surfaced on EVERY exit (the json
-    /// envelope already carries them in `details`; `--human` mode reads them here
-    /// to print them verbatim, since human mode does not print `details`).
+    /// Recovery tokens `(send_token, change_token)`, for the POST-swap `pay`
+    /// errors only — the swap already spent the held inputs, so this ecash exists
+    /// ONLY as these strings and MUST surface on every exit. `--human` mode reads
+    /// them here because it does not print `details`.
     pub fn recovery_tokens(&self) -> Option<(&str, Option<&str>)> {
         match self {
             PopError::GatewayRejectedPayment {
@@ -811,11 +776,9 @@ impl PopError {
         }
     }
 
-    /// The raw recovery proofs (as JSON) an error carries, if any:
-    /// `(send_proofs_json, change_proofs_json)`. Only [`PopError::TokenEncodeFailed`]
-    /// carries these — the swap spent the input but the `cashuB` string could not
-    /// be built, so the ecash survives only as these raw proofs. `--human` mode
-    /// reads them here to print them verbatim (human mode does not print `details`).
+    /// Raw recovery proofs `(send_proofs_json, change_proofs_json)`, for
+    /// [`PopError::TokenEncodeFailed`] only — the `cashuB` encode failed, so the
+    /// ecash survives only as these. Read by `--human` mode (no `details` there).
     pub fn recovery_proofs_json(&self) -> Option<(Option<&str>, Option<&str>)> {
         match self {
             PopError::TokenEncodeFailed {
@@ -860,9 +823,8 @@ impl PopError {
     }
 }
 
-/// Resolves an arbitrary boxed error into a typed [`PopError`]: if it already is
-/// one, take it; otherwise wrap its `Display` as [`PopError::Internal`]
-/// (`internal_error` — an unmapped, unexpected failure).
+/// Resolves a boxed error to a typed [`PopError`]: downcast if it is one, else
+/// wrap its `Display` as [`PopError::Internal`].
 pub fn from_boxed(err: Box<dyn std::error::Error>) -> PopError {
     match err.downcast::<PopError>() {
         Ok(pe) => *pe,
@@ -896,7 +858,6 @@ mod tests {
     /// REQUIRED-details codes actually populate `details`.
     #[test]
     fn envelope_shape_and_required_details() {
-        // A required-details code: cltv_not_expired.
         let e = PopError::CltvNotExpired {
             matures_at: 2000,
             now: 1000,
@@ -909,7 +870,7 @@ mod tests {
         assert_eq!(env["error"]["details"]["now"], json!(1000));
         assert!(env["error"]["message"].is_string());
 
-        // address_mismatch is terminal (not retriable) and has required details.
+        // address_mismatch is terminal (not retriable).
         let e = PopError::AddressMismatch {
             expected: "bc1pexpected".to_string(),
             got: "bc1pgot".to_string(),
@@ -940,7 +901,7 @@ mod tests {
         assert_eq!(env["error"]["details"]["operation"], json!("tip_mtp"));
         assert!(env["error"]["message"].is_string());
 
-        // operation is optional: esplora_url is still always present.
+        // operation optional; esplora_url still always present.
         let e = PopError::ChainUnreachable {
             esplora_url: "https://esplora.example".to_string(),
             operation: None,
@@ -954,7 +915,6 @@ mod tests {
     /// present (signet/testnet/regtest), and OMITS it on mainnet (None).
     #[test]
     fn funding_pending_carries_faucet_hint_when_present() {
-        // Signet-style: faucet_hint present.
         let e = PopError::FundingPending {
             address: "tb1pexample".to_string(),
             expires_at: 1_788_000_000,
@@ -969,14 +929,13 @@ mod tests {
             env["error"]["details"]["faucet_hint"],
             json!("https://faucet.mutinynet.com")
         );
-        // Required details still present.
         assert_eq!(env["error"]["details"]["address"], json!("tb1pexample"));
         assert_eq!(
             env["error"]["details"]["expires_at"],
             json!(1_788_000_000u64)
         );
 
-        // Mainnet-style: no faucet_hint key.
+        // Mainnet: no faucet_hint key.
         let e = PopError::FundingPending {
             address: "bc1pexample".to_string(),
             expires_at: 1_788_000_000,
@@ -991,9 +950,8 @@ mod tests {
         );
     }
 
-    /// The post-swap `gateway_rejected_payment` is terminal (not retriable) and
-    /// MUST carry BOTH the send token AND the change token in its details +
-    /// `recovery_tokens()` — once the swap ran, both halves are unspent ecash and
+    /// Post-swap `gateway_rejected_payment` is terminal and MUST carry BOTH
+    /// tokens (details + `recovery_tokens()`) — both halves are unspent ecash and
     /// losing either is permanent value loss.
     #[test]
     fn gateway_rejected_payment_surfaces_both_tokens() {
@@ -1011,14 +969,13 @@ mod tests {
             env["error"]["details"]["change_token"],
             json!("cashuBchange")
         );
-        // recovery_tokens() exposes both for the human-mode renderer.
         assert_eq!(
             e.recovery_tokens(),
             Some(("cashuBsend", Some("cashuBchange")))
         );
 
-        // ZERO-CHANGE swap: change_token is None, but the send token is STILL
-        // surfaced (the input WAS spent → the send set must be recoverable).
+        // ZERO-CHANGE swap: the input was still spent, so the send token must
+        // STILL be surfaced even with change_token None.
         let e = PopError::GatewayRejectedPayment {
             status: 402,
             body: "no".to_string(),
@@ -1030,9 +987,9 @@ mod tests {
         assert_eq!(e.recovery_tokens(), Some(("cashuBsend", None)));
     }
 
-    /// `gateway_retry_failed` is a NEW post-swap code: terminal (NOT retriable —
-    /// the input proofs are already spent), carrying BOTH unspent tokens so the
-    /// freshly-minted send/change ecash is never lost on a retry network error.
+    /// `gateway_retry_failed` is terminal (NOT retriable — the input proofs are
+    /// already spent), carrying BOTH unspent tokens so a retry network error
+    /// never loses the freshly-minted ecash.
     #[test]
     fn gateway_retry_failed_is_terminal_and_carries_both_tokens() {
         let e = PopError::GatewayRetryFailed {
@@ -1056,9 +1013,8 @@ mod tests {
         );
     }
 
-    /// `token_encode_failed` (post-swap, cashuB string unbuildable) carries the
-    /// raw proofs as parsed JSON so the value survives, and exposes them via
-    /// `recovery_proofs_json()` for the human-mode renderer.
+    /// `token_encode_failed` carries the raw proofs as parsed JSON (so the value
+    /// survives the failed encode) and exposes them via `recovery_proofs_json()`.
     #[test]
     fn token_encode_failed_surfaces_raw_proofs() {
         let e = PopError::TokenEncodeFailed {
@@ -1069,7 +1025,7 @@ mod tests {
         let env = e.to_envelope();
         assert_eq!(env["error"]["code"], json!("token_encode_failed"));
         assert_eq!(env["error"]["retriable"], json!(false));
-        // The proof JSON is surfaced as PARSED json (not a string blob).
+        // Surfaced as PARSED json, not a string blob.
         assert_eq!(
             env["error"]["details"]["send_proofs"][0]["amount"],
             json!(600)
@@ -1082,8 +1038,7 @@ mod tests {
             e.recovery_proofs_json(),
             Some((Some(r#"[{"amount":600}]"#), Some(r#"[{"amount":400}]"#)))
         );
-        // It is NOT a cashuB-token-bearing error (those go through a different
-        // human-mode path): recovery_tokens() must be None.
+        // NOT a cashuB-token-bearing error (different human-mode path).
         assert!(e.recovery_tokens().is_none());
     }
 

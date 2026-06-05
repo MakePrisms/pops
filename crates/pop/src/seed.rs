@@ -1,12 +1,10 @@
 //! `seed` — the BIP-39 seed, stored as plaintext, the wallet's ONLY secret.
 //!
-//! The 64-byte BIP-39 seed is written verbatim (hex) to a `seed` file inside
-//! the wallet dir, created with `0600` perms so only the owner can read it.
-//! There is deliberately NO at-rest encryption: the BIP-39 mnemonic shown once
-//! at `init` is the real backup. An encrypted seed behind a separate passphrase
-//! is redundant friction and a footgun — lose that passphrase and the encrypted
-//! seed is bricked with no import path. Protect the wallet directory (perms +
-//! disk) and keep the mnemonic offline instead.
+//! The 64-byte BIP-39 seed is written verbatim (hex) to a `seed` file with
+//! `0600` perms. There is deliberately NO at-rest encryption: the mnemonic
+//! shown once at `init` is the real backup, and a separate passphrase would
+//! only add a footgun (lose it → the seed is bricked with no import path).
+//! Protect the wallet directory (perms + disk) and keep the mnemonic offline.
 //!
 //! The seed is the master from which every funder key derives (see `derive`).
 //! Losing it loses every deposit's recovery key — the recovery files alone are

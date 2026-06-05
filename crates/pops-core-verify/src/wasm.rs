@@ -8,7 +8,7 @@
 //!    `build_payment_credential`). String-in, string-out; errors thrown as JS
 //!    strings.
 //!
-//! 2. The **full `verify_and_redeem`** (Step 2): decode + structural checks +
+//! 2. The **full `verify_and_redeem`**: decode + structural checks +
 //!    the NUT-03 swap, with HTTP performed by the injected-`fetch`
 //!    [`WasmMintClient`][crate::wasm_mint_client::WasmMintClient]. It is async
 //!    (returns a `Promise`) and resolves to a structured JS object on success

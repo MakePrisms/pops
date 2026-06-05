@@ -1,15 +1,11 @@
-//! Black-box tests for the FROZEN output & error contract.
+//! Black-box tests for the FROZEN output & error contract, driving the real
+//! `pop` binary against a throwaway wallet dir:
 //!
-//! These drive the real `pop` binary (via `CARGO_BIN_EXE_pop`) against a
-//! throwaway wallet dir and assert the contract on the actual process I/O:
-//!
-//! - json is the DEFAULT; stdout carries EXACTLY ONE JSON object and nothing
-//!   else (progress/diagnostics go to stderr);
-//! - every output (success and failure) carries top-level `schema_version`;
-//! - failures are the `{schema_version, error:{code, retriable, message,
-//!   details?}}` envelope on stdout, exit 1;
-//! - `--human` switches to text (success → stdout, errors → stderr, no json);
-//! - clap usage errors stay exit 2.
+//! - json is the DEFAULT; stdout is EXACTLY ONE JSON object (diagnostics → stderr);
+//! - every output carries top-level `schema_version`;
+//! - failures are the `{schema_version, error:{code, retriable, message, details?}}`
+//!   envelope on stdout, exit 1;
+//! - `--human` switches to text; clap usage errors stay exit 2.
 
 use std::path::Path;
 use std::process::Command;
@@ -53,10 +49,9 @@ fn parse_single_json(stdout: &str) -> serde_json::Value {
     v
 }
 
-/// (a) A success command (`init`) emits a valid JSON object carrying
-/// `schema_version` on stdout, exit 0. SECURITY: by default the mnemonic is NOT
-/// on the stdout parse channel — it's marked `mnemonic_delivery: "stderr"` and
-/// the secret line itself appears on stderr.
+/// A success command emits a `schema_version` JSON object on stdout, exit 0.
+/// SECURITY: by default the mnemonic is NOT on stdout (it goes to stderr,
+/// `mnemonic_delivery: "stderr"`).
 #[test]
 fn success_emits_json_with_schema_version_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
@@ -117,17 +112,13 @@ fn list_is_json_by_default_with_envelope() {
     assert_eq!(v["deposits"].as_array().unwrap().len(), 0);
 }
 
-/// (a) `balance` is pure-json by default and degrades gracefully when the chain
-/// backend is unreachable: with an unroutable esplora URL the MTP fetch fails,
-/// so `recoverable_now` is `null` and `mtp_available` is `false` — but the
-/// command still EXITS 0 with a single JSON object (a chain read never hard-fails
-/// `balance`), and the local-only aggregation is fully populated. The esplora
-/// warning lands on stderr, keeping stdout a pure envelope.
+/// `balance` degrades gracefully on an unreachable chain: `recoverable_now` null
+/// + `mtp_available` false, but still EXITS 0 with a single JSON object (a chain
+/// read never hard-fails balance); the warning lands on stderr.
 #[test]
 fn balance_degrades_to_null_recoverable_when_chain_unreachable() {
     let dir = tempfile::tempdir().unwrap();
-    // Pin an unroutable esplora so the tip-MTP fetch deterministically fails
-    // (port 0 on the discard address never connects).
+    // Unroutable esplora so the tip-MTP fetch deterministically fails.
     assert_eq!(
         run_pop(
             dir.path(),
@@ -139,16 +130,13 @@ fn balance_degrades_to_null_recoverable_when_chain_unreachable() {
 
     let out = run_pop(dir.path(), &["balance"]);
     assert_eq!(out.code, 0, "balance must not hard-fail on a chain read; stderr:\n{}", out.stderr);
-    // Purity: the WHOLE of stdout is one JSON object; the esplora warning is on stderr.
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["schema_version"], serde_json::json!(1));
     assert_eq!(v["mtp_available"], serde_json::json!(false));
     assert_eq!(v["recoverable_now"], serde_json::json!(null));
-    // Local-only aggregation is present (empty ledger → all-zero buckets).
     assert_eq!(v["total_locked_sats"], serde_json::json!(0));
     assert_eq!(v["mintable_now"], serde_json::json!({ "count": 0, "sats": 0 }));
     assert_eq!(v["by_state"]["paid"], serde_json::json!({ "count": 0, "sats": 0 }));
-    // The degrade warning is surfaced to stderr, not stdout.
     assert!(
         out.stderr.contains("esplora"),
         "expected an esplora-unreachable warning on stderr; got:\n{}",
@@ -156,11 +144,8 @@ fn balance_degrades_to_null_recoverable_when_chain_unreachable() {
     );
 }
 
-/// `status` (json default) degrades like `balance` when the chain backend is
-/// unreachable: the list envelope carries `mtp_available: false`, exits 0, and is
-/// a single pure JSON object with a `deposits` array (the esplora warning lands on
-/// stderr). The `mtp_available` flag is present even with an empty ledger — the
-/// same agent-parser invariant `balance` upholds.
+/// `status` degrades like `balance`: `mtp_available: false`, exit 0, a single
+/// JSON object with a `deposits` array (flag present even for an empty ledger).
 #[test]
 fn status_signals_mtp_available_false_when_chain_unreachable() {
     let dir = tempfile::tempdir().unwrap();
@@ -326,30 +311,22 @@ fn invalid_state_filter_is_clap_exit_2() {
     assert_eq!(run_pop(dir.path(), &["list", "--state", "minted"]).code, 0);
 }
 
-/// (c) stdout-purity: even when there ARE diagnostics, json-mode stdout stays a
-/// single JSON object; the human/progress text appears on STDERR instead.
-/// `init` writes a wallet (its human banner is suppressed in json mode), then a
-/// failing `init` (wallet exists) must still keep stdout pure.
+/// stdout-purity: even with diagnostics, json-mode stdout stays a single JSON
+/// object (human/progress text goes to stderr).
 #[test]
 fn json_mode_stdout_is_pure_progress_on_stderr() {
     let dir = tempfile::tempdir().unwrap();
     let first = run_pop(dir.path(), &["init", "--network", "regtest"]);
     assert_eq!(first.code, 0);
-    // stdout is exactly one json object (parse consumes all of it).
     let v = parse_single_json(&first.stdout);
     assert!(v["schema_version"].is_u64());
 
-    // A second init without --force fails: wallet_exists, json on stdout only.
+    // A second init fails (wallet_exists); stdout stays pure (the human `message`
+    // lives INSIDE the envelope — what's forbidden is loose prose OUTSIDE it).
     let second = run_pop(dir.path(), &["init", "--network", "regtest"]);
     assert_eq!(second.code, 1);
-    // Purity: the ENTIRE stdout is one JSON object — `parse_single_json` errors
-    // if any non-json text were appended outside it. (The human `message` field
-    // legitimately lives INSIDE the envelope; what's forbidden is loose prose
-    // OUTSIDE the single object.)
     let v = parse_single_json(&second.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("wallet_exists"));
-    // The human-only banner ("DANGER", suppressed in json mode) is not on
-    // stdout; any human diagnostics would be on stderr.
     assert!(
         !second.stdout.contains("DANGER"),
         "human banner leaked to stdout: {}",
@@ -496,16 +473,12 @@ fn duration_and_unit_together_is_clap_exit_2() {
     assert_eq!(out.code, 2, "duration+unit together must be exit 2; stderr:\n{}", out.stderr);
 }
 
-/// (item 4) `recover --all` on a ledger with NO funded candidates is an empty
-/// SUCCESS: stdout is `{schema_version, tip_height:null, tip_mtp:null,
-/// results:[]}`, exit 0 — and it makes NO chain call (so it can't fail
-/// chain_unreachable even with an unroutable esplora). Previously this was an
-/// `invalid_input` error.
+/// `recover --all` with NO funded candidates is an empty SUCCESS (exit 0) that
+/// makes NO chain call (so it can't fail chain_unreachable).
 #[test]
 fn recover_all_empty_is_success_with_no_chain_call() {
     let dir = tempfile::tempdir().unwrap();
-    // Unroutable esplora: if recover tried the tip fetch it would fail; the empty
-    // sweep must NOT touch the chain, so it still succeeds.
+    // Unroutable esplora: the empty sweep must NOT touch the chain.
     assert_eq!(
         run_pop(
             dir.path(),
@@ -525,7 +498,7 @@ fn recover_all_empty_is_success_with_no_chain_call() {
     assert_eq!(v["tip_height"], serde_json::json!(null));
     assert_eq!(v["tip_mtp"], serde_json::json!(null));
     assert!(v["results"].as_array().unwrap().is_empty());
-    // No chain call: no esplora-unreachable warning should appear.
+    // No chain call ⇒ no esplora warning.
     assert!(
         !out.stderr.contains("esplora"),
         "empty --all sweep must not touch the chain; got stderr:\n{}",

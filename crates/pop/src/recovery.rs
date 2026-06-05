@@ -1,21 +1,11 @@
 //! The per-deposit recovery file — the funder's portable "you can always get
-//! your BTC back" artifact.
+//! your BTC back" artifact (`recovery/<deposit_id>.recovery.json`).
 //!
-//! One JSON file per deposit at `recovery/<deposit_id>.recovery.json`. It is
-//! **non-secret**: every field is public or seed-derivable. It carries no
-//! private key. Its job is to preserve the one mint-random datum (`nonce`)
-//! plus all explicit construction params, so the BTC is reclaimable with this
-//! wallet (seed + file) OR with Bitcoin Core (the explicit descriptor + the
-//! seed-derived funder key) even if the mint disappears.
-//!
-//! The file is a *projection* of the deposit DB row — everything in it is also
-//! in `wallet.db` — kept standalone precisely so it survives the database.
-//!
-//! The taproot construction itself (`reconstruct`, `ConstructionParams`,
-//! `Construction`, `descriptor`) now lives in the `pops-core-funder` kernel —
-//! the single source of address truth shared by the wallet and the mint. This
-//! module keeps only the wallet-local JSON projection plus the `utc_iso8601`
-//! display helper.
+//! NON-SECRET (every field is public or seed-derivable; no private key). It
+//! preserves the one mint-random datum (`nonce`) plus the construction params,
+//! so the BTC is reclaimable with this wallet OR with Bitcoin Core (the explicit
+//! descriptor + seed-derived funder key) even if the mint disappears. It is a
+//! PROJECTION of the deposit DB row, kept standalone so it survives the database.
 
 use std::path::{Path, PathBuf};
 
@@ -133,16 +123,13 @@ impl RecoveryFile {
         }
     }
 
-    /// Parses the stored hex fields back into typed `ConstructionParams`.
-    ///
-    /// The break-glass reload path: reconstruct a deposit's funding output from
-    /// the recovery file alone (used by the round-trip test and a future
-    /// `restore` that rebuilds deposit records from recovery files).
+    /// Parses the stored hex fields back into typed `ConstructionParams` — the
+    /// break-glass reload path (reconstruct a deposit's funding output from the
+    /// file alone).
     ///
     /// # Errors
     ///
-    /// Returns an error if any hex field is malformed or the wrong length, or
-    /// the network string is unknown.
+    /// A malformed/wrong-length hex field or an unknown network string.
     #[allow(dead_code)]
     pub fn construction_params(&self) -> Result<ConstructionParams, Box<dyn std::error::Error>> {
         let mint_pubkey_bytes = hex::decode(&self.mint_pubkey)
@@ -216,8 +203,7 @@ impl RecoveryFile {
 mod tests {
     use super::*;
 
-    /// The same fixed inputs cdk-pop's own script tests pin against, so we can
-    /// cross-check the address our reconstruction produces.
+    /// The same fixed inputs the script tests pin, to cross-check the address.
     const TEST_MINT_PUBKEY: [u8; 33] = [
         0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
         0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
@@ -227,8 +213,7 @@ mod tests {
     const TEST_NONCE: [u8; 32] = [0x42; 32];
 
     fn test_funder() -> XOnlyPublicKey {
-        // secp256k1 generator G's x-coordinate — a known valid x-only point,
-        // matching cdk-pop's own test vector funder key.
+        // secp256k1 generator G's x-coordinate — a known valid x-only point.
         const G_X: [u8; 32] = [
             0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
             0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
@@ -247,13 +232,9 @@ mod tests {
         }
     }
 
-    /// THE core round-trip: build a recovery file, serialize to JSON, reload,
-    /// re-derive the construction from the reloaded params, and assert the
-    /// rebuilt address + internal key + leaf script all match the original.
-    /// This is the wallet's central correctness guarantee — the file alone is
-    /// enough to reconstruct the funding output. The construction now comes from
-    /// the `pops-core-funder` kernel; this test pins that the projection +
-    /// reload still reproduce the same funding output.
+    /// THE core round-trip: build → JSON → reload → re-derive, asserting the
+    /// rebuilt address + internal key + leaf script match the original. The
+    /// wallet's central guarantee: the file alone reconstructs the funding output.
     #[test]
     fn recovery_file_roundtrip_reconstructs_address() {
         let params = test_params(Network::Signet);
@@ -270,11 +251,8 @@ mod tests {
             None,
         );
 
-        // Round-trip through JSON.
         let json = serde_json::to_string_pretty(&rf).unwrap();
         let reloaded: RecoveryFile = serde_json::from_str(&json).unwrap();
-
-        // The file recorded the original address.
         assert_eq!(reloaded.funding_address, original.address);
 
         // Rebuild purely from the reloaded file's params.
@@ -293,7 +271,7 @@ mod tests {
             rebuilt.leaf_script, original.leaf_script,
             "leaf script rebuilt from recovery file must match the original"
         );
-        // The stored hex projections must agree with the rebuild too.
+        // The stored hex projections agree with the rebuild.
         assert_eq!(reloaded.p_internal, hex::encode(rebuilt.internal_key.serialize()));
         assert_eq!(reloaded.leaf_script, hex::encode(rebuilt.leaf_script.as_bytes()));
     }

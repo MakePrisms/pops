@@ -1,39 +1,15 @@
-//! Mint client abstraction used by the verify core.
+//! Mint client abstraction used by the verify core. A successful swap proves the
+//! proofs are unexpired (`final_expiry`) and unspent (nullifier replay), yielding
+//! new proofs under the verifier's secrets — the charge is transfer-on-use.
 //!
-//! [`CashuCredential`][crate::cashu_credential::CashuCredential] confirms a
-//! token's structural fit against a
-//! [`CashuRequirement`][crate::challenge::CashuRequirement] locally, then
-//! calls the issuing mint to perform an atomic swap. A successful swap proves
-//! the proofs are unexpired (mint enforces `final_expiry`) and unspent (mint
-//! enforces nullifier replay protection), and yields new proofs under the
-//! verifier's secrets — the charge is transfer-on-use.
+//! The trait takes [`MintUrl`] + [`Proofs`] (not a decoded [`Token`][cashu::Token])
+//! so implementations fetch keyset info up front; [`MintClient::keysets`] is its
+//! own method because V1 short keyset IDs need the full [`KeySetInfo`] list to
+//! resolve before [`Token::proofs`][cashu::Token::proofs] returns them.
 //!
-//! This module exposes only the trait + error surface. A concrete
-//! `cdk`-backed implementation lives in [`crate::cdk_mint_client`] (native
-//! only); tests in this crate use a mock impl defined alongside the
-//! `cashu_credential` tests.
-//!
-//! The trait deliberately takes a [`MintUrl`] and [`Proofs`] rather than the
-//! decoded [`Token`][cashu::Token] so concrete implementations can fetch
-//! mint keyset info up front and feed already-expanded proofs to the swap
-//! call. Translating a [`Token`][cashu::Token] into [`Proofs`] is the
-//! validator's responsibility — and is why [`MintClient::keysets`] exists
-//! as its own trait method: V1-format token keyset IDs are short (7 bytes)
-//! and need a full [`KeySetInfo`] list to resolve into a long [`Id`][cashu::nuts::Id]
-//! before [`Token::proofs`][cashu::Token::proofs] will return them.
-//!
-//! `MintClientError` is intentionally coarse: `Unreachable` for transport
-//! failures and `RejectedSwap` for any mint-side refusal. It does not
-//! distinguish expired vs. double-spent vs. keyset-rotated refusals. The one
-//! exception is `SwapOutputDleqInvalid`, kept as its OWN arm (never folded into
-//! `RejectedSwap`) because a swap whose returned blind signatures fail DLEQ is
-//! a money-safety event — the mint handed back outputs we MUST NOT treat as
-//! redeemed value — and the cross-slice contract surfaces it as the distinct
-//! `ChargeError::DleqInvalid { location: SwapOutput }`, not a double-spend.
-//!
-//! On `wasm32` the trait is `#[async_trait(?Send)]` (single-threaded; matches
-//! cdk's own wasm32 usage). On native it is `Send + Sync` so the validator can
-//! be shared across async tasks (e.g. inside an HTTP handler chain).
+//! `?Send` on wasm32, `Send + Sync` on native (so the validator can be shared
+//! across async tasks). A concrete `cdk`-backed impl lives in
+//! [`crate::cdk_mint_client`].
 
 use async_trait::async_trait;
 use cashu::nuts::nut02::KeySetInfo;
@@ -41,33 +17,19 @@ use cashu::{MintUrl, Proofs};
 use thiserror::Error;
 
 /// Abstraction over the calls the verify core makes to a Cashu mint.
-///
-/// On native, implementations are expected to be `Send + Sync` so the
-/// validator can be shared across async tasks. On `wasm32` the futures are
-/// `?Send` (single-threaded).
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 pub trait MintClient: Send + Sync {
-    /// Fetch the mint's keyset list.
-    ///
-    /// The validator needs this to resolve V1-format short keyset IDs
-    /// that appear in tokens on the wire. Without a matching
-    /// [`KeySetInfo`] the cashu crate cannot decode the proofs — see
-    /// [`cashu::Token::proofs`].
-    ///
-    /// Returning an empty `Vec` is valid (the mint reports no keysets);
-    /// callers must treat that as "no V1 IDs resolvable" rather than an
-    /// error.
+    /// Fetch the mint's keyset list (to resolve V1 short keyset IDs; without a
+    /// matching [`KeySetInfo`] the proofs cannot decode). An empty `Vec` is valid
+    /// ("no V1 IDs resolvable"), not an error.
     async fn keysets(
         &self,
         mint_url: &MintUrl,
     ) -> Result<Vec<KeySetInfo>, MintClientError>;
 
-    /// Swap `proofs` at `mint_url` for new proofs held by the verifier.
-    ///
-    /// The mint atomically consumes the inputs (failing if any are
-    /// spent, expired, or otherwise invalid) and returns blinded
-    /// signatures the verifier unblinds into the returned [`Proofs`].
+    /// Swap `proofs` for new verifier-held proofs. The mint atomically consumes
+    /// the inputs (failing if spent/expired/invalid).
     async fn swap(
         &self,
         mint_url: &MintUrl,
@@ -97,45 +59,33 @@ pub trait MintClient {
 /// Errors returned by [`MintClient`] implementations.
 #[derive(Debug, Error)]
 pub enum MintClientError {
-    /// The mint could not be reached (DNS, TCP, TLS, timeout, etc.) on a call
-    /// whose outcome is DETERMINATE — i.e. BEFORE the swap inputs were
-    /// submitted (a keysets/keys GET, or a connect failure on the swap POST that
-    /// never left our side). The token was NOT consumed; a retry with the SAME
-    /// token is safe and authoritative.
+    /// Mint unreachable on a DETERMINATE call — BEFORE the swap inputs were
+    /// submitted (a GET, or a connect failure that never left our side). The
+    /// token was NOT consumed; retry with the SAME token is authoritative.
     #[error("mint unreachable: {0}")]
     Unreachable(String),
 
-    /// A transport failure on the swap POST ITSELF (5xx / read-timeout AFTER the
-    /// request was sent), so the swap outcome is INDETERMINATE: the mint MAY
-    /// have already consumed the inputs even though we never read a response.
-    ///
-    /// Distinct from [`Self::Unreachable`] (a pre-submit/determinate failure) so
-    /// the validator can surface the contract's
-    /// `ChargeError::MintUnreachable { indeterminate: true }` — same 503+retry,
-    /// but the operator MUST NOT assume the token is still good without a
-    /// checkstate (spec §Durability). Raised ONLY by the swap ceremony around
-    /// `post_swap`; the pre-POST GETs keep [`Self::Unreachable`].
+    /// A transport failure on the swap POST ITSELF (5xx / read-timeout AFTER
+    /// sending), so the outcome is INDETERMINATE: the mint MAY have consumed the
+    /// inputs. Kept distinct so the validator surfaces `indeterminate: true` —
+    /// same 503+retry, but the operator MUST checkstate before assuming the token
+    /// is good (spec §Durability). Raised ONLY around `post_swap`.
     #[error("mint unreachable (indeterminate swap outcome): {0}")]
     UnreachableIndeterminate(String),
 
-    /// The mint reached us but refused the swap (expired credential,
-    /// double-spent proof, invalid signature, keyset rotated, etc.).
+    /// The mint refused the swap (expired, double-spent, bad signature, keyset
+    /// rotated, etc.).
     #[error("mint rejected swap: {0}")]
     RejectedSwap(String),
 
-    /// The swap succeeded at the HTTP level but a returned blind signature
-    /// failed DLEQ verification — its NUT-12 proof is MISSING or INVALID
-    /// against the mint's advertised keyset key.
+    /// A returned blind signature failed DLEQ verification (NUT-12 proof MISSING
+    /// or INVALID against the advertised key).
     ///
-    /// SECURITY-CRITICAL and deliberately distinct from [`Self::RejectedSwap`]:
-    /// a missing/invalid swap-output DLEQ means the mint did NOT prove it
-    /// signed the outputs with the advertised key, so the unblinded proofs are
-    /// not provably valid bearer value and MUST NOT be redeemed. This is the
-    /// money-safety invariant — no redeemed value without a verified DLEQ. The
-    /// validator maps it to the contract's
-    /// `ChargeError::DleqInvalid { location: SwapOutput }` (a verification
-    /// failure → 402, the gateway does NOT serve the resource), NOT to a
-    /// double-spend.
+    /// SECURITY-CRITICAL, deliberately distinct from [`Self::RejectedSwap`]: the
+    /// mint did NOT prove it signed the outputs with the advertised key, so the
+    /// proofs are not provably valid bearer value and MUST NOT be redeemed (no
+    /// redeemed value without a verified DLEQ). Maps to `DleqInvalid { SwapOutput }`
+    /// (402, resource not served), NOT a double-spend.
     #[error("swap-output DLEQ verification failed: {0}")]
     SwapOutputDleqInvalid(String),
 }

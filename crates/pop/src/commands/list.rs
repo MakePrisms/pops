@@ -16,9 +16,8 @@ use crate::recovery::utc_iso8601;
 use crate::wallet::Wallet;
 use crate::SCHEMA_VERSION;
 
-/// The `--state` filter values, as a clap `ValueEnum` so `--help` enumerates and
-/// clap validates them (an unknown value is a clap usage error, exit 2). Maps 1:1
-/// onto [`DepositState`].
+/// The `--state` filter values (a clap `ValueEnum`, so `--help` enumerates +
+/// validates them). Maps 1:1 onto [`DepositState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum StateFilter {
@@ -75,26 +74,21 @@ fn state_label(state: DepositState) -> &'static str {
     }
 }
 
-/// The display state surfaced to the funder (a derived view over the stored
-/// state + the chain MTP).
-///
-/// The recoverability overlay applies to EVERY locked deposit — funding-gated
-/// and matured per the shared [`Deposit::is_locked`] / [`Deposit::is_recoverable_now`]
-/// (the SAME definition `balance` uses, so the two surfaces can't drift). That
-/// means `Paid` (funded, mintable) also carries it, and an `Expired` row that was
-/// never funded does NOT (it holds no BTC to recover). `Unpaid`/`Recovered` are
-/// never locked, so they get no overlay.
+/// The display state for the funder (stored state + chain MTP). The
+/// recoverability overlay applies to EVERY locked deposit, funding-gated +
+/// matured per the shared [`Deposit::is_locked`] / [`Deposit::is_recoverable_now`]
+/// (the SAME definition `balance` uses, so the surfaces can't drift) — so a
+/// funded `Paid` carries it, an un-funded `Expired` does not.
 fn display_state(dep: &Deposit, mtp: Option<u64>) -> String {
     let base = state_label(dep.state);
     if !dep.is_locked() {
-        // Unpaid / Recovered / un-funded Expired: nothing locked to recover.
         return base.to_string();
     }
     match mtp {
         Some(m) if dep.is_recoverable_now(m) => format!("{base} / Recoverable now"),
         Some(_) => format!("{base} / Recoverable-after {}", utc_iso8601(dep.ts_expiry)),
-        // MTP unavailable: we can't assert maturity, so fall back to the
-        // unlock-time hint rather than claiming recoverability either way.
+        // MTP-unavailable falls back to the unlock-time hint rather than
+        // claiming recoverability either way.
         None => format!("{base} / Recoverable-after {}", utc_iso8601(dep.ts_expiry)),
     }
 }
@@ -111,8 +105,6 @@ pub fn run_list(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let wallet = Wallet::open(wallet_dir)?;
     let deposits = match args.state {
-        // clap's ValueEnum already validated the value (an unknown one is a clap
-        // usage error, exit 2), so this is a total mapping — no string parse.
         Some(s) => wallet.db.list_deposits_by_state(s.to_deposit_state())?,
         None => wallet.db.list_deposits()?,
     };
@@ -155,8 +147,7 @@ pub async fn run_status(
                 deposit_id: id.clone(),
             })?;
         if json {
-            // Single-deposit detail: the deposit object with schema_version
-            // merged in at the top level.
+            // Single-deposit detail: the object + schema_version at top level.
             let mut out = deposit_json(&dep, mtp);
             if let Some(o) = out.as_object_mut() {
                 o.insert("schema_version".to_string(), serde_json::json!(SCHEMA_VERSION));
@@ -233,7 +224,6 @@ fn print_detail(dep: &Deposit, mtp: Option<u64>) {
     }
     println!("recover-after:    {} (ts {})", utc_iso8601(dep.ts_expiry), dep.ts_expiry);
     if !dep.is_locked() {
-        // No locked BTC (unpaid / recovered / un-funded expired): nothing to sweep.
         println!("recoverable:      n/a (no locked BTC at this deposit)");
     } else if let Some(m) = mtp {
         let now = now_unix();
@@ -261,17 +251,10 @@ fn print_detail(dep: &Deposit, mtp: Option<u64>) {
     );
 }
 
-/// Wraps a list of deposit objects in the contract envelope:
-/// `{ "schema_version": 1, "mtp_available": <bool>, "deposits": [...] }`. A
-/// top-level array can't carry `schema_version`, so the list/status table output
-/// is an object with the deposits under `deposits`.
-///
-/// `mtp_available` is `true` iff the chain-tip MTP was fetched (the recoverability
-/// overlay is live); `false` when esplora was unreachable (the per-deposit
-/// `recoverable_now` is then `null`). It is at the envelope level so the flag is
-/// present even for an empty ledger — matching `balance`'s top-level
-/// `mtp_available` / `recoverable_now|null` pattern. (`list` is local-only and
-/// never fetches MTP, so it always reports `false`.)
+/// Wraps deposits in the envelope `{ schema_version, mtp_available, deposits }`
+/// (a top-level array can't carry `schema_version`). `mtp_available` is true iff
+/// the tip MTP was fetched; it lives at the envelope level so the flag is present
+/// even for an empty ledger. (`list` never fetches MTP → always `false`.)
 fn deposit_list_envelope(arr: Vec<serde_json::Value>, mtp: Option<u64>) -> serde_json::Value {
     serde_json::json!({
         "schema_version": SCHEMA_VERSION,
@@ -281,11 +264,9 @@ fn deposit_list_envelope(arr: Vec<serde_json::Value>, mtp: Option<u64>) -> serde
 }
 
 fn deposit_json(dep: &Deposit, mtp: Option<u64>) -> serde_json::Value {
-    // Recoverability is funding-gated + matured (the shared `is_recoverable_now`,
-    // identical to `balance`). It is PRESENT-as-null when the chain MTP was
-    // unavailable — an agent's parser always finds the key and checks for null +
-    // `mtp_available`, never key-existence. A locked-but-immature deposit is
-    // `false`; an un-funded/un-locked deposit is also `false` (nothing to sweep).
+    // recoverable_now is the shared funding-gated `is_recoverable_now`, PRESENT-as-
+    // null when MTP was unavailable (the key is never omitted — agent parsers check
+    // null + `mtp_available`, not key-existence).
     let recoverable_now = mtp.map(|m| dep.is_recoverable_now(m));
     serde_json::json!({
         "id": dep.id,
@@ -349,11 +330,10 @@ mod tests {
         let dep = sample();
         let v = deposit_json(&dep, None);
 
-        // Unix creation time, distinct from ts_expiry (guards a ts_expiry copy-paste).
+        // Distinct from ts_expiry (guards a copy-paste).
         assert_eq!(v["created_at"], serde_json::json!(1_700_000_000u64));
         assert_ne!(v["created_at"], v["ts_expiry"]);
 
-        // ISO-8601 rendering of created_at via the shared helper.
         assert_eq!(v["created_at_utc"], serde_json::json!("2023-11-14T22:13:20Z"));
         assert_eq!(v["created_at_utc"], serde_json::json!(utc_iso8601(dep.created_at)));
         assert_ne!(v["created_at_utc"], v["recover_after_utc"]);
@@ -368,27 +348,24 @@ mod tests {
         d
     }
 
-    /// `mtp_available` reflects whether the chain MTP was fetched, at BOTH the
-    /// per-deposit level and the list envelope; and the recoverability field is
-    /// PRESENT-as-null (key never omitted) when degraded — the balance pattern,
-    /// so an agent's parser checks null + the flag, never key-existence.
+    /// `mtp_available` reflects whether MTP was fetched (per-deposit + envelope);
+    /// recoverable_now is PRESENT-as-null when degraded (key never omitted).
     #[test]
     fn mtp_available_signals_degrade_and_recoverable_is_present_as_null() {
-        let dep = funded(DepositState::Minted); // ts_expiry 1_782_259_200
+        let dep = funded(DepositState::Minted);
 
-        // Degraded (esplora unreachable → mtp None).
+        // Degraded (mtp None): key present + null.
         let v = deposit_json(&dep, None);
         assert_eq!(v["mtp_available"], serde_json::json!(false));
-        // Key is PRESENT and null (not omitted) — agent parser invariant.
         assert!(v.as_object().unwrap().contains_key("recoverable_now"));
         assert_eq!(v["recoverable_now"], serde_json::json!(null));
 
-        // Live (mtp known) → flag true, recoverability a concrete bool.
+        // Live: flag true, recoverability a concrete bool.
         let v = deposit_json(&dep, Some(dep.ts_expiry));
         assert_eq!(v["mtp_available"], serde_json::json!(true));
         assert_eq!(v["recoverable_now"], serde_json::json!(true));
 
-        // The list envelope carries the flag too (present even for an empty ledger).
+        // The envelope carries the flag even for an empty ledger.
         let empty_degraded = deposit_list_envelope(vec![], None);
         assert_eq!(empty_degraded["mtp_available"], serde_json::json!(false));
         assert!(empty_degraded["deposits"].as_array().unwrap().is_empty());
@@ -396,22 +373,18 @@ mod tests {
         assert_eq!(empty_live["mtp_available"], serde_json::json!(true));
     }
 
-    /// status's recoverability uses the SAME funding-gated + matured definition as
-    /// balance (the shared `Deposit::is_recoverable_now`): `Paid` IS included once
-    /// matured (a divergence the old state-only overlay had — it excluded Paid),
-    /// and an un-funded `Expired` deposit is NEVER recoverable even past maturity.
+    /// Recoverability uses the SAME shared `is_recoverable_now` as balance: a
+    /// matured `Paid` IS recoverable, an un-funded `Expired` is NEVER.
     #[test]
     fn recoverable_now_matches_balance_shared_definition() {
-        let mtp = 1_782_259_200; // == sample ts_expiry (matured, boundary-inclusive)
+        let mtp = 1_782_259_200; // == sample ts_expiry (matured, inclusive)
 
-        // Paid + matured: recoverable (the old overlay wrongly excluded Paid).
         let paid = funded(DepositState::Paid);
         let v = deposit_json(&paid, Some(mtp));
         assert_eq!(v["recoverable_now"], serde_json::json!(true), "matured Paid is recoverable");
-        // And the json field agrees with the shared db helper it delegates to.
         assert_eq!(v["recoverable_now"], serde_json::json!(paid.is_recoverable_now(mtp)));
 
-        // Un-funded Expired: NOT recoverable even though matured (no BTC to sweep).
+        // Un-funded Expired: NOT recoverable even though matured.
         let mut unfunded_expired = sample();
         unfunded_expired.state = DepositState::Expired;
         let v = deposit_json(&unfunded_expired, Some(mtp));
@@ -422,7 +395,6 @@ mod tests {
             "un-funded expired holds nothing — never recoverable (matches balance)"
         );
 
-        // Funded Expired + matured: recoverable.
         let funded_expired = funded(DepositState::Expired);
         let v = deposit_json(&funded_expired, Some(mtp));
         assert_eq!(v["recoverable_now"], serde_json::json!(true));
@@ -432,27 +404,23 @@ mod tests {
         assert_eq!(v["recoverable_now"], serde_json::json!(false));
     }
 
-    /// The `display_state` string overlay agrees with the structured recoverability
-    /// (both off the shared helper): a matured Paid reads "Recoverable now"; an
-    /// un-funded Expired gets NO overlay (it is not locked).
+    /// The `display_state` string overlay agrees with the structured field.
     #[test]
     fn display_state_overlay_is_funding_gated() {
         let mtp = 1_782_259_200;
 
-        // Matured Paid now carries the recoverability overlay.
         let s = display_state(&funded(DepositState::Paid), Some(mtp));
         assert_eq!(s, "Paid / Recoverable now");
 
-        // Un-funded expired: bare label, no "Recoverable now" claim.
+        // Un-funded expired: bare label.
         let mut unfunded_expired = sample();
         unfunded_expired.state = DepositState::Expired;
         assert_eq!(display_state(&unfunded_expired, Some(mtp)), "Expired");
 
-        // Immature funded minted: "Recoverable-after <date>".
         let s = display_state(&funded(DepositState::Minted), Some(mtp - 1));
         assert!(s.starts_with("Minted / Recoverable-after "), "got: {s}");
 
-        // Unpaid / Recovered are never locked → bare labels.
+        // Unpaid / Recovered are never locked.
         assert_eq!(display_state(&sample(), Some(mtp)), "Unpaid");
         assert_eq!(display_state(&funded(DepositState::Recovered), Some(mtp)), "Recovered");
     }

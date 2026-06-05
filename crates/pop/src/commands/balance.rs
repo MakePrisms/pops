@@ -1,43 +1,24 @@
-//! `pop balance` — an aggregated, agent-friendly summary over the local ledger.
+//! `pop balance` — an aggregated summary over the local ledger (locked BTC,
+//! per-state counts/sums, mintable-now, and best-effort recoverable-now).
 //!
-//! Where `list`/`status` are per-deposit, `balance` rolls the whole ledger into
-//! one object: how much BTC is still locked (funded but not recovered), counts
-//! and sat sums per lifecycle state, how much is mintable right now (the
-//! paid-not-minted set), and — best-effort against the chain tip — how much is
-//! recoverable right now (funded-not-recovered deposits whose CLTV has matured).
+//! SCOPE: ON-CHAIN DEPOSITS ONLY — the wallet holds no ecash custody, so minted
+//! spendable-pops are not in any balance number.
 //!
-//! Like `status`, the chain overlay degrades gracefully: if esplora is
-//! unreachable we cannot compute median-time-past (MTP), so `recoverable_now`
-//! becomes `null` and `mtp_available` is `false` (a warning goes to stderr). We
-//! do NOT raise `chain_unreachable` — balance is a best-effort read, not a
-//! correctness-critical operation.
+//! The chain overlay degrades gracefully: an unreachable esplora leaves
+//! `recoverable_now` `null` + `mtp_available` `false` (NOT a `chain_unreachable`
+//! error — balance is best-effort).
 //!
-//! ## Scope: ON-CHAIN DEPOSITS ONLY
+//! Lifecycle → money:
+//! - `unpaid`    — no confirmed funding → NOT locked.
+//! - `paid`      — funded, not minted → LOCKED; mintable now.
+//! - `minted`    — issued, BTC locked until `ts_expiry` → LOCKED.
+//! - `recovered` — swept → NOT locked.
+//! - `expired`   — LOCKED iff funds were sent (`funding_txid` set); an un-funded
+//!   expired quote holds NOTHING.
 //!
-//! `balance` accounts the **on-chain CLTV deposits** this wallet tracks — it does
-//! NOT count spendable ecash. This wallet *mints-and-prints* `cashuB` tokens and
-//! holds **no token custody** (db: "no tokens stored"), so already-minted
-//! spendable-pops are not part of any balance number here. (If/when a phase-2
-//! `pay` command gives the wallet ecash custody, `balance` would surface
-//! spendable-pops then.) So `balance` answers "how much BTC have I got locked /
-//! mintable / recoverable", NOT "how much spendable ecash do I hold".
-//!
-//! ## Lifecycle → money mapping
-//!
-//! - `unpaid`    — quoted, no confirmed funding → BTC not in the address → NOT locked.
-//! - `paid`      — funding credited, not yet minted → BTC LOCKED; mintable now.
-//! - `minted`    — credential issued, BTC locked until `ts_expiry` → BTC LOCKED.
-//! - `recovered` — the script-path sweep was broadcast → BTC reclaimed → NOT locked.
-//! - `expired`   — funding deadline passed → BTC LOCKED **iff** funds were sent
-//!   (`funding_txid` set); an un-funded expired quote holds NOTHING → NOT locked.
-//!
-//! So **locked** (`total_locked_sats`, and the candidate set for
-//! `recoverable_now`) = funded-and-not-recovered = `paid + minted + funded-expired`
-//! (BTC still in the CLTV address). The test is funding-gated, not state-gated
-//! (an expired-but-never-funded deposit must NOT inflate the locked total), and
-//! lives in one place — [`Deposit::is_locked`] — shared with `status`.
-//! `mintable_now` = `paid`. A locked deposit is recoverable once chain MTP ≥ its
-//! `ts_expiry` (BIP-113, the same maturity gate `recover` uses).
+//! So locked is FUNDING-gated, not state-gated, via the shared
+//! [`Deposit::is_locked`]. Recoverable once MTP ≥ `ts_expiry` (BIP-113, the gate
+//! `recover` uses).
 
 use std::path::Path;
 
@@ -55,31 +36,25 @@ pub struct BalanceArgs {}
 /// A `{ count, sats }` pair for one bucket of deposits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Bucket {
-    /// Number of deposits in this bucket.
     count: u64,
-    /// Sum of their funded amounts, sats.
     sats: u64,
 }
 
 impl Bucket {
-    /// Folds one deposit's amount into the bucket.
     fn add(&mut self, amount: u64) {
         self.count += 1;
         self.sats = self.sats.saturating_add(amount);
     }
 
-    /// JSON `{ "count", "sats" }`.
     fn to_json(self) -> serde_json::Value {
         serde_json::json!({ "count": self.count, "sats": self.sats })
     }
 }
 
-/// The fully aggregated balance summary. Built purely from a deposit slice +
-/// an optional chain MTP, so the aggregation is unit-testable without a db or
-/// network.
+/// The aggregated balance summary. Built purely from a deposit slice + an
+/// optional chain MTP, so it is unit-testable without a db or network.
 #[derive(Debug, Clone)]
 struct Summary {
-    /// Per-state buckets, indexed by [`DepositState`] (see [`Self::bucket`]).
     unpaid: Bucket,
     paid: Bucket,
     minted: Bucket,
@@ -87,16 +62,15 @@ struct Summary {
     expired: Bucket,
     /// Funded-but-not-recovered total (`paid + minted + funded-expired`).
     total_locked_sats: u64,
-    /// Funded-but-not-minted (`paid`) — the mintable-now set.
+    /// The `paid` set (funded, not yet minted).
     mintable_now: Bucket,
-    /// Funded-not-recovered deposits with `ts_expiry <= mtp`. `None` ⟺ MTP was
-    /// unavailable (esplora unreachable).
+    /// Locked deposits with `ts_expiry <= mtp`; `None` ⟺ MTP unavailable.
     recoverable_now: Option<Bucket>,
 }
 
 impl Summary {
-    /// Aggregates a deposit slice. `mtp` is the chain tip's median-time-past
-    /// when known; `None` (esplora unreachable) leaves `recoverable_now` unknown.
+    /// Aggregates a deposit slice; `None` `mtp` (esplora unreachable) leaves
+    /// `recoverable_now` unknown.
     fn build(deposits: &[Deposit], mtp: Option<u64>) -> Self {
         let mut unpaid = Bucket::default();
         let mut paid = Bucket::default();
@@ -104,8 +78,7 @@ impl Summary {
         let mut recovered = Bucket::default();
         let mut expired = Bucket::default();
         let mut total_locked_sats: u64 = 0;
-        // Only computed when MTP is known; a `Some(default)` means "MTP known,
-        // zero deposits matured", distinct from `None` ("MTP unknown").
+        // `Some(default)` = "MTP known, zero matured"; `None` = "MTP unknown".
         let mut recoverable = mtp.map(|_| Bucket::default());
 
         for d in deposits {
@@ -117,13 +90,11 @@ impl Summary {
                 DepositState::Expired => expired.add(d.amount),
             }
 
-            // Locked = funded (BTC in the CLTV address) and not yet recovered.
             // Funding-gated via the shared `Deposit::is_locked` (so balance and
-            // status can't drift): an expired-but-never-funded deposit is excluded.
+            // status can't drift); an expired-but-never-funded deposit is excluded.
             if d.is_locked() {
                 total_locked_sats = total_locked_sats.saturating_add(d.amount);
-                // Recoverable now = a locked deposit whose CLTV has matured
-                // (MTP >= ts_expiry, BIP-113 — the gate `recover` enforces).
+                // Matured = MTP >= ts_expiry (BIP-113, the gate `recover` uses).
                 if let (Some(rb), Some(m)) = (recoverable.as_mut(), mtp) {
                     if d.is_recoverable_now(m) {
                         rb.add(d.amount);
@@ -139,13 +110,12 @@ impl Summary {
             recovered,
             expired,
             total_locked_sats,
-            // mintable_now is exactly the paid bucket (funded, not yet minted).
-            mintable_now: paid,
+            mintable_now: paid, // exactly the paid bucket
             recoverable_now: recoverable,
         }
     }
 
-    /// The success envelope object (see the module + SKILL docs for the schema).
+    /// The success envelope object.
     fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "schema_version": SCHEMA_VERSION,
@@ -254,9 +224,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Builds a deposit fixture in `state` with `amount` sats and `ts_expiry`.
-    /// `funding_txid` is `None` (un-funded); use [`fund`] to mark funding sent.
-    /// Only the fields the aggregation reads are meaningful; the rest are filler.
+    /// A deposit fixture (un-funded; use [`fund`] to mark funding sent). Only the
+    /// aggregation-relevant fields matter; the rest are filler.
     fn dep(state: DepositState, amount: u64, ts_expiry: u64) -> Deposit {
         Deposit {
             id: format!("dep-{}-{amount}-{ts_expiry}", state.as_str()),
@@ -282,19 +251,17 @@ mod tests {
         }
     }
 
-    /// Marks `d` as funding-sent (sets `funding_txid`/`funding_vout`) — the gate
-    /// that makes an `Expired` deposit count as locked.
+    /// Marks `d` as funding-sent — the gate that makes an `Expired` deposit count
+    /// as locked.
     fn fund(mut d: Deposit) -> Deposit {
         d.funding_txid = Some("ab".repeat(32));
         d.funding_vout = Some(0);
         d
     }
 
-    /// A representative ledger spanning every state, with distinct amounts so a
-    /// mis-bucketed deposit changes a sum. Includes BOTH a funded-expired row
-    /// (BTC was sent → counts as locked) AND an un-funded expired row
-    /// (`funding_txid` None → holds nothing → must NOT count), exercising the
-    /// funding-gated `is_locked` fix.
+    /// A ledger spanning every state with distinct amounts (a mis-bucket changes a
+    /// sum). Includes BOTH a funded-expired row (locked) and an un-funded one (must
+    /// NOT count) to exercise the funding-gated `is_locked` fix.
     fn fixture() -> Vec<Deposit> {
         vec![
             dep(DepositState::Unpaid, 100, 1_000),
@@ -316,30 +283,25 @@ mod tests {
         assert_eq!((s.paid.count, s.paid.sats), (2, 600)); // 200 + 400
         assert_eq!((s.minted.count, s.minted.sats), (2, 2_400)); // 800 + 1600
         assert_eq!((s.recovered.count, s.recovered.sats), (1, 3_200));
-        // by_state buckets PURELY by stored state, so both expired rows land here
-        // (6400 funded + 256 un-funded) regardless of the locked/funding gate.
+        // by_state buckets PURELY by state, so both expired rows land here.
         assert_eq!((s.expired.count, s.expired.sats), (2, 6_656));
     }
 
-    /// total_locked_sats = paid + minted + funded-expired (funding sent, not
-    /// recovered); it excludes unpaid (unfunded), recovered (swept out), AND an
-    /// expired row whose funding was never sent.
+    /// total_locked = paid + minted + funded-expired; excludes unpaid, recovered,
+    /// and an expired row whose funding was never sent.
     #[test]
     fn total_locked_excludes_unpaid_and_recovered() {
         let s = Summary::build(&fixture(), None);
-        // 200 + 400 + 800 + 1600 + 6400 = 9400. The un-funded expired 256 is
-        // EXCLUDED (the funding-gated fix) even though it is in the expired state.
+        // 200+400+800+1600+6400 = 9400; un-funded expired 256 EXCLUDED.
         assert_eq!(s.total_locked_sats, 9_400);
-        // Sanity: it is NOT the grand total (which would include unpaid+recovered+
-        // the un-funded expired).
+        // NOT the grand total (which includes unpaid + recovered + un-funded expired).
         let grand: u64 = fixture().iter().map(|d| d.amount).sum();
         assert_eq!(grand, 12_956);
         assert_ne!(s.total_locked_sats, grand);
     }
 
-    /// The locked total is funding-gated, not state-gated: an `Expired` deposit
-    /// with `funding_txid` set counts, an otherwise-identical one with no funding
-    /// does NOT — pinning the money-overcount fix directly.
+    /// Locked is funding-gated, not state-gated: a funded `Expired` counts, an
+    /// identical un-funded one does NOT (the money-overcount fix).
     #[test]
     fn expired_counts_as_locked_only_when_funded() {
         let funded = fund(dep(DepositState::Expired, 5_000, 1_000));
@@ -353,11 +315,11 @@ mod tests {
             only_unfunded.total_locked_sats, 0,
             "un-funded expired holds no locked BTC (the overcount fix)"
         );
-        // It still shows in the expired by_state bucket (a state count, not money).
+        // Still in the expired by_state bucket (a state count, not money).
         assert_eq!((only_unfunded.expired.count, only_unfunded.expired.sats), (1, 5_000));
     }
 
-    /// mintable_now is exactly the paid bucket (funded, not yet minted).
+    /// mintable_now is exactly the paid bucket.
     #[test]
     fn mintable_now_is_the_paid_set() {
         let s = Summary::build(&fixture(), None);
@@ -365,23 +327,17 @@ mod tests {
         assert_eq!(s.mintable_now, s.paid);
     }
 
-    /// With MTP known, recoverable_now selects locked (funding-sent) deposits
-    /// whose ts_expiry <= MTP (and ONLY those — immature locked ones, a recovered
-    /// deposit even if matured, AND a matured-but-un-funded expired row, are all
-    /// excluded).
+    /// recoverable_now selects ONLY locked (funding-sent) deposits with
+    /// ts_expiry <= MTP — immature, recovered, and un-funded rows excluded.
     #[test]
     fn recoverable_now_filters_by_mtp() {
-        // MTP = 2000: matured+locked = paid@1000(200), minted@1500(800),
-        // funded-expired@1200(6400). Immature (ts_expiry 5000/9000) excluded;
-        // recovered@1000 excluded though matured; un-funded expired@1100(256)
-        // excluded though matured (it holds no BTC — the funding-gate fix).
+        // MTP=2000: paid@1000(200) + minted@1500(800) + funded-expired@1200(6400).
         let s = Summary::build(&fixture(), Some(2_000));
         let rb = s.recoverable_now.expect("mtp known => Some");
-        assert_eq!((rb.count, rb.sats), (3, 7_400)); // 200 + 800 + 6400
+        assert_eq!((rb.count, rb.sats), (3, 7_400));
     }
 
-    /// The MTP boundary is inclusive (ts_expiry == MTP is recoverable), matching
-    /// `recover`'s `mtp >= ts_expiry` gate.
+    /// The MTP boundary is inclusive, matching `recover`'s `mtp >= ts_expiry`.
     #[test]
     fn recoverable_now_boundary_is_inclusive() {
         let deps = vec![
@@ -393,9 +349,8 @@ mod tests {
         assert_eq!((rb.count, rb.sats), (1, 10));
     }
 
-    /// MTP unavailable (esplora unreachable) => recoverable_now is None and the
-    /// JSON renders it as null with mtp_available=false; the local-only fields
-    /// (by_state, total_locked, mintable_now) are still fully populated.
+    /// MTP unavailable => recoverable_now is null + mtp_available=false; the
+    /// local-only fields stay fully populated.
     #[test]
     fn mtp_unavailable_degrades_to_null() {
         let s = Summary::build(&fixture(), None);
@@ -404,14 +359,12 @@ mod tests {
         let v = s.to_json();
         assert_eq!(v["mtp_available"], json!(false));
         assert_eq!(v["recoverable_now"], json!(null));
-        // Local-only aggregation is unaffected by the missing chain tip.
         assert_eq!(v["total_locked_sats"], json!(9_400));
         assert_eq!(v["mintable_now"], json!({ "count": 2, "sats": 600 }));
         assert_eq!(v["by_state"]["minted"], json!({ "count": 2, "sats": 2_400 }));
     }
 
-    /// The full success envelope shape with MTP present: schema_version, the
-    /// five by_state buckets, mintable/recoverable objects, mtp_available=true.
+    /// The full success envelope shape with MTP present.
     #[test]
     fn json_envelope_shape_with_mtp() {
         let s = Summary::build(&fixture(), Some(2_000));
@@ -434,7 +387,7 @@ mod tests {
     }
 
     /// An empty ledger is all-zero buckets; with MTP known, recoverable_now is a
-    /// zeroed bucket (NOT null) — null is reserved for "MTP unavailable".
+    /// zeroed bucket, NOT null (null is reserved for MTP-unavailable).
     #[test]
     fn empty_ledger_is_zeroed_not_null() {
         let s = Summary::build(&[], Some(1_000));

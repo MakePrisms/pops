@@ -1,16 +1,8 @@
-//! Cashu-free codec for the `Payment` auth-scheme: the request envelope
-//! (`WWW-Authenticate` side) and the credentials envelope (`Authorization`
-//! side).
+//! Cashu-free codec for the `Payment` auth-scheme (the WASM-targetable layer:
+//! `serde` + `base64`, no `cashu` types).
 //!
-//! This module is the WASM-targetable layer — it touches no `cashu` types,
-//! only `serde` + `base64`. It folds together the former `auth_header`
-//! (credentials parsing) and the wrap/unwrap half of the former `challenge`
-//! (the `request` envelope around a `creqA…` string).
-//!
-//! ## Credentials envelope (`Authorization: Payment <credentials>`)
-//!
-//! The retry credentials are a single opaque token: `auth-scheme` =
-//! `Payment` followed by a base64url-nopad-encoded JSON object:
+//! Credentials envelope (`Authorization: Payment <blob>`): `Payment` + a
+//! base64url-nopad JSON object:
 //!
 //! ```json
 //! {
@@ -25,15 +17,11 @@
 //! }
 //! ```
 //!
-//! Required fields are honoured; optional fields (`source`, `description`,
-//! `opaque`, `digest`, `expires`) are tolerated on the wire but ignored.
+//! Optional fields (`source`, `description`, `opaque`, `digest`, `expires`) are
+//! tolerated on the wire but ignored.
 //!
-//! ## Request envelope (`WWW-Authenticate: Payment … request="…"`)
-//!
-//! The `request` auth-param is a base64url-nopad-encoded JSON blob wrapping
-//! the `creqA…` payment-request under a single `cashu_request` field.
-//! [`encode_request_envelope`] does the wrap; [`decode_request_envelope`]
-//! unwraps it.
+//! Request envelope (`request="…"`): a base64url-nopad JSON blob wrapping the
+//! `creqA…` under a single `cashu_request` field.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -50,12 +38,9 @@ pub const PAYMENT_SCHEME: &str = "Payment";
 /// wire value is lowercase ASCII, so this comparison is case-sensitive.
 pub const CASHU_METHOD: &str = "cashu";
 
-/// Echo of the `WWW-Authenticate` auth-params the client round-trips
-/// from the 402.
-///
-/// All required fields are deserialized; optional fields
-/// (`description`, `opaque`, `digest`, `expires`) are accepted but not
-/// surfaced.
+/// Echo of the `WWW-Authenticate` auth-params the client round-trips from the
+/// 402. Optional fields (`description`, `opaque`, `digest`, `expires`) are
+/// accepted but not surfaced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EchoedChallenge {
     /// Echo of the server-issued challenge id.
@@ -66,28 +51,20 @@ pub struct EchoedChallenge {
     pub method: String,
     /// Echo of the payment intent (we emit `"charge"`).
     pub intent: String,
-    /// Echo of the base64url-encoded method-specific request blob.
+    /// Echo of the method-specific request blob.
     pub request: String,
 }
 
-/// Cashu-method `payload`: the data needed to complete the challenge.
-///
-/// For cashu this is the `cashuB…` token the holder mints from the issuer.
-/// The token's structural validation (prefix, base64, CBOR, proof shape) is
-/// the validator's job; this struct just carries the string out of the JSON
-/// envelope.
+/// Cashu-method `payload`. This struct just carries the token string out of the
+/// JSON; its structural validation is the validator's job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashuPayload {
-    /// The `cashuB…` token string. Forwarded as-is to
-    /// [`crate::challenge::decode_token`].
+    /// The `cashuB…` token, forwarded as-is to [`crate::challenge::decode_token`].
     pub cashu_token: String,
 }
 
-/// Full credentials object.
-///
-/// `challenge` and `payload` are required; `source` and any other extra
-/// fields are tolerated and ignored, so a `source` a client sends
-/// round-trips silently.
+/// Full credentials object. Extra fields (`source`, etc.) are tolerated and
+/// ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentCredentials {
     /// Echo of the WWW-Authenticate auth-params.
@@ -96,11 +73,9 @@ pub struct PaymentCredentials {
     pub payload: CashuPayload,
 }
 
-/// Why an `Authorization: Payment <blob>` header failed to parse.
-///
-/// Every variant maps to a 402 re-challenge in the middleware; they are
-/// distinct enums only to make the response body intelligible to the
-/// client.
+/// Why an `Authorization: Payment <blob>` header failed to parse. Every variant
+/// is a 402 re-challenge in the middleware; distinct only to make the body
+/// intelligible.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthParseError {
     /// First whitespace-separated token is not `Payment`.
@@ -115,12 +90,11 @@ pub enum AuthParseError {
     #[error("Payment credentials are not valid base64url-nopad: {0}")]
     Base64Decode(String),
 
-    /// Base64-decoded bytes are not valid UTF-8 (so cannot be JSON).
+    /// Base64-decoded bytes are not valid UTF-8.
     #[error("Payment credentials are not valid UTF-8: {0}")]
     Utf8Decode(String),
 
-    /// JSON does not parse, or required fields are missing/of the wrong
-    /// shape.
+    /// JSON does not parse, or a required field is missing/wrong-shaped.
     #[error("Payment credentials JSON is malformed: {0}")]
     JsonParse(String),
 
@@ -129,14 +103,10 @@ pub enum AuthParseError {
     WrongMethod(String),
 }
 
-/// Parse an `Authorization: Payment <base64url-nopad-blob>` header and
-/// return the structured credentials.
-///
-/// On success the caller still needs to:
-/// 1. Validate that `credentials.challenge.method == "cashu"` —
-///    `WrongMethod` is surfaced here for any other value.
-/// 2. Decode `credentials.payload.cashu_token` via
-///    [`crate::challenge::decode_token`].
+/// Parse an `Authorization: Payment <base64url-nopad-blob>` header into the
+/// structured credentials. `WrongMethod` is surfaced here for a non-`cashu`
+/// method; the caller still decodes `payload.cashu_token` via
+/// [`crate::challenge::decode_token`].
 pub fn parse_payment_authorization(
     header_value: &str,
 ) -> Result<PaymentCredentials, AuthParseError> {
@@ -145,8 +115,6 @@ pub fn parse_payment_authorization(
         return Err(AuthParseError::UnknownScheme);
     }
 
-    // Split scheme off the first whitespace run; at least one space
-    // separates scheme from credentials.
     let (scheme, rest) = match trimmed.split_once(|c: char| c.is_ascii_whitespace()) {
         Some((s, r)) => (s, r.trim()),
         None => (trimmed, ""),
@@ -160,9 +128,7 @@ pub fn parse_payment_authorization(
         return Err(AuthParseError::MissingCredentials);
     }
 
-    // The credentials blob is base64url without padding. Anything else
-    // (including a legacy key=value param form) trips up the base64
-    // decoder and is rejected.
+    // base64url-nopad only; a legacy key=value param form trips the decoder.
     let bytes = URL_SAFE_NO_PAD
         .decode(rest)
         .map_err(|e| AuthParseError::Base64Decode(e.to_string()))?;
@@ -182,24 +148,18 @@ pub fn parse_payment_authorization(
     Ok(credentials)
 }
 
-/// Helper for tests + downstream consumers: build a credentials blob
-/// (the inverse of [`parse_payment_authorization`]).
-///
-/// Returns the bare base64url-nopad string — the caller is responsible
-/// for prepending `Payment ` to form the full header value.
+/// Build a credentials blob (inverse of [`parse_payment_authorization`]),
+/// returning the bare base64url-nopad string — the caller prepends `Payment `.
 pub fn encode_payment_credentials(credentials: &PaymentCredentials) -> String {
-    // `serde_json::to_string` cannot fail on these owned-String fields,
-    // but we surface a panic via `expect` rather than introduce a
-    // result-typed signature for a path that has no recoverable error.
+    // Serialization of owned-String fields cannot fail; `expect` rather than a
+    // result-typed signature for a non-recoverable path.
     let json = serde_json::to_string(credentials).expect("PaymentCredentials always serializes");
     URL_SAFE_NO_PAD.encode(json.as_bytes())
 }
 
-/// The `WWW-Authenticate: Payment …` auth-params a client receives on a 402,
-/// parsed out for the holder. The inverse of the server's header build.
-///
-/// Cashu-free: the `request` field stays the raw base64url envelope string
-/// (the client unwraps it via [`decode_request_envelope`] to get the `creqA`).
+/// The `WWW-Authenticate: Payment …` auth-params a client receives on a 402.
+/// Cashu-free: `request` stays the raw base64url envelope (the client unwraps it
+/// via [`decode_request_envelope`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentParams {
     /// Server-issued challenge id.
@@ -214,19 +174,13 @@ pub struct PaymentParams {
     pub request: String,
 }
 
-/// Strip exactly ONE matched pair of surrounding double-quotes from an
-/// auth-param value, returning the inner string. Returns `None` (a reject) if
-/// the value is not a well-formed quoted-string:
-///   - not wrapped in quotes at all (`x`),
-///   - only one quote (`"x` / `x"`),
-///   - the bare empty/single `"`,
-///   - or carries an interior `"` (`"x"y"`, `""x""`) — our auth-param values
-///     are base64url-nopad / identifiers and never contain a quote, so any
-///     interior quote means an unbalanced/garbled value.
+/// Strip exactly ONE matched pair of surrounding double-quotes, or `None` (a
+/// reject) if not a well-formed quoted-string: unquoted (`x`), one quote
+/// (`"x`/`x"`), a lone `"`, or an interior `"` (`""x""`). Our values are
+/// base64url/identifiers and never contain a quote, so an interior one is garbled.
 fn strip_quoted(s: &str) -> Option<&str> {
     let inner = s.strip_prefix('"')?.strip_suffix('"')?;
-    // `strip_suffix` on a lone `"` would leave `inner == ""` having consumed the
-    // SAME quote twice — guard by requiring the original to be ≥ 2 bytes.
+    // A lone `"` would let `strip_suffix` consume the SAME quote twice; require ≥ 2 bytes.
     if s.len() < 2 {
         return None;
     }
@@ -236,24 +190,17 @@ fn strip_quoted(s: &str) -> Option<&str> {
     Some(inner)
 }
 
-/// Parse a `WWW-Authenticate: Payment id="…", realm="…", method="…",
-/// intent="…", request="…"` header into its [`PaymentParams`].
-///
-/// Tolerant of the `Payment ` scheme prefix being present or absent, of
-/// surrounding whitespace, and of extra/reordered params (only the five
-/// known fields are surfaced). Values MUST be RFC 7235 quoted-strings — each
-/// of the five known params is wrapped in exactly one matched `"` pair, and an
-/// unquoted or unbalanced value is rejected (not leniently stripped). Returns
-/// [`AuthParseError::JsonParse`] with a descriptive message if a required field
-/// is missing or a present value is unquoted/garbled.
+/// Parse a `WWW-Authenticate: Payment` header into its [`PaymentParams`].
+/// Tolerant of the scheme prefix, whitespace, and extra/reordered params. Values
+/// MUST be RFC 7235 quoted-strings — an unquoted or unbalanced value is rejected
+/// (NOT leniently stripped, which could mis-bind the echoed value); a missing or
+/// garbled field returns [`AuthParseError::JsonParse`].
 pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthParseError> {
     let trimmed = header_value.trim();
 
     // Drop an optional leading `Payment` scheme token.
     let params_str = match trimmed.split_once(|c: char| c.is_ascii_whitespace()) {
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case(PAYMENT_SCHEME) => rest.trim(),
-        // No scheme prefix (or the first token is itself a param) — treat the
-        // whole string as the param list.
         _ => trimmed,
     };
 
@@ -263,8 +210,7 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
     let mut intent = None;
     let mut request = None;
 
-    // Split on commas; each piece is `key="value"`. Commas never appear in
-    // our values (base64url-nopad + identifiers), so a naive split is safe.
+    // Commas never appear in our values, so a naive split is safe.
     for piece in params_str.split(',') {
         let piece = piece.trim();
         if piece.is_empty() {
@@ -274,16 +220,10 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
             continue;
         };
         let key = key.trim();
-        // Only the five known params carry meaning; an unknown key's value is
-        // never inspected, so do not waste a strict-quote check on it.
         if !matches!(key, "id" | "realm" | "method" | "intent" | "request") {
             continue;
         }
-        // RFC 7235 auth-params are quoted-strings: the value MUST be wrapped in
-        // exactly ONE matched pair of double-quotes. Reject an unquoted value
-        // or an unbalanced quote rather than silently `trim_matches('"')` (which
-        // would accept `id=x`, `id="x`, or `id=""x""` alike) — a lenient strip
-        // lets a malformed challenge through and can mis-bind the echoed value.
+        // Strict quoted-string (see `strip_quoted` / the fn doc).
         let val = match strip_quoted(val_raw.trim()) {
             Some(v) => v,
             None => {
@@ -315,19 +255,15 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
     })
 }
 
-/// JSON envelope carried inside the `WWW-Authenticate` `request`
-/// auth-param: a base64url-nopad-encoded object holding the `creqA…`
-/// payment-request under a single `cashu_request` field.
+/// The JSON object inside the `request` auth-param, holding the `creqA…` under a
+/// single `cashu_request` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestEnvelope {
     cashu_request: String,
 }
 
-/// Wrap a `creqA…` string in the `request` envelope and
-/// base64url-nopad-encode it.
-///
-/// The returned string is what goes inside the `request="…"` auth-param
-/// of `WWW-Authenticate: Payment`. Cannot fail.
+/// Wrap a `creqA…` in the `request` envelope, base64url-nopad-encoded. The result
+/// goes inside `request="…"`. Cannot fail.
 pub fn encode_request_envelope(creq_a: &str) -> String {
     let envelope = RequestEnvelope {
         cashu_request: creq_a.to_string(),
@@ -337,11 +273,8 @@ pub fn encode_request_envelope(creq_a: &str) -> String {
     URL_SAFE_NO_PAD.encode(json.as_bytes())
 }
 
-/// Unwrap the base64url-nopad-encoded `request` envelope and return the
-/// inner `cashu_request` string (a `creqA…` payment-request).
-///
-/// Returns an error if the envelope cannot be base64-decoded, is not
-/// valid UTF-8/JSON, or lacks the `cashu_request` field.
+/// Unwrap the `request` envelope, returning the inner `cashu_request` (`creqA…`).
+/// Errors on bad base64 / JSON or a missing `cashu_request`.
 pub fn decode_request_envelope(b64: &str) -> Result<String, Error> {
     let bytes = URL_SAFE_NO_PAD
         .decode(b64.trim())
@@ -354,8 +287,6 @@ pub fn decode_request_envelope(b64: &str) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- credentials envelope (was auth_header) ----------------------
 
     fn make_credentials(method: &str, token: &str) -> PaymentCredentials {
         PaymentCredentials {
@@ -554,8 +485,6 @@ mod tests {
         parse_payment_authorization(&header).expect("extra whitespace tolerated");
     }
 
-    // ---- request envelope (was challenge wrap/unwrap) ----------------
-
     #[test]
     fn request_envelope_roundtrips() {
         let creq = "creqAsomepayload";
@@ -568,8 +497,7 @@ mod tests {
     #[test]
     fn request_envelope_is_base64url_nopad() {
         let envelope = encode_request_envelope("creqAdummy");
-        // base64url-nopad alphabet excludes '+', '/', '='. Confirm none
-        // of those leak through.
+        // base64url-nopad excludes '+', '/', '='.
         for c in envelope.chars() {
             assert!(
                 c.is_ascii_alphanumeric() || c == '-' || c == '_',
@@ -593,8 +521,6 @@ mod tests {
             .expect_err("missing cashu_request");
         assert!(matches!(err, Error::DecodeFailed(_)));
     }
-
-    // ---- WWW-Authenticate param parsing ------------------------------
 
     #[test]
     fn parse_payment_params_extracts_all_five_fields() {
@@ -625,8 +551,7 @@ mod tests {
 
     #[test]
     fn parse_payment_params_rejects_missing_required_field() {
-        // No `request` param.
-        let header = r#"Payment id="x", realm="r", method="cashu", intent="charge""#;
+        let header = r#"Payment id="x", realm="r", method="cashu", intent="charge""#; // no request
         let err = parse_payment_params(header).expect_err("missing request must fail");
         assert!(
             matches!(err, AuthParseError::JsonParse(_)),
@@ -636,8 +561,7 @@ mod tests {
 
     #[test]
     fn parse_payment_params_rejects_unquoted_value() {
-        // `id=x` (no quotes at all) must be rejected, not leniently accepted as
-        // `x` the way `trim_matches('"')` would.
+        // `id=x` must reject, not leniently accept `x` the way trim_matches would.
         let header = r#"Payment id=x, realm="r", method="cashu", intent="charge", request="e""#;
         let err = parse_payment_params(header).expect_err("unquoted id must fail");
         assert!(
@@ -648,7 +572,6 @@ mod tests {
 
     #[test]
     fn parse_payment_params_rejects_unbalanced_trailing_quote() {
-        // `id="x` (missing the closing quote) must be rejected.
         let header = r#"Payment id="x, realm="r", method="cashu", intent="charge", request="e""#;
         let err =
             parse_payment_params(header).expect_err("missing-trailing-quote id must fail");
@@ -657,7 +580,6 @@ mod tests {
 
     #[test]
     fn parse_payment_params_rejects_unbalanced_leading_quote() {
-        // `id=x"` (missing the opening quote) must be rejected.
         let header = r#"Payment id=x", realm="r", method="cashu", intent="charge", request="e""#;
         let err = parse_payment_params(header).expect_err("missing-leading-quote id must fail");
         assert!(matches!(err, AuthParseError::JsonParse(_)), "got {err:?}");
@@ -665,8 +587,7 @@ mod tests {
 
     #[test]
     fn parse_payment_params_rejects_doubled_quotes() {
-        // `id=""x""` — an interior quote means a garbled/unbalanced value; the
-        // strict strip rejects it rather than peeling layers.
+        // `id=""x""` — an interior quote is garbled; the strict strip rejects it.
         let header =
             r#"Payment id=""x"", realm="r", method="cashu", intent="charge", request="e""#;
         let err = parse_payment_params(header).expect_err("doubled-quote id must fail");
@@ -675,9 +596,8 @@ mod tests {
 
     #[test]
     fn parse_payment_params_accepts_empty_quoted_value() {
-        // A properly-quoted EMPTY string `realm=""` is a well-formed
-        // quoted-string and must be accepted (it strips to ``), distinct from an
-        // unquoted/unbalanced value.
+        // `realm=""` is a well-formed quoted-string (strips to ``), distinct from
+        // an unquoted/unbalanced value.
         let header =
             r#"Payment id="x", realm="", method="cashu", intent="charge", request="e""#;
         let params = parse_payment_params(header).expect("empty quoted realm is valid");

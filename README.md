@@ -50,9 +50,8 @@ result, and recovering both tokens on a post-swap failure).
   bindings — install those prebuilt with
   `npm install github:MakePrisms/pops#wasm-pkg` (no toolchain needed).
 - **Let your agent pay automatically** — `pop pay <URL> --token <cashuB>` does the
-  `402` dance and pays a gated endpoint with an exact-amount token (swapping the
-  held pop to the exact charge and returning the change), so an agent driving the
-  `pop` wallet can satisfy the challenge on your behalf.
+  `402` dance for an agent driving the `pop` wallet (see "Use it with your agent"
+  above for the exact-amount / change mechanics).
 - **Mint and recover via the CLI** — lock BTC, get a pop, and reclaim the
   unspent BTC after the CLTV expiry, all from the `pop` command.
 

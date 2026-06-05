@@ -1,11 +1,6 @@
-//! Mint HTTP client — the PoP quote/mint/swap/keyset flows.
-//!
-//! Lifted verbatim (logic-for-logic) from `cdk-pop`'s `pop_test_tool` example
-//! so the wallet drives the EXACT same proven wire format the live mint
-//! expects: quote-create with the NUT-20 lock pubkey + x-only `funder_pubkey`,
-//! poll-until-paid, active-keyset selection, NUT-20-signed blinded outputs,
-//! unblind into proofs. The crypto goes through the same `cdk_common`
-//! primitives the mint verifies against, so the signed message cannot drift.
+//! Mint HTTP client — the PoP quote/mint/swap/keyset flows. The crypto goes
+//! through the same `cdk_common` primitives the mint verifies against, so the
+//! signed message cannot drift from the live mint's expected wire format.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -22,33 +17,30 @@ use cdk_common::{Amount as CdkAmount, SecretKey as CdkSecretKey};
 use crate::error::PopError;
 use crate::signer::Signer;
 
-/// Wire body for `POST /v1/mint/pop`: a NUT-04 `MintRequest` with a string
-/// quote id and a NUT-20 signature.
+/// Wire body for `POST /v1/mint/pop`: a NUT-04 `MintRequest` (string quote id +
+/// NUT-20 signature).
 type PopMintRequest = MintRequest<String>;
 
-/// PoP mint-quote response (`POST`/`GET /v1/mint/quote/pop[/<id>]`).
-///
-/// A custom quote has no `state` field on the wire — the lifecycle is derived
-/// from `amount_paid` vs `amount_issued`. The PoP reconstruction fields
-/// (`nonce`/`internal_key`/`leaf_script`/`funder_pubkey`) arrive flattened.
+/// PoP mint-quote response. A custom quote has NO `state` field on the wire —
+/// the lifecycle is derived from `amount_paid` vs `amount_issued`. The PoP
+/// reconstruction fields arrive flattened.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PopQuoteResponse {
     /// Quote id.
     pub quote: String,
     /// bech32m funding address.
     pub request: String,
-    /// Quoted amount (sats). Echoed by the mint; the wallet drives off its own
-    /// requested amount, so this is kept for wire fidelity / debugging.
+    /// Echoed; the wallet drives off its own requested amount (kept for wire
+    /// fidelity / debugging).
     #[allow(dead_code)]
     pub amount: Option<u64>,
-    /// Amount the mint has credited from on-chain funding.
+    /// Amount credited from on-chain funding.
     #[serde(default)]
     pub amount_paid: u64,
     /// Amount already issued as ecash.
     #[serde(default)]
     pub amount_issued: u64,
-    /// Unit (`pop_<ts>`). Echoed by the mint; the wallet uses its own resolved
-    /// unit, so this is kept for wire fidelity / debugging.
+    /// Echoed; the wallet uses its own resolved unit.
     #[allow(dead_code)]
     pub unit: Option<String>,
     /// Quote expiry (unix seconds).
@@ -85,10 +77,9 @@ struct KeysResponseBody {
     keysets: Vec<KeySet>,
 }
 
-/// Creates a PoP mint quote. Sends the funder's full compressed pubkey as the
-/// NUT-20 lock (`pubkey`) and the x-only pubkey as `funder_pubkey` (the
-/// Bitcoin commitment key). Both derive from the same secret — EXACTLY the
-/// wire format `pop_test_tool quote` uses.
+/// Creates a PoP mint quote. Sends the full compressed pubkey as the NUT-20 lock
+/// (`pubkey`) and the x-only pubkey as `funder_pubkey` (the Bitcoin commitment
+/// key) — both from the same secret.
 ///
 /// # Errors
 ///
@@ -164,21 +155,14 @@ pub async fn get_quote(
     Ok(quote)
 }
 
-/// Polls `GET /v1/mint/quote/pop/<id>` until credited (PAID), the quote
-/// expires, or `timeout` elapses. Mirrors `pop_test_tool::poll_until_paid`.
-///
-/// `funding_address` is used only to populate the `funding_pending` error
-/// details when the poll times out without crediting (still-pending is the
-/// transient, keep-polling case). `network` selects the non-mainnet
-/// `faucet_hint` carried in those same details (None on mainnet).
-///
-/// Progress is logged to STDERR (json mode keeps stdout pure).
+/// Polls `GET /v1/mint/quote/pop/<id>` until credited (PAID), expired, or
+/// `timeout`. `funding_address` + `network` only populate the `funding_pending`
+/// error details (incl. a non-mainnet `faucet_hint`). Progress goes to STDERR.
 ///
 /// # Errors
 ///
-/// - [`PopError::QuoteExpired`] when the quote window closes before credit.
-/// - [`PopError::FundingPending`] when `timeout` elapses with funding still
-///   uncredited (transient — keep polling).
+/// - [`PopError::QuoteExpired`] when the window closes before credit.
+/// - [`PopError::FundingPending`] when `timeout` elapses uncredited (transient).
 /// - [`PopError::MintError`] if the mint reports the quote already issued.
 /// - mint HTTP errors propagate from [`get_quote`].
 pub async fn poll_until_paid(
@@ -225,11 +209,9 @@ pub async fn poll_until_paid(
         if std::time::Instant::now() >= deadline {
             return Err(PopError::FundingPending {
                 address: funding_address.to_string(),
-                // Use the quote's own expiry when known; else 0 (unknown window).
-                expires_at: quote.expiry.unwrap_or(0),
+                expires_at: quote.expiry.unwrap_or(0), // 0 ⇒ unknown window
                 confs_seen: None,
                 confs_required: None,
-                // Non-mainnet: tell the caller where to get test coins. Mainnet → None.
                 faucet_hint: crate::network::faucet_hint(network).map(str::to_string),
             }
             .into());
@@ -244,11 +226,9 @@ pub async fn poll_until_paid(
     }
 }
 
-/// Fetches `/v1/keysets` and returns the full list of [`KeySetInfo`].
-///
-/// The list is needed to resolve a token's SHORT (v2, 16-hex) keyset ids to
-/// their FULL (66-hex) ids ([`Token::proofs`] requires it), and to read the
-/// active keyset's `input_fee_ppk` for the swap fee math.
+/// Fetches `/v1/keysets`. The list resolves a token's SHORT keyset ids to FULL
+/// ids (which [`Token::proofs`] requires) and supplies the active keyset's
+/// `input_fee_ppk` for the swap fee math.
 ///
 /// # Errors
 ///
@@ -351,13 +331,10 @@ pub async fn fetch_keys(
     Ok(keyset.keys)
 }
 
-/// Best-effort DLEQ check on returned blind signatures (missing proof
-/// tolerated, present-but-invalid aborts). Mirrors `pop_test_tool`.
-///
-/// Shared by the issuance ([`mint_token`]) and swap ([`swap`]) paths: a
-/// present-but-invalid DLEQ proof means the mint signed with a key other than
-/// the one it advertised, so the unblinded ecash would be worthless — abort
-/// before treating the signatures as money.
+/// Best-effort DLEQ check on returned blind signatures: a MISSING proof is
+/// tolerated, but a present-but-INVALID one aborts — it means the mint signed
+/// with a key other than the one it advertised, so the unblinded ecash would be
+/// worthless. Shared by [`mint_token`] and [`swap`].
 pub(crate) fn verify_blind_signatures(
     signatures: &[BlindSignature],
     premint_secrets: &PreMintSecrets,
@@ -375,21 +352,13 @@ pub(crate) fn verify_blind_signatures(
     Ok(())
 }
 
-/// Mints the ecash for a PAID quote into a `cashuB` token. Selects the active
-/// keyset, builds NUT-20-signed blinded outputs for the exact amount, posts
-/// `POST /v1/mint/pop`, unblinds, and assembles the token. Mirrors
-/// `pop_test_tool mint` steps 2-8.
+/// Mints the ecash for a PAID quote into a `cashuB` token. NUT-20 signing routes
+/// through the funder [`Signer`] seam (custody stays behind the signer).
 ///
-/// NUT-20 signing is routed through the funder [`Signer`] seam (custody stays
-/// behind the signer): the request is assembled here, then
-/// [`Signer::sign_mint_request`] signs + self-verifies it in place for the
-/// deposit at `funder_index`.
-///
-/// Returns BOTH the assembled [`Token`] AND the raw [`Proofs`] it was built
-/// from. The proofs are returned alongside so the caller can pre-serialize them
-/// for value-recovery BEFORE stringifying the token: the mint has ALREADY issued
-/// the ecash by the time this returns, so if the `cashuB` Display (CBOR) were to
-/// fail, the freshly-issued bearer ecash would survive ONLY as these proofs.
+/// Returns BOTH the [`Token`] AND the raw [`Proofs`] it was built from, so the
+/// caller can pre-serialize the proofs for value-recovery BEFORE stringifying
+/// the token: the mint has ALREADY issued the ecash by the time this returns, so
+/// a failing `cashuB` encode would leave the value surviving ONLY as these proofs.
 ///
 /// # Errors
 ///
@@ -405,11 +374,10 @@ pub async fn mint_token(
 ) -> Result<(Token, Proofs), Box<dyn std::error::Error>> {
     let base = base.trim_end_matches('/');
 
-    // Select the active keyset + fetch its amount->pubkey map.
     let keyset_id = active_keyset_for_unit(http, base, unit).await?;
     let keys = fetch_keys(http, base, &keyset_id).await?;
 
-    // Build blinded outputs (least-proofs power-of-2 split) for `amount`.
+    // Blinded outputs (least-proofs power-of-2 split) for `amount`.
     let amount_cdk = CdkAmount::from(amount);
     let amounts: Vec<u64> = keys.keys().keys().map(|a| a.to_u64()).collect();
     let fee_and_amounts = (0u64, amounts).into();
@@ -417,8 +385,7 @@ pub async fn mint_token(
         PreMintSecrets::random(keyset_id, amount_cdk, &SplitTarget::None, &fee_and_amounts)
             .map_err(|e| format!("failed to build premint secrets: {e}"))?;
 
-    // Assemble the request, then NUT-20-sign (+ self-verify) it through the
-    // signer seam for this deposit's funder index.
+    // NUT-20-sign (+ self-verify) through the signer seam.
     let mut request: PopMintRequest = MintRequest {
         quote: quote_id.to_string(),
         outputs: premint_secrets.blinded_messages(),
@@ -428,7 +395,6 @@ pub async fn mint_token(
         .sign_mint_request(funder_index, &mut request)
         .map_err(|e| format!("NUT-20 sign failed: {e}"))?;
 
-    // POST /v1/mint/pop.
     let mint_url = format!("{base}/v1/mint/pop");
     let resp = http
         .post(&mint_url)
@@ -453,7 +419,6 @@ pub async fn mint_token(
     let mint_response: MintResponse = serde_json::from_str(&text)
         .map_err(|e| format!("mint response parse failed: {e}\nbody: {text}"))?;
 
-    // Unblind into proofs, then assemble the cashuB token.
     verify_blind_signatures(&mint_response.signatures, &premint_secrets, &keys)?;
     let proofs = construct_proofs(
         mint_response.signatures,
@@ -465,37 +430,28 @@ pub async fn mint_token(
 
     let mint_url_typed = MintUrl::from_str(base)
         .map_err(|e| format!("mint url `{base}` is not a valid MintUrl: {e}"))?;
-    // Build the token from a CLONE so the raw proofs can be returned for
-    // value-recovery (the ecash is already issued; if stringify ever fails the
-    // proofs are the only surviving form). `Proof: Clone`, sets are tiny.
+    // Build from a CLONE so the raw proofs can be returned for value-recovery
+    // (sets are tiny).
     let token = Token::new(mint_url_typed, proofs.clone(), None, unit.clone());
     Ok((token, proofs))
 }
 
-/// Performs a NUT-03 swap (`POST /v1/swap`) and unblinds the result into one
-/// proof set PER output bucket, preserving bucket order.
+/// Performs a NUT-03 swap and unblinds into one proof set PER output bucket,
+/// preserving order. The mint returns signatures in the SAME order as the
+/// concatenated `output_buckets`, so this splits them back by length,
+/// DLEQ-verifies each bucket, and unblinds each SEPARATELY (e.g.
+/// `[send_proofs, change_proofs]`).
 ///
-/// `inputs` are the proofs being spent; `output_buckets` is an ordered list of
-/// [`PreMintSecrets`] whose concatenated blinded messages form the swap
-/// `outputs` (e.g. `[send_premint, change_premint]`). The mint returns blind
-/// signatures in the SAME order as the outputs, so this splits them back per
-/// bucket by length, DLEQ-verifies each bucket against its own secrets, and
-/// unblinds each bucket SEPARATELY with its own `rs`/`secrets` — yielding one
-/// `Proofs` per bucket (e.g. `[send_proofs, change_proofs]`).
+/// UNSIGNED NUT-03 (no NUT-20 funder signature — that is a NUT-04 issuance
+/// concept), so it takes no signer and `pay` never loads the wallet seed.
 ///
-/// Swap is UNSIGNED NUT-03: there is no NUT-20 funder signature on a swap
-/// (that is a NUT-04 *mint*/issuance concept), so this takes no signer and the
-/// `pay` flow never loads the wallet seed.
-///
-/// This is a pure wire+crypto primitive — it does NOT enforce the exact-amount
-/// money invariant. The caller ([`crate::commands::pay`]) constructs the buckets
-/// and asserts the send-set sum before treating the output as spendable.
+/// A pure wire+crypto primitive: it does NOT enforce the exact-amount invariant
+/// — the caller ([`crate::commands::pay`]) asserts the send-set sum.
 ///
 /// # Errors
 ///
 /// - [`PopError::MintUnreachable`] / [`PopError::MintError`] on the swap HTTP.
-/// - an error if the mint returns the wrong number of signatures, a DLEQ proof
-///   fails, or unblinding fails.
+/// - an error on a wrong signature count, a failed DLEQ, or failed unblinding.
 pub async fn swap(
     http: &reqwest::Client,
     base: &str,
@@ -505,8 +461,7 @@ pub async fn swap(
 ) -> Result<Vec<Proofs>, Box<dyn std::error::Error>> {
     let base = base.trim_end_matches('/');
 
-    // Concatenate every bucket's blinded messages, in bucket order, into the
-    // single `outputs` vector the mint signs.
+    // Concatenate every bucket's blinded messages, in order, into `outputs`.
     let outputs: Vec<BlindedMessage> = output_buckets
         .iter()
         .flat_map(|b| b.blinded_messages())
@@ -542,8 +497,7 @@ pub async fn swap(
         .into());
     }
 
-    // Split the signatures back into per-bucket slices (same order as outputs),
-    // DLEQ-verify each against its own premint, and unblind each separately.
+    // Split the signatures back per bucket (same order), DLEQ-verify, unblind.
     let mut sigs = swap_response.signatures.into_iter();
     let mut out: Vec<Proofs> = Vec::with_capacity(output_buckets.len());
     for bucket in output_buckets {
@@ -557,19 +511,16 @@ pub async fn swap(
     Ok(out)
 }
 
-/// Sums the sat value of a proof set (saturating — proof amounts are u64 sats
-/// and a PoP token's total is far below `u64::MAX`).
+/// Sums the sat value of a proof set (a PoP total is far below `u64::MAX`).
 pub fn proofs_value(proofs: &[Proof]) -> u64 {
     proofs.iter().map(|p| p.amount.to_u64()).sum()
 }
 
-/// Stringifies a [`Token`] to its `cashuB…` form WITHOUT the `.to_string()`
-/// panic. `Token`'s `Display` (CBOR-encodes via ciborium) can return a
-/// `fmt::Error`; `ToString::to_string` PANICS on that — and on any path where the
-/// mint has ALREADY issued the ecash (the `mint` finish, the `pay` post-swap),
-/// that panic would VAPORIZE already-issued bearer ecash. Writing through
-/// [`std::fmt::Write`] surfaces the error as an `Err` instead, so the caller can
-/// recover the proofs.
+/// Stringifies a [`Token`] to `cashuB…` WITHOUT the `.to_string()` panic:
+/// `Token`'s `Display` can return a CBOR `fmt::Error`, on which `to_string`
+/// PANICS — which on an already-issued path would VAPORIZE bearer ecash. Writing
+/// through [`std::fmt::Write`] surfaces it as an `Err` so the caller recovers the
+/// proofs.
 pub fn token_to_string(token: &Token) -> Result<String, String> {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -577,10 +528,9 @@ pub fn token_to_string(token: &Token) -> Result<String, String> {
     Ok(s)
 }
 
-/// Serializes a proof set to a JSON array string for recovery surfacing (the
-/// wire `Proof` shape: `{amount, id, secret, C, ...}`). Falls back to a
-/// diagnostic placeholder if serde ever fails (it does not for valid proofs) —
-/// this is a last-ditch value-recovery aid, never a hard error.
+/// Serializes a proof set to a JSON array (the wire `Proof` shape) for recovery
+/// surfacing. A last-ditch value-recovery aid: falls back to a diagnostic
+/// placeholder rather than ever erroring.
 pub fn proofs_to_json(proofs: &Proofs) -> String {
     serde_json::to_string(proofs)
         .unwrap_or_else(|e| format!("<proofs unserializable: {e}; {} proof(s)>", proofs.len()))

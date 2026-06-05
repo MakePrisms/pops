@@ -2,9 +2,9 @@
 //!
 //! On every successful charge the gateway appends ONE JSONL line to
 //! `proofs_sink` and `flush()` + `sync_all()`s it to disk BEFORE forwarding the
-//! request upstream (spec refinement #2: a crash between forward and persist
-//! would lose already-consumed proofs = lost operator value). The file is a
-//! WALLET — each `fresh_proofs` value is a spendable `cashuB…` bearer token.
+//! request upstream — a crash between forward and persist would lose
+//! already-consumed proofs = lost operator value. The file is a WALLET: each
+//! `fresh_proofs` value is a spendable `cashuB…` bearer token.
 //!
 //! Serialization is hand-rolled (not `serde_json::to_writer` over a struct)
 //! only to keep the record shape pinned + obvious; the line is valid JSON.
