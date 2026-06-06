@@ -217,18 +217,7 @@ impl Esplora {
         if !status.is_success() {
             return Err(format!("esplora GET {url} returned {status}: {text}").into());
         }
-        let raw: std::collections::HashMap<String, f64> = serde_json::from_str(&text)
-            .map_err(|e| format!("esplora /fee-estimates parse failed: {e}\nbody: {text}"))?;
-        let mut by_target = std::collections::BTreeMap::new();
-        for (k, v) in raw {
-            if let Ok(target) = k.parse::<u32>() {
-                by_target.insert(target, v);
-            }
-        }
-        if by_target.is_empty() {
-            return Err(format!("esplora /fee-estimates: no usable targets\nbody: {text}").into());
-        }
-        Ok(FeeEstimates { by_target })
+        parse_fee_estimates(&text)
     }
 
     /// Broadcasts a raw transaction (hex); returns the body (txid on success).
@@ -266,6 +255,27 @@ impl Esplora {
     }
 }
 
+/// Parse a `/fee-estimates` JSON body (`{ "<target>": <sat/vB>, … }`) into
+/// [`FeeEstimates`], keeping only the numeric `target -> feerate` entries.
+/// Tolerates non-numeric metadata fields: mempool.space appends a `"warning"`
+/// string while deprecating this endpoint, and a strict `HashMap<String, f64>`
+/// would reject the whole body on that field — forcing the conservative fee
+/// fallback even though the estimates themselves are present.
+fn parse_fee_estimates(text: &str) -> Result<FeeEstimates, Box<dyn std::error::Error>> {
+    let raw: std::collections::HashMap<String, serde_json::Value> = serde_json::from_str(text)
+        .map_err(|e| format!("esplora /fee-estimates parse failed: {e}\nbody: {text}"))?;
+    let mut by_target = std::collections::BTreeMap::new();
+    for (k, v) in raw {
+        if let (Ok(target), Some(feerate)) = (k.parse::<u32>(), v.as_f64()) {
+            by_target.insert(target, feerate);
+        }
+    }
+    if by_target.is_empty() {
+        return Err(format!("esplora /fee-estimates: no usable targets\nbody: {text}").into());
+    }
+    Ok(FeeEstimates { by_target })
+}
+
 /// Parsed `/fee-estimates`: confirmation-target-in-blocks -> feerate (sat/vB).
 #[derive(Debug, Clone)]
 pub struct FeeEstimates {
@@ -300,6 +310,32 @@ mod tests {
         FeeEstimates {
             by_target: pairs.iter().copied().collect(),
         }
+    }
+
+    #[test]
+    fn parse_fee_estimates_keeps_numeric_targets() {
+        let fe = parse_fee_estimates(r#"{"1":12.3,"6":4.1,"144":1.0}"#)
+            .expect("plain estimates parse");
+        assert_eq!(fe.pick_feerate(1), 12.3);
+        assert_eq!(fe.pick_feerate(6), 4.1);
+    }
+
+    #[test]
+    fn parse_fee_estimates_tolerates_warning_field() {
+        // mempool.space appends a `"warning"` string when deprecating the
+        // endpoint; the numeric targets MUST still parse (regression: a strict
+        // map rejected the whole body → silent fee fallback to the default).
+        let body = r#"{"1":3.148,"6":2.131,"144":0.737,"warning":"This endpoint is deprecated and will be removed in a future release. Please use /api/v1/fees/recommended"}"#;
+        let fe = parse_fee_estimates(body).expect("warning field must not break the parse");
+        assert_eq!(fe.pick_feerate(1), 3.148);
+        assert_eq!(fe.pick_feerate(6), 2.131);
+    }
+
+    #[test]
+    fn parse_fee_estimates_errors_when_no_numeric_targets() {
+        let err = parse_fee_estimates(r#"{"warning":"deprecated"}"#)
+            .expect_err("no usable targets must error");
+        assert!(err.to_string().contains("no usable targets"), "got: {err}");
     }
 
     #[test]
