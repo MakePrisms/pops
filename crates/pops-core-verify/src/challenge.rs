@@ -1,7 +1,10 @@
 //! The cashu-coupled `creqA` layer (the cashu-free envelopes live in
 //! [`crate::envelope`]). [`encode_challenge`] serializes a [`CashuRequirement`]
-//! into the `creqA…` carried in the 402's `request` auth-param; [`decode_token`]
-//! parses the `cashuB…` token the client returns on retry.
+//! into the opaque `creqA…`; [`encode_charge_request`] wraps it in the
+//! `draft-cashu-charge-01` request object the 402's `request` auth-param carries,
+//! and [`decode_charge_request`] reads that object back (enforcing the
+//! mints-superset over the inner creqA); [`decode_token`] parses the `cashuB…`
+//! token the client returns on retry.
 //!
 //! Transports are left empty (the challenge is in-band) and `nut10` is `None` (a
 //! bearer charge has no spend lock). This module does NOT enforce the `pop_<ts>`
@@ -13,6 +16,9 @@ use cashu::{Amount, MintUrl, Token};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+use crate::envelope::{
+    decode_request_object, encode_request_object, MethodDetails, RequestObject,
+};
 use crate::error::Error;
 
 /// What the verifier requires from a holder (cashu-typed). `single_use` is
@@ -50,13 +56,102 @@ impl CashuRequirement {
     }
 }
 
-/// Encode a [`CashuRequirement`] into the `creqA...` string that becomes the
-/// `cashu_request` field inside the `request` auth-param on a 402 response.
+/// Encode a [`CashuRequirement`] into the `creqA...` string that becomes
+/// `methodDetails.request` inside the `request` auth-param on a 402 response.
 ///
 /// Cannot fail: the CBOR + base64url encoding of these fields is
 /// infallible.
 pub fn encode_challenge(req: &CashuRequirement) -> String {
     req.to_payment_request().to_string()
+}
+
+/// The decoded `draft-cashu-charge-01` request object: the spec amount/unit/mints
+/// (the authoritative source) plus the opaque `creqA…` they were issued with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedChargeRequest {
+    /// Exact amount required.
+    pub amount: Amount,
+    /// Currency unit the proofs must carry.
+    pub unit: CurrencyUnit,
+    /// Mints the verifier accepts (a non-empty superset of the creqA's mints).
+    pub mints: Vec<MintUrl>,
+    /// Optional human-readable description.
+    pub description: Option<String>,
+    /// Optional external correlation id.
+    pub external_id: Option<String>,
+    /// The opaque `creqA…` carried under `methodDetails.request`.
+    pub creq_a: String,
+}
+
+/// Build the `draft-cashu-charge-01` request object for the 402's `request`
+/// auth-param: the spec amount/currency/description plus `methodDetails`
+/// (`{ request: creqA, mints }`). `methodDetails.mints` is the requirement's
+/// accepted set, which IS the creqA's set, so the spec's mints-superset holds by
+/// construction. Returns the base64url-nopad JCS string (`encode_request_object`).
+pub fn encode_charge_request(req: &CashuRequirement) -> String {
+    let object = RequestObject {
+        amount: u64::from(req.amount).to_string(),
+        currency: req.unit.to_string(),
+        description: req.description.clone(),
+        external_id: req.payment_id.clone(),
+        method_details: MethodDetails {
+            request: encode_challenge(req),
+            mints: req.mints.iter().map(|m| m.to_string()).collect(),
+        },
+    };
+    encode_request_object(&object)
+}
+
+/// Decode the 402's `request` auth-param into a [`DecodedChargeRequest`].
+///
+/// Reads the spec amount/currency/mints (the authoritative source per the spec's
+/// Request Schema), then enforces step-conformance against the inner `creqA`:
+/// `methodDetails.mints` MUST be a NON-EMPTY superset of the creqA's mints
+/// (`draft-cashu-charge-01` §Request Schema). A missing/short superset, an
+/// unparseable creqA, or a non-decimal `amount` is a [`Error::DecodeFailed`].
+pub fn decode_charge_request(b64: &str) -> Result<DecodedChargeRequest, Error> {
+    let object = decode_request_object(b64)?;
+
+    let amount_u64: u64 = object.amount.parse().map_err(|e| {
+        Error::DecodeFailed(format!("request amount {:?} is not a decimal: {e}", object.amount))
+    })?;
+    let unit = CurrencyUnit::from_str(&object.currency)
+        .map_err(|e| Error::DecodeFailed(format!("request currency {:?}: {e}", object.currency)))?;
+
+    let mut mints = Vec::with_capacity(object.method_details.mints.len());
+    for m in &object.method_details.mints {
+        mints.push(
+            MintUrl::from_str(m)
+                .map_err(|e| Error::DecodeFailed(format!("methodDetails mint {m:?}: {e}")))?,
+        );
+    }
+
+    // The inner creqA is the ground truth for the accepted mints; methodDetails
+    // MUST be a non-empty superset of it.
+    let creq = PaymentRequest::from_str(&object.method_details.request)
+        .map_err(|e| Error::DecodeFailed(format!("methodDetails.request creqA: {e}")))?;
+    if mints.is_empty() {
+        return Err(Error::DecodeFailed(
+            "methodDetails.mints is empty (spec requires a non-empty superset of the creqA mints)"
+                .to_string(),
+        ));
+    }
+    for cm in &creq.mints {
+        if !mints.contains(cm) {
+            return Err(Error::DecodeFailed(format!(
+                "methodDetails.mints is not a superset of the creqA mints (missing {cm})"
+            )));
+        }
+    }
+
+    Ok(DecodedChargeRequest {
+        amount: Amount::from(amount_u64),
+        unit,
+        mints,
+        description: object.description,
+        external_id: object.external_id,
+        creq_a: object.method_details.request,
+    })
 }
 
 /// Decode the `cashuB…` token the client returns on retry.
@@ -237,5 +332,57 @@ mod tests {
             .expect("request envelope round-trips");
         assert_eq!(unwrapped, creq);
         assert!(unwrapped.starts_with("creqA"));
+    }
+
+    #[test]
+    fn charge_request_roundtrips_through_request_object() {
+        // requirement → spec request object → decoded amount/unit/mints + creqA.
+        let req = sample_requirement();
+        let encoded = encode_charge_request(&req);
+        let decoded = decode_charge_request(&encoded).expect("charge request round-trips");
+        assert_eq!(decoded.amount, req.amount);
+        assert_eq!(decoded.unit, req.unit);
+        assert_eq!(decoded.mints, req.mints);
+        assert_eq!(decoded.description, req.description);
+        assert_eq!(decoded.external_id, req.payment_id);
+        assert!(decoded.creq_a.starts_with("creqA"));
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_mints_subset() {
+        // methodDetails.mints MUST be a superset of the creqA's mints. Hand-build
+        // an object whose creqA names two mints but methodDetails names only one.
+        let req = sample_requirement(); // creqA carries mint1 + mint2
+        let creq = encode_challenge(&req);
+        let object = RequestObject {
+            amount: u64::from(req.amount).to_string(),
+            currency: req.unit.to_string(),
+            description: None,
+            external_id: None,
+            method_details: MethodDetails {
+                request: creq,
+                mints: vec!["https://mint1.example.com".into()], // missing mint2
+            },
+        };
+        let err = decode_charge_request(&encode_request_object(&object))
+            .expect_err("a mints-subset must be rejected");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_empty_mints() {
+        // A requirement with no mints yields an empty methodDetails.mints, which
+        // the spec forbids (must be a non-empty superset).
+        let req = CashuRequirement {
+            unit: CurrencyUnit::Custom("pop_1700000000".to_string()),
+            mints: vec![],
+            amount: Amount::from(5),
+            payment_id: None,
+            description: None,
+            single_use: false,
+        };
+        let encoded = encode_charge_request(&req);
+        let err = decode_charge_request(&encoded).expect_err("empty mints must be rejected");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
     }
 }

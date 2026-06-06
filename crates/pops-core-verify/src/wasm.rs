@@ -3,8 +3,8 @@
 //! Two layers cross the JS boundary here:
 //!
 //! 1. The **envelope codec** the TS client / extension needs — pure `serde` +
-//!    `base64`, secp-free (`parse_payment_params`, `decode_request_envelope`,
-//!    `encode_request_envelope`, `parse_payment_credential`,
+//!    `base64` + JCS, secp-free (`parse_payment_params`, `decode_request_object`,
+//!    `encode_request_object`, `parse_payment_credential`,
 //!    `build_payment_credential`). String-in, string-out; errors thrown as JS
 //!    strings.
 //!
@@ -23,9 +23,10 @@ use wasm_bindgen_futures::future_to_promise;
 use crate::cashu_credential::CashuCredential;
 use crate::redeemer::{ChargeRequirement, Redeemer};
 use crate::envelope::{
-    decode_request_envelope as core_decode_request_envelope, encode_payment_credentials,
-    encode_request_envelope as core_encode_request_envelope, parse_payment_authorization,
-    parse_payment_params as core_parse_payment_params, PaymentCredentials, PAYMENT_SCHEME,
+    decode_request_object as core_decode_request_object, encode_payment_credentials,
+    encode_request_object as core_encode_request_object, parse_payment_authorization,
+    parse_payment_params as core_parse_payment_params, PaymentCredentials, RequestObject,
+    PAYMENT_SCHEME,
 };
 use crate::wasm_mint_client::WasmMintClient;
 
@@ -36,27 +37,29 @@ fn js_err<E: core::fmt::Display>(e: E) -> JsValue {
 
 /// Parse a `WWW-Authenticate: Payment …` header (the 402 challenge the
 /// client receives) into a JSON object `{id, realm, method, intent,
-/// request}`. The `request` stays the raw base64url envelope — unwrap it
-/// with [`decode_request_envelope`].
+/// request}`. The `request` stays the raw base64url request object — decode
+/// it with [`decode_request_object`].
 #[wasm_bindgen]
 pub fn parse_payment_params(www_authenticate: &str) -> Result<String, JsValue> {
     let params = core_parse_payment_params(www_authenticate).map_err(js_err)?;
     serde_json::to_string(&params).map_err(js_err)
 }
 
-/// Unwrap the base64url-nopad `request` envelope and return the inner
-/// `creqA…` payment-request string.
+/// Decode the base64url-nopad `request` auth-param into the JSON
+/// `draft-cashu-charge-01` request object (`{amount, currency, description?,
+/// externalId?, methodDetails:{request, mints}}`).
 #[wasm_bindgen]
-pub fn decode_request_envelope(b64: &str) -> Result<String, JsValue> {
-    core_decode_request_envelope(b64).map_err(js_err)
+pub fn decode_request_object(b64: &str) -> Result<String, JsValue> {
+    let object = core_decode_request_object(b64).map_err(js_err)?;
+    serde_json::to_string(&object).map_err(js_err)
 }
 
-/// Wrap a `creqA…` string in the `request` envelope and base64url-nopad
-/// encode it (what goes inside `request="…"` of `WWW-Authenticate:
-/// Payment`). Infallible.
+/// Encode a JSON `draft-cashu-charge-01` request object as the base64url-nopad
+/// JCS-canonical `request="…"` auth-param value.
 #[wasm_bindgen]
-pub fn encode_request_envelope(creq_a: &str) -> String {
-    core_encode_request_envelope(creq_a)
+pub fn encode_request_object(request_object_json: &str) -> Result<String, JsValue> {
+    let object: RequestObject = serde_json::from_str(request_object_json).map_err(js_err)?;
+    Ok(core_encode_request_object(&object))
 }
 
 /// Parse an `Authorization: Payment <blob>` header (or a bare base64url

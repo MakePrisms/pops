@@ -129,10 +129,14 @@ fn payment_header(token: &str) -> String {
             method: "cashu".into(),
             intent: "charge".into(),
             request: "echoed".into(),
+            digest: None,
+            opaque: None,
+            expires: None,
         },
         payload: CashuPayload {
             cashu_token: token.into(),
         },
+        source: None,
     };
     format!("Payment {}", encode_payment_credentials(&creds))
 }

@@ -29,6 +29,11 @@ thiserror = "1"
 # Pure-Rust, wasm-clean — kept out of the cashu/secp dep so the envelope-only
 # wasm surface stays lean while token_hash is still computable in core.
 sha2 = "0.10"
+# JCS / RFC 8785 canonical JSON for the `request` object and the `Authorization`
+# credential blob (`draft-cashu-charge-01` §Encoding): lexicographic key sort +
+# ECMAScript number formatting, over serde_json. Pure-Rust + wasm-clean (ryu-js
+# for the number serialization), so the envelope codec stays wasm-targetable.
+serde_jcs = "0.1"
 
 # ── native feature deps (off on wasm) ───────────────────────────────────────
 # cdk supplies wallet::{HttpClient, MintConnector} for the real MintClient.
@@ -39,6 +44,10 @@ axum = { version = "0.7", optional = true }
 http = { version = "1", optional = true }
 # uuid v4 generates the per-request challenge `id`.
 uuid = { version = "1", features = ["v4"], optional = true }
+# RFC 3339 parsing + the wall clock for the middleware's `challenge.expires`
+# enforcement and the `Payment-Receipt` timestamp (draft-cashu-charge-01 step 7,
+# §Receipt). Native-only: the wasm surface decodes but does not enforce expiry.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
 
 # ── wasm feature deps (off on native) ───────────────────────────────────────
 wasm-bindgen = { version = "0.2", optional = true }
@@ -57,7 +66,7 @@ getrandom = { version = "0.2", optional = true }
 
 [features]
 default = ["native"]
-native = ["dep:cdk", "dep:axum", "dep:http", "dep:uuid"]
+native = ["dep:cdk", "dep:axum", "dep:http", "dep:uuid", "dep:chrono"]
 # `uuid/js` selects uuid's wasm randomness backend. uuid is pulled
 # TRANSITIVELY by cashu (not just our native dep), and uuid 1.23+ refuses to
 # compile on wasm32 without an explicit randomness feature; `getrandom/js`
