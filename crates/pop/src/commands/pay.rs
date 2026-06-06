@@ -26,14 +26,13 @@ use std::str::FromStr;
 
 use cdk_common::amount::SplitTarget;
 use cdk_common::mint_url::MintUrl;
-use cdk_common::nuts::nut18::PaymentRequest;
 use cdk_common::nuts::{CurrencyUnit, Id, KeySetInfo, Keys, PreMintSecrets, Proofs, Token};
 use cdk_common::Amount as CdkAmount;
 use clap::Parser;
 
 use crate::error::PopError;
 use crate::http402::{
-    decode_request_envelope, encode_payment_credentials, parse_payment_params, CashuPayload,
+    decode_charge_request, encode_payment_credentials, parse_payment_params, CashuPayload,
     EchoedChallenge, PaymentCredentials, PaymentParams,
 };
 use crate::mint_client::{self, proofs_to_json, proofs_value, token_to_string};
@@ -466,46 +465,29 @@ async fn build_exact_payment(
     })
 }
 
-/// Decodes the concrete [`Charge`] from parsed 402 params: unwrap the request
-/// envelope → `creqA` → NUT-18 [`PaymentRequest`], requiring the amount.
+/// Decodes the concrete [`Charge`] from parsed 402 params: read the
+/// `draft-cashu-charge-01` request object (`amount`/`currency`/`methodDetails`),
+/// enforcing its mints-superset over the inner creqA. A 0-sat charge is rejected
+/// before any spend (an exact 0-sat charge is meaningless).
 fn decode_charge_from_params(params: &PaymentParams) -> Result<Charge, Box<dyn std::error::Error>> {
-    let creq_a =
-        decode_request_envelope(&params.request).map_err(|e| PopError::ChallengeParseFailed {
-            reason: format!("request envelope did not decode: {e}"),
+    let decoded =
+        decode_charge_request(&params.request).map_err(|e| PopError::ChallengeParseFailed {
+            reason: format!("request object did not decode: {e}"),
         })?;
-    decode_charge(&creq_a)
-}
-
-/// Parses a `creqA…` payment-request string into a [`Charge`], requiring the
-/// amount (a charge with no amount is unusable — we will not guess).
-pub fn decode_charge(creq_a: &str) -> Result<Charge, Box<dyn std::error::Error>> {
-    let pr = PaymentRequest::from_str(creq_a).map_err(|e| PopError::ChallengeParseFailed {
-        reason: format!("creqA payment request did not decode: {e}"),
-    })?;
-    let amount = pr
-        .amount
-        .ok_or_else(|| PopError::ChallengeParseFailed {
-            reason: "payment request has no amount (PoP charges are exact-amount)".to_string(),
-        })?
-        .to_u64();
-    // Reject a 0-sat charge BEFORE any spend: build_premint(0) yields an EMPTY
-    // send bucket, so a proof-less token would be presented and a non-zero-fee
-    // keyset would burn the swap fee for nothing.
+    let amount = decoded.amount.to_u64();
     if amount == 0 {
         return Err(PopError::ChallengeParseFailed {
             reason: "payment request amount is 0 (a 0-sat exact charge is meaningless)".to_string(),
         }
         .into());
     }
-    let unit = pr.unit.ok_or_else(|| PopError::ChallengeParseFailed {
-        reason: "payment request has no unit".to_string(),
-    })?;
     Ok(Charge {
         amount,
-        unit,
-        mints: pr.mints,
+        unit: decoded.unit,
+        mints: decoded.mints,
     })
 }
+
 
 /// Validates the held token against the charge BEFORE any spend: matching unit,
 /// an accepted mint, and enough value. Any mismatch → a structured error and
@@ -603,7 +585,9 @@ fn build_premint(
 }
 
 /// Builds the `Authorization: Payment` credentials: a VERBATIM echo of the
-/// parsed challenge params, plus the exact-amount token as the cashu payload.
+/// parsed challenge params, plus the exact-amount token as the cashu payload. The
+/// 402 carries no `digest`/`opaque`/`expires` (binding is server-deferred), so
+/// those echo fields and the optional `source` are `None`.
 pub fn build_credentials(params: &PaymentParams, cashu_token: &str) -> PaymentCredentials {
     PaymentCredentials {
         challenge: EchoedChallenge {
@@ -612,10 +596,14 @@ pub fn build_credentials(params: &PaymentParams, cashu_token: &str) -> PaymentCr
             method: params.method.clone(),
             intent: params.intent.clone(),
             request: params.request.clone(),
+            digest: None,
+            opaque: None,
+            expires: None,
         },
         payload: CashuPayload {
             cashu_token: cashu_token.to_string(),
         },
+        source: None,
     }
 }
 
@@ -715,8 +703,8 @@ fn emit_paid(
 mod tests {
     use super::*;
     use crate::http402::encode_payment_credentials;
-    use pops_core_verify::challenge::{encode_challenge, CashuRequirement};
-    use pops_core_verify::envelope::{encode_request_envelope, parse_payment_authorization};
+    use pops_core_verify::challenge::{encode_charge_request, CashuRequirement};
+    use pops_core_verify::envelope::parse_payment_authorization;
 
     fn pop_unit() -> CurrencyUnit {
         CurrencyUnit::Custom("pop_1782668279".to_string())
@@ -853,50 +841,49 @@ mod tests {
         assert_eq!(d["need"], serde_json::json!(600));
     }
 
-    // ---- charge decode requires an amount --------------------------------
+    // ---- request-object decode (the client's 402 parse surface) ----------
 
-    #[test]
-    fn decode_charge_reads_amount_unit_mints() {
+    /// Build the parsed `PaymentParams` for a charge of `amount`, as the client
+    /// sees them off a 402 carrying the spec request object.
+    fn params_for_charge(amount: u64) -> PaymentParams {
         let req = CashuRequirement {
             unit: pop_unit(),
             mints: vec![mint_a()],
-            amount: cdk_common::Amount::from(777),
+            amount: cdk_common::Amount::from(amount),
             payment_id: Some("ch-1".to_string()),
             description: None,
             single_use: true,
         };
-        let creq = encode_challenge(&req);
-        let c = decode_charge(&creq).unwrap();
+        let request = encode_charge_request(&req);
+        let header = format!(
+            r#"Payment id="ch-1", realm="pops", method="cashu", intent="charge", request="{request}""#
+        );
+        parse_payment_params(&header).expect("parses params")
+    }
+
+    #[test]
+    fn decode_charge_from_params_reads_amount_unit_mints() {
+        let c = decode_charge_from_params(&params_for_charge(777)).unwrap();
         assert_eq!(c.amount, 777);
         assert_eq!(c.unit, pop_unit());
         assert_eq!(c.mints, vec![mint_a()]);
     }
 
     #[test]
-    fn decode_charge_rejects_missing_amount() {
-        let pr = PaymentRequest {
-            payment_id: None,
-            amount: None,
-            unit: Some(pop_unit()),
-            single_use: Some(false),
-            mints: vec![mint_a()],
-            description: None,
-            transports: vec![],
-            nut10: None,
-        };
-        let creq = pr.to_string();
-        let err = decode_charge(&creq).unwrap_err();
+    fn decode_charge_from_params_rejects_zero_amount() {
+        // A 0-sat exact charge is meaningless and must be rejected before any spend.
+        let err = decode_charge_from_params(&params_for_charge(0)).unwrap_err();
         assert_eq!(
             crate::error::from_boxed(err).code(),
             "challenge_parse_failed"
         );
     }
 
-    // ---- envelope round-trip: 402 header -> params -> creqA -> credentials -
+    // ---- envelope round-trip: 402 header -> params -> request object -> credentials -
 
     #[test]
     fn full_envelope_roundtrip_402_to_credentials() {
-        // Server: build a creqA → request envelope → WWW-Authenticate header.
+        // Server: build the spec request object → WWW-Authenticate header.
         let req = CashuRequirement {
             unit: pop_unit(),
             mints: vec![mint_a()],
@@ -905,10 +892,9 @@ mod tests {
             description: None,
             single_use: true,
         };
-        let creq = encode_challenge(&req);
-        let env = encode_request_envelope(&creq);
+        let request = encode_charge_request(&req);
         let header = format!(
-            r#"Payment id="ch-42", realm="pops", method="cashu", intent="charge", request="{env}""#
+            r#"Payment id="ch-42", realm="pops", method="cashu", intent="charge", request="{request}""#
         );
 
         // Client: parse params back out.
@@ -926,7 +912,7 @@ mod tests {
         assert_eq!(creds.challenge.realm, "pops");
         assert_eq!(creds.challenge.method, "cashu");
         assert_eq!(creds.challenge.intent, "charge");
-        assert_eq!(creds.challenge.request, env, "request echoed verbatim");
+        assert_eq!(creds.challenge.request, request, "request echoed verbatim");
         assert_eq!(creds.payload.cashu_token, "cashuBexampletoken");
 
         // Parse the blob as the GATEWAY would (proves the wire round-trips

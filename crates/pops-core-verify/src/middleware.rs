@@ -3,16 +3,20 @@
 //! [`axum::middleware::from_fn_with_state`].
 //!
 //! Flow: a request without `Authorization: Payment <blob>` gets a 402 carrying a
-//! `WWW-Authenticate: Payment` challenge (whose `request="…"` wraps the
-//! [`CashuRequirement`][crate::challenge::CashuRequirement] `creqA`). The client
-//! retries with the credentials blob; the middleware verify+redeems through the
-//! generic [`Redeemer`] seam and, on success, attaches the
-//! [`Redeemed`][crate::redeemer::Redeemed] to `request.extensions_mut()`.
+//! `WWW-Authenticate: Payment` challenge (whose `request="…"` is the
+//! `draft-cashu-charge-01` request object built from the
+//! [`CashuRequirement`][crate::challenge::CashuRequirement]). The client retries
+//! with the credentials blob; the middleware verify+redeems through the generic
+//! [`Redeemer`] seam and, on success, attaches the
+//! [`Redeemed`][crate::redeemer::Redeemed] to `request.extensions_mut()` and
+//! emits a `Payment-Receipt` (`draft-cashu-charge-01` §Receipt).
 //!
-//! Status mapping: ANY validation failure (bad header/token, wrong
-//! unit/mint/amount, refused swap) → 402 + a fresh re-challenge (plain-text body
-//! naming the reason); ONLY transport failures to reach the mint → 503. Every
-//! 402 carries `Cache-Control: no-store`.
+//! Status mapping (`draft-cashu-charge-01` §Errors): a verification or
+//! malformed-credential failure → 402 + a fresh re-challenge; a transport
+//! failure to reach the mint → 503; a malformed request frame → 400. Every error
+//! body is RFC-9457 `application/problem+json` carrying the spec problem-type.
+//! Every 402 carries `Cache-Control: no-store`; the 200 carries
+//! `Cache-Control: private`.
 
 use std::sync::Arc;
 
@@ -21,17 +25,20 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use chrono::{DateTime, Utc};
 use http::{header::HeaderValue, StatusCode};
 use pops_core_types::ChargeError;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use crate::cdk_mint_client::CdkMintClient;
-use crate::challenge::{encode_challenge, CashuRequirement};
-use crate::redeemer::Redeemer;
+use crate::challenge::{encode_charge_request, CashuRequirement};
+use crate::redeemer::{Redeemed, Redeemer};
 use crate::envelope::{
-    encode_request_envelope, parse_payment_authorization, AuthParseError, EchoedChallenge,
-    PAYMENT_SCHEME,
+    parse_payment_authorization, AuthParseError, EchoedChallenge, CASHU_METHOD, PAYMENT_SCHEME,
 };
 
 /// Default `realm` emitted in `WWW-Authenticate: Payment`. Operator-defined;
@@ -92,22 +99,38 @@ where
     let header_value = match header_raw.to_str() {
         Ok(v) => v,
         Err(_) => {
-            return challenge_response(
+            return charge_error_to_response(
+                ChargeError::MalformedCredential(
+                    "invalid Authorization header encoding".to_string(),
+                ),
                 &ctx.requirement,
-                Some("invalid Authorization header encoding"),
             );
         }
     };
 
     // `UnknownScheme` (Basic/Bearer/…) is control-flow-identical to no header at
-    // all; every OTHER parse error is a validation failure → 402 re-challenge.
+    // all; every OTHER parse error is a malformed credential → 402 re-challenge
+    // (`draft-cashu-charge-01` §Errors `malformed-credential`).
     let credentials = match parse_payment_authorization(header_value) {
         Ok(c) => c,
         Err(AuthParseError::UnknownScheme) => {
             return challenge_response(&ctx.requirement, None);
         }
-        Err(e) => return challenge_response(&ctx.requirement, Some(&e.to_string())),
+        Err(e) => {
+            return charge_error_to_response(
+                ChargeError::MalformedCredential(e.to_string()),
+                &ctx.requirement,
+            )
+        }
     };
+
+    // Step 7: an echoed `challenge.expires` in the PAST is a `payment-expired`,
+    // caught BEFORE any swap.
+    if let Some(expires) = &credentials.challenge.expires {
+        if challenge_is_expired(expires) {
+            return charge_error_to_response(ChargeError::ChallengeExpired, &ctx.requirement);
+        }
+    }
 
     // Verify + redeem via the generic seam; the `ChargeError` variant decides the
     // status (see `charge_error_to_response`).
@@ -121,28 +144,181 @@ where
         Err(e) => return charge_error_to_response(e, &ctx.requirement),
     };
 
+    // The receipt facts come from the redeemed proofs + the echoed challenge id;
+    // `externalId` is the issuance-side correlation id (the requirement's).
+    let receipt_header = payment_receipt_header(
+        &redeemed,
+        &credentials.challenge.id,
+        ctx.requirement.payment_id.as_deref(),
+    );
+
     // Downstream reads this via `Extension<Redeemed>`.
     req.extensions_mut().insert(redeemed);
-    next.run(req).await
+    let mut response = next.run(req).await;
+
+    // `Payment-Receipt` + `Cache-Control: private` ride the settled response
+    // (`draft-cashu-charge-01` §Receipt). `from_str`/`from_static` are guarded:
+    // a header that won't build is dropped rather than failing the served route.
+    if let Ok(value) = HeaderValue::from_str(&receipt_header) {
+        response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, value);
+    }
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("private"),
+    );
+    response
+}
+
+/// The `Payment-Receipt` response-header name (`draft-cashu-charge-01`
+/// §Receipt).
+const PAYMENT_RECEIPT_HEADER: http::header::HeaderName =
+    http::header::HeaderName::from_static("payment-receipt");
+
+/// The problem-type URI prefix the spec uses for its cashu problem-types
+/// (`draft-cashu-charge-01` §Errors).
+const PROBLEM_TYPE_PREFIX: &str = "cashu/";
+
+/// The `Payment-Receipt` JSON (`draft-cashu-charge-01` §Receipt). `reference` is
+/// the redeemed `token_hash` (a settlement id exposing no secret); `externalId`
+/// is omitted when absent.
+#[derive(Debug, Serialize)]
+struct PaymentReceipt<'a> {
+    method: &'a str,
+    #[serde(rename = "challengeId")]
+    challenge_id: &'a str,
+    reference: &'a str,
+    status: &'a str,
+    timestamp: String,
+    #[serde(rename = "externalId", skip_serializing_if = "Option::is_none")]
+    external_id: Option<&'a str>,
+}
+
+/// An RFC-9457 `application/problem+json` body (`draft-cashu-charge-01` §Errors).
+#[derive(Debug, Serialize)]
+struct Problem {
+    #[serde(rename = "type")]
+    type_uri: String,
+    title: String,
+    status: u16,
+    detail: String,
+}
+
+/// Build the `Payment-Receipt` header value: base64url-nopad over the receipt
+/// JSON. `challenge_id` echoes the credential's challenge `id`; `external_id`
+/// rides the receipt iff the issuance carried a correlation id.
+fn payment_receipt_header(
+    redeemed: &Redeemed,
+    challenge_id: &str,
+    external_id: Option<&str>,
+) -> String {
+    let receipt = PaymentReceipt {
+        method: CASHU_METHOD,
+        challenge_id,
+        reference: &redeemed.proofs.token_hash,
+        status: "success",
+        timestamp: Utc::now().to_rfc3339(),
+        external_id,
+    };
+    let json = serde_json::to_string(&receipt).expect("PaymentReceipt always serializes");
+    URL_SAFE_NO_PAD.encode(json.as_bytes())
+}
+
+/// Whether an echoed RFC-3339 `expires` is in the past against the wall clock
+/// (`draft-cashu-charge-01` step 7). An UNPARSEABLE timestamp is treated as
+/// expired — a malformed echo is not a faithful challenge echo.
+fn challenge_is_expired(expires: &str) -> bool {
+    match DateTime::parse_from_rfc3339(expires) {
+        Ok(ts) => ts.with_timezone(&Utc) <= Utc::now(),
+        Err(_) => true,
+    }
+}
+
+/// The spec problem-type slug, RFC-9457 `title`, and HTTP status for a
+/// [`ChargeError`] (`draft-cashu-charge-01` §Errors — the per-variant docs on
+/// `ChargeError` name these). The slug is bare (no `cashu/`); `problem_for`
+/// prepends the prefix.
+fn problem_parts(e: &ChargeError) -> (&'static str, &'static str, StatusCode) {
+    match e {
+        ChargeError::MintUnreachable { .. } => (
+            "mint-unavailable",
+            "Mint unavailable",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        ChargeError::AmountMismatch { .. } => (
+            "payment-insufficient",
+            "Payment insufficient",
+            StatusCode::PAYMENT_REQUIRED,
+        ),
+        ChargeError::WrongUnit { .. }
+        | ChargeError::MintNotAllowed { .. }
+        | ChargeError::MultiMintOrUnit
+        | ChargeError::LockedToken
+        | ChargeError::DleqInvalid { .. }
+        | ChargeError::ShortKeysetIdUnresolved { .. }
+        | ChargeError::DoubleSpend => (
+            "verification-failed",
+            "Verification failed",
+            StatusCode::PAYMENT_REQUIRED,
+        ),
+        ChargeError::Expired | ChargeError::ChallengeExpired => (
+            "payment-expired",
+            "Payment expired",
+            StatusCode::PAYMENT_REQUIRED,
+        ),
+        ChargeError::InvalidChallenge => (
+            "invalid-challenge",
+            "Invalid challenge",
+            StatusCode::PAYMENT_REQUIRED,
+        ),
+        ChargeError::MalformedCredential(_) | ChargeError::TooManyProofs { .. } => (
+            "malformed-credential",
+            "Malformed credential",
+            StatusCode::PAYMENT_REQUIRED,
+        ),
+        ChargeError::MalformedRequest(_) => (
+            "invalid-challenge",
+            "Malformed request",
+            StatusCode::BAD_REQUEST,
+        ),
+        // `#[non_exhaustive]`: an unmodelled future variant degrades to a
+        // conservative 402 verification-failed.
+        _ => (
+            "verification-failed",
+            "Verification failed",
+            StatusCode::PAYMENT_REQUIRED,
+        ),
+    }
+}
+
+/// Build the RFC-9457 [`Problem`] + its status for a [`ChargeError`].
+fn problem_for(e: &ChargeError) -> (Problem, StatusCode) {
+    let (slug, title, status) = problem_parts(e);
+    let problem = Problem {
+        type_uri: format!("{PROBLEM_TYPE_PREFIX}{slug}"),
+        title: title.to_string(),
+        status: status.as_u16(),
+        detail: e.to_string(),
+    };
+    (problem, status)
 }
 
 /// Build a 402 carrying a fresh challenge (always `Cache-Control: no-store`).
-/// `failure_reason`, when set, becomes the body so the client sees why the
-/// previous attempt failed; a bare "no attempt yet" 402 gets an empty body.
-fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&str>) -> Response {
+/// `problem`, when set, is the RFC-9457 `application/problem+json` body naming
+/// why the previous attempt failed; a bare "no attempt yet" 402 has an empty
+/// body.
+fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>) -> Response {
     // A random UUIDv4 `id` suffices; stateless binding (id as an HMAC over the
     // challenge params) is a deliberate non-goal for v1.
     let id = Uuid::new_v4().to_string();
 
-    let creq_a = encode_challenge(requirement);
-    let request_envelope = encode_request_envelope(&creq_a);
+    let request = encode_charge_request(requirement);
 
     // TODO(operator-configurable): wire `realm` through middleware state.
     let realm = DEFAULT_REALM;
 
     let header = format!(
         r#"{} id="{}", realm="{}", method="cashu", intent="{}", request="{}""#,
-        PAYMENT_SCHEME, id, realm, INTENT_CHARGE, request_envelope,
+        PAYMENT_SCHEME, id, realm, INTENT_CHARGE, request,
     );
 
     // Values are all ASCII-printable; the `from_str` validation is a
@@ -160,34 +336,64 @@ fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&st
 
     let cache_control = HeaderValue::from_static("no-store");
 
-    let body = failure_reason.unwrap_or("").to_string();
+    match problem {
+        Some(p) => {
+            let body = serde_json::to_string(p).expect("Problem always serializes");
+            (
+                StatusCode::PAYMENT_REQUIRED,
+                [
+                    (http::header::WWW_AUTHENTICATE, www_auth),
+                    (http::header::CACHE_CONTROL, cache_control),
+                    (
+                        http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/problem+json"),
+                    ),
+                ],
+                body,
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                (http::header::WWW_AUTHENTICATE, www_auth),
+                (http::header::CACHE_CONTROL, cache_control),
+            ],
+            String::new(),
+        )
+            .into_response(),
+    }
+}
 
+/// Map a [`ChargeError`] to an HTTP response with an RFC-9457
+/// `application/problem+json` body (`draft-cashu-charge-01` §Errors). The three
+/// non-collapsing concerns drive the status: `MintUnreachable` is 503 (transport,
+/// token NOT consumed, NEVER a 402); `MalformedRequest` is 400 (not a well-formed
+/// payment attempt); everything else (verification / malformed-credential) is a
+/// 402 with a fresh re-challenge. The 402 carries the problem body alongside the
+/// fresh `WWW-Authenticate`; a 503/400 carries the problem body with
+/// `Cache-Control: no-store`.
+fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
+    let (problem, status) = problem_for(&e);
+    if status == StatusCode::PAYMENT_REQUIRED {
+        return challenge_response(requirement, Some(&problem));
+    }
+    let body = serde_json::to_string(&problem).expect("Problem always serializes");
     (
-        StatusCode::PAYMENT_REQUIRED,
+        status,
         [
-            (http::header::WWW_AUTHENTICATE, www_auth),
-            (http::header::CACHE_CONTROL, cache_control),
+            (
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/problem+json"),
+            ),
+            (
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            ),
         ],
         body,
     )
         .into_response()
-}
-
-/// Map a [`ChargeError`] to an HTTP response. The three non-collapsing concerns
-/// drive the status (the 402 body is the Display string; every 402 is no-store):
-/// `MintUnreachable` → 503 (transport, token NOT consumed, NEVER a 402),
-/// `MalformedRequest` → 400 (not a well-formed payment attempt), everything else
-/// (verification / malformed-credential) → 402 + fresh re-challenge.
-fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
-    match &e {
-        ChargeError::MintUnreachable { .. } => {
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
-        ChargeError::MalformedRequest(_) => {
-            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
-        }
-        _ => challenge_response(requirement, Some(&e.to_string())),
-    }
 }
 
 /// Pluck the echoed challenge fields out of a parsed credentials blob — for test
@@ -399,11 +605,15 @@ mod tests {
                 realm: DEFAULT_REALM.into(),
                 method: "cashu".into(),
                 intent: INTENT_CHARGE.into(),
-                request: "echoed-request-envelope".into(),
+                request: "echoed-request-object".into(),
+                digest: None,
+                opaque: None,
+                expires: None,
             },
             payload: CashuPayload {
                 cashu_token: token.into(),
             },
+            source: None,
         };
         format!("Payment {}", encode_payment_credentials(&creds))
     }
@@ -502,9 +712,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn www_authenticate_request_is_base64url_nopad_envelope() {
-        // The `request` param round-trips back to a creqA payload.
-        use crate::envelope::decode_request_envelope;
+    async fn www_authenticate_request_is_spec_request_object() {
+        // The `request` param decodes as the draft-cashu-charge-01 request object
+        // (amount/currency/mints + the inner creqA), with the mints-superset
+        // satisfied.
+        use crate::challenge::decode_charge_request;
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app.oneshot(bare_request()).await.expect("oneshot");
         let header = www_authenticate(&response);
@@ -512,10 +724,14 @@ mod tests {
         let after = &header[start + r#"request=""#.len()..];
         let end = after.find('"').expect("terminated request param");
         let request_value = &after[..end];
-        let creq_a = decode_request_envelope(request_value).expect("decodes envelope");
+        let decoded = decode_charge_request(request_value).expect("decodes request object");
+        assert_eq!(decoded.amount, cashu::Amount::from(10));
+        assert_eq!(decoded.unit, pop_unit());
+        assert_eq!(decoded.mints, vec![mint_a()]);
         assert!(
-            creq_a.starts_with("creqA"),
-            "envelope must wrap a creqA payload, got: {creq_a}"
+            decoded.creq_a.starts_with("creqA"),
+            "methodDetails.request must be a creqA, got: {}",
+            decoded.creq_a
         );
     }
 
@@ -572,10 +788,14 @@ mod tests {
                 method: "cashu".into(),
                 intent: INTENT_CHARGE.into(),
                 request: "echoed-request".into(),
+                digest: None,
+                opaque: None,
+                expires: None,
             },
             payload: CashuPayload {
                 cashu_token: encoded,
             },
+            source: None,
         };
         let header = format!("Payment {}", encode_payment_credentials(&creds));
 
@@ -920,10 +1140,14 @@ mod tests {
                 method: "tempo".into(),
                 intent: "charge".into(),
                 request: "r".into(),
+                digest: None,
+                opaque: None,
+                expires: None,
             },
             payload: CashuPayload {
                 cashu_token: "cashuBabc".into(),
             },
+            source: None,
         };
         let header = format!("Payment {}", encode_payment_credentials(&creds));
 

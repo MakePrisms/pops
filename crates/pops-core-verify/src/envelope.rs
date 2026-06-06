@@ -1,8 +1,8 @@
 //! Cashu-free codec for the `Payment` auth-scheme (the WASM-targetable layer:
-//! `serde` + `base64`, no `cashu` types).
+//! `serde` + `base64` + JCS, no `cashu` types).
 //!
 //! Credentials envelope (`Authorization: Payment <blob>`): `Payment` + a
-//! base64url-nopad JSON object:
+//! base64url-nopad encoding of the JCS-canonical (RFC 8785) bytes of:
 //!
 //! ```json
 //! {
@@ -17,11 +17,17 @@
 //! }
 //! ```
 //!
-//! Optional fields (`source`, `description`, `opaque`, `digest`, `expires`) are
-//! tolerated on the wire but ignored.
+//! The credential blob is JCS-canonical (`draft-cashu-charge-01` §Encoding); the
+//! inner `request` echo and `cashu_token` strings are opaque (not
+//! re-canonicalized). The echoed `challenge` carries optional `digest`/`opaque`/
+//! `expires` (present iff the 402 carried them) and an optional top-level
+//! `source`; the parser tolerates these and any further unknown fields.
 //!
-//! Request envelope (`request="…"`): a base64url-nopad JSON blob wrapping the
-//! `creqA…` under a single `cashu_request` field.
+//! Request object (`request="…"`): a base64url-nopad encoding of the JCS-canonical
+//! bytes of the `draft-cashu-charge-01` request schema —
+//! `{ amount, currency, description?, externalId?, methodDetails: { request, mints } }`
+//! — where `methodDetails.request` is the opaque `creqA…` and `methodDetails.mints`
+//! is the non-empty superset of the creqA's accepted mints.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -39,8 +45,9 @@ pub const PAYMENT_SCHEME: &str = "Payment";
 pub const CASHU_METHOD: &str = "cashu";
 
 /// Echo of the `WWW-Authenticate` auth-params the client round-trips from the
-/// 402. Optional fields (`description`, `opaque`, `digest`, `expires`) are
-/// accepted but not surfaced.
+/// 402 (`draft-cashu-charge-01` steps 4-6). The client echoes `digest`, `opaque`,
+/// and `expires` iff the 402 carried them; each is `None` (and absent on the
+/// JCS-canonical wire) otherwise. Any further unknown field is tolerated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EchoedChallenge {
     /// Echo of the server-issued challenge id.
@@ -53,6 +60,17 @@ pub struct EchoedChallenge {
     pub intent: String,
     /// Echo of the method-specific request blob.
     pub request: String,
+    /// Echo of the optional challenge digest, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Echo of the optional server opaque, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque: Option<String>,
+    /// Echo of the optional challenge expiry (RFC 3339), present iff the 402
+    /// carried it. The verifier rejects an echo whose `expires` is in the past
+    /// (`draft-cashu-charge-01` step 7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
 }
 
 /// Cashu-method `payload`. This struct just carries the token string out of the
@@ -63,14 +81,19 @@ pub struct CashuPayload {
     pub cashu_token: String,
 }
 
-/// Full credentials object. Extra fields (`source`, etc.) are tolerated and
-/// ignored.
+/// Full credentials object (`draft-cashu-charge-01` §Credential). The top-level
+/// `source` is optional (tolerated, MUST NOT be required); any further unknown
+/// field is tolerated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentCredentials {
     /// Echo of the WWW-Authenticate auth-params.
     pub challenge: EchoedChallenge,
     /// Method-specific payload (cashu = `{ "cashu_token": "..." }`).
     pub payload: CashuPayload,
+    /// Optional client-supplied source identifier; absent on the wire when
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Why an `Authorization: Payment <blob>` header failed to parse. Every variant
@@ -150,10 +173,12 @@ pub fn parse_payment_authorization(
 
 /// Build a credentials blob (inverse of [`parse_payment_authorization`]),
 /// returning the bare base64url-nopad string — the caller prepends `Payment `.
+/// The bytes are JCS-canonical (`draft-cashu-charge-01` §Encoding).
 pub fn encode_payment_credentials(credentials: &PaymentCredentials) -> String {
     // Serialization of owned-String fields cannot fail; `expect` rather than a
     // result-typed signature for a non-recoverable path.
-    let json = serde_json::to_string(credentials).expect("PaymentCredentials always serializes");
+    let json =
+        serde_jcs::to_string(credentials).expect("PaymentCredentials always serializes");
     URL_SAFE_NO_PAD.encode(json.as_bytes())
 }
 
@@ -255,15 +280,71 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
     })
 }
 
-/// The JSON object inside the `request` auth-param, holding the `creqA…` under a
-/// single `cashu_request` field.
+/// Cashu method-details of the request object (`draft-cashu-charge-01` §Request
+/// Schema): the opaque `creqA…` and the non-empty superset of the creqA's
+/// accepted mints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MethodDetails {
+    /// The opaque `creqA…` payment-request string.
+    pub request: String,
+    /// Mints the verifier accepts — a non-empty superset of the creqA's mints.
+    pub mints: Vec<String>,
+}
+
+/// The `request` auth-param object (`draft-cashu-charge-01` §Request Schema).
+/// `amount` is the canonical decimal string and `currency` is the unit; the
+/// cashu specifics live under `methodDetails`. Carried base64url-nopad over its
+/// JCS-canonical bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestObject {
+    /// Exact amount required, as a decimal string.
+    pub amount: String,
+    /// Currency unit the proofs must carry (`pop_<unix_ts>` for PoP).
+    pub currency: String,
+    /// Optional human-readable description; absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional external correlation id; absent on the wire when `None`.
+    #[serde(default, rename = "externalId", skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    /// Cashu method-specific details (the creqA + accepted mints).
+    #[serde(rename = "methodDetails")]
+    pub method_details: MethodDetails,
+}
+
+/// Encode a [`RequestObject`] as the `request="…"` auth-param: base64url-nopad
+/// over its JCS-canonical bytes (`draft-cashu-charge-01` §Encoding). Cannot fail
+/// (the owned-`String` fields always serialize).
+pub fn encode_request_object(object: &RequestObject) -> String {
+    let json = serde_jcs::to_string(object).expect("RequestObject always serializes");
+    URL_SAFE_NO_PAD.encode(json.as_bytes())
+}
+
+/// Decode the `request="…"` auth-param into a [`RequestObject`]. Errors on bad
+/// base64 / JSON or a missing/wrong-shaped field (the cashu-semantic
+/// mints-superset check is the caller's, via the cashu-coupled
+/// [`crate::challenge`] layer).
+pub fn decode_request_object(b64: &str) -> Result<RequestObject, Error> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(b64.trim())
+        .map_err(|e| Error::DecodeFailed(format!("request object base64: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| Error::DecodeFailed(format!("request object json: {e}")))
+}
+
+/// The JSON object inside the `pops-gateway` binary's `request` auth-param,
+/// holding the `creqA…` under a single `cashu_request` field. The gateway
+/// (`gateway.rs`) is a SEPARATE call-site that has not yet been folded onto the
+/// spec [`RequestObject`] codec (`draft-cashu-charge-01` conformance is the
+/// library path — `middleware.rs` — for now); this flat codec serves it until
+/// that de-dup lands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestEnvelope {
     cashu_request: String,
 }
 
-/// Wrap a `creqA…` in the `request` envelope, base64url-nopad-encoded. The result
-/// goes inside `request="…"`. Cannot fail.
+/// Wrap a `creqA…` in the gateway's flat `request` envelope, base64url-nopad-
+/// encoded. Cannot fail. (The spec request codec is [`encode_request_object`].)
 pub fn encode_request_envelope(creq_a: &str) -> String {
     let envelope = RequestEnvelope {
         cashu_request: creq_a.to_string(),
@@ -273,8 +354,9 @@ pub fn encode_request_envelope(creq_a: &str) -> String {
     URL_SAFE_NO_PAD.encode(json.as_bytes())
 }
 
-/// Unwrap the `request` envelope, returning the inner `cashu_request` (`creqA…`).
-/// Errors on bad base64 / JSON or a missing `cashu_request`.
+/// Unwrap the gateway's flat `request` envelope, returning the inner
+/// `cashu_request` (`creqA…`). Errors on bad base64 / JSON or a missing
+/// `cashu_request`. (The spec request codec is [`decode_request_object`].)
 pub fn decode_request_envelope(b64: &str) -> Result<String, Error> {
     let bytes = URL_SAFE_NO_PAD
         .decode(b64.trim())
@@ -296,10 +378,14 @@ mod tests {
                 method: method.into(),
                 intent: "charge".into(),
                 request: "ZHVtbXkK".into(),
+                digest: None,
+                opaque: None,
+                expires: None,
             },
             payload: CashuPayload {
                 cashu_token: token.into(),
             },
+            source: None,
         }
     }
 
@@ -615,5 +701,134 @@ mod tests {
         assert_eq!(strip_quoted(r#"""#), None); // lone quote
         assert_eq!(strip_quoted(""), None); // empty
         assert_eq!(strip_quoted(r#""a"b""#), None); // interior quote
+    }
+
+    // ---- spec request object (draft-cashu-charge-01 §Request Schema) ---------
+
+    fn sample_request_object() -> RequestObject {
+        RequestObject {
+            amount: "100".into(),
+            currency: "pop_1782668279".into(),
+            description: Some("read access".into()),
+            external_id: Some("inv-7".into()),
+            method_details: MethodDetails {
+                request: "creqAsomepayload".into(),
+                mints: vec!["https://mint.example".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn request_object_roundtrips() {
+        let obj = sample_request_object();
+        let encoded = encode_request_object(&obj);
+        let decoded = decode_request_object(&encoded).expect("request object round-trips");
+        assert_eq!(decoded, obj);
+    }
+
+    #[test]
+    fn request_object_is_base64url_nopad() {
+        let encoded = encode_request_object(&sample_request_object());
+        for c in encoded.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '-' || c == '_',
+                "request object contains non-base64url char {c:?}: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_object_bytes_are_jcs_canonical() {
+        // JCS sorts object keys lexicographically; the decoded base64 is exactly
+        // those canonical bytes, key-sorted at both levels (amount < currency <
+        // description < externalId < methodDetails; request < mints).
+        let encoded = encode_request_object(&sample_request_object());
+        let bytes = URL_SAFE_NO_PAD.decode(&encoded).expect("decodes");
+        let json = std::str::from_utf8(&bytes).expect("utf8");
+        assert_eq!(
+            json,
+            r#"{"amount":"100","currency":"pop_1782668279","description":"read access","externalId":"inv-7","methodDetails":{"mints":["https://mint.example"],"request":"creqAsomepayload"}}"#
+        );
+    }
+
+    #[test]
+    fn request_object_omits_absent_optionals_on_wire() {
+        let obj = RequestObject {
+            amount: "1".into(),
+            currency: "pop_1700000000".into(),
+            description: None,
+            external_id: None,
+            method_details: MethodDetails {
+                request: "creqAx".into(),
+                mints: vec!["https://m.example".into()],
+            },
+        };
+        let bytes = URL_SAFE_NO_PAD
+            .decode(encode_request_object(&obj))
+            .expect("decodes");
+        let json = std::str::from_utf8(&bytes).expect("utf8");
+        assert_eq!(
+            json,
+            r#"{"amount":"1","currency":"pop_1700000000","methodDetails":{"mints":["https://m.example"],"request":"creqAx"}}"#
+        );
+    }
+
+    #[test]
+    fn decode_request_object_rejects_missing_method_details() {
+        let bad = URL_SAFE_NO_PAD.encode(br#"{"amount":"1","currency":"pop_1"}"#);
+        let err = decode_request_object(&bad).expect_err("missing methodDetails");
+        assert!(matches!(err, Error::DecodeFailed(_)));
+    }
+
+    #[test]
+    fn decode_request_object_rejects_bad_base64() {
+        let err = decode_request_object("!!!notbase64!!!").expect_err("bad base64");
+        assert!(matches!(err, Error::DecodeFailed(_)));
+    }
+
+    // ---- credential blob: JCS + optional echo fields -------------------------
+
+    #[test]
+    fn credential_blob_bytes_are_jcs_canonical() {
+        // The credential blob is JCS-canonical (challenge < payload < source;
+        // within challenge: id < intent < method < realm < request, plus the
+        // optional digest/opaque/expires when present).
+        let creds = make_credentials("cashu", "cashuBabc");
+        let blob = encode_payment_credentials(&creds);
+        let bytes = URL_SAFE_NO_PAD.decode(&blob).expect("decodes");
+        let json = std::str::from_utf8(&bytes).expect("utf8");
+        assert_eq!(
+            json,
+            r#"{"challenge":{"id":"challenge-1","intent":"charge","method":"cashu","realm":"pops-core-verify","request":"ZHVtbXkK"},"payload":{"cashu_token":"cashuBabc"}}"#
+        );
+    }
+
+    #[test]
+    fn credential_echo_carries_optional_fields_when_present() {
+        let creds = PaymentCredentials {
+            challenge: EchoedChallenge {
+                id: "id".into(),
+                realm: "r".into(),
+                method: "cashu".into(),
+                intent: "charge".into(),
+                request: "req".into(),
+                digest: Some("d".into()),
+                opaque: Some("o".into()),
+                expires: Some("2999-01-01T00:00:00Z".into()),
+            },
+            payload: CashuPayload {
+                cashu_token: "cashuBz".into(),
+            },
+            source: Some("did:example:1".into()),
+        };
+        let header = format!("Payment {}", encode_payment_credentials(&creds));
+        let parsed = parse_payment_authorization(&header).expect("optional echo round-trips");
+        assert_eq!(parsed.challenge.digest.as_deref(), Some("d"));
+        assert_eq!(parsed.challenge.opaque.as_deref(), Some("o"));
+        assert_eq!(
+            parsed.challenge.expires.as_deref(),
+            Some("2999-01-01T00:00:00Z")
+        );
+        assert_eq!(parsed.source.as_deref(), Some("did:example:1"));
     }
 }

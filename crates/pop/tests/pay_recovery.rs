@@ -40,8 +40,7 @@ use cdk_common::nuts::{
 };
 use cdk_common::secret::Secret;
 use cdk_common::{Amount, PublicKey, SecretKey};
-use pops_core_verify::challenge::{encode_challenge, CashuRequirement};
-use pops_core_verify::envelope::encode_request_envelope;
+use pops_core_verify::challenge::{encode_charge_request, CashuRequirement};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -177,7 +176,8 @@ fn build_input_token(mint: &TestMint, mint_url: &str) -> String {
 }
 
 /// The `WWW-Authenticate: Payment …` header value for a charge of `CHARGE_AMOUNT`
-/// in `pop_unit()` accepting exactly `mint_url`.
+/// in `pop_unit()` accepting exactly `mint_url`. The `request` param is the
+/// `draft-cashu-charge-01` request object.
 fn challenge_header(mint_url: &str) -> String {
     let req = CashuRequirement {
         unit: pop_unit(),
@@ -187,10 +187,9 @@ fn challenge_header(mint_url: &str) -> String {
         description: None,
         single_use: true,
     };
-    let creq = encode_challenge(&req);
-    let env = encode_request_envelope(&creq);
+    let request = encode_charge_request(&req);
     format!(
-        r#"Payment id="ch-recovery", realm="pops", method="cashu", intent="charge", request="{env}""#
+        r#"Payment id="ch-recovery", realm="pops", method="cashu", intent="charge", request="{request}""#
     )
 }
 
