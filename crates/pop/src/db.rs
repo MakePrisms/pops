@@ -231,7 +231,7 @@ impl Db {
     /// # Errors
     ///
     /// Propagates SQLite errors (including a duplicate id).
-    pub fn insert_deposit(&self, d: &Deposit) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn insert_deposit(&self, deposit: &Deposit) -> Result<(), Box<dyn std::error::Error>> {
         self.conn
             .execute(
                 r#"INSERT INTO deposits (
@@ -244,26 +244,26 @@ impl Db {
                     ?15, ?16, ?17, ?18, ?19, ?20
                 )"#,
                 params![
-                    d.id,
-                    d.label,
-                    d.mint_url,
-                    d.unit,
-                    d.ts_expiry,
-                    d.amount,
-                    d.funder_index,
-                    d.funder_pubkey,
-                    d.quote_lock_pubkey,
-                    d.p_internal,
-                    d.leaf_script,
-                    d.nonce,
-                    d.mint_pubkey,
-                    d.funding_address,
-                    d.quote_id,
-                    d.state.as_str(),
-                    d.funding_txid,
-                    d.funding_vout,
-                    d.recovery_txid,
-                    d.created_at,
+                    deposit.id,
+                    deposit.label,
+                    deposit.mint_url,
+                    deposit.unit,
+                    deposit.ts_expiry,
+                    deposit.amount,
+                    deposit.funder_index,
+                    deposit.funder_pubkey,
+                    deposit.quote_lock_pubkey,
+                    deposit.p_internal,
+                    deposit.leaf_script,
+                    deposit.nonce,
+                    deposit.mint_pubkey,
+                    deposit.funding_address,
+                    deposit.quote_id,
+                    deposit.state.as_str(),
+                    deposit.funding_txid,
+                    deposit.funding_vout,
+                    deposit.recovery_txid,
+                    deposit.created_at,
                 ],
             )
             .map_err(|e| format!("failed to insert deposit: {e}"))?;

@@ -206,7 +206,7 @@ pub async fn run(
         .proofs(&keyset_infos)
         .map_err(|e| PopError::invalid_input(format!("--token proofs are unreadable: {e}")))?;
 
-    let Outcome {
+    let ExactPaymentTokens {
         send_token,
         change_token,
     } = build_exact_payment(
@@ -337,7 +337,7 @@ fn ensure_post_swap_token_bearing(
 }
 
 /// The two tokens produced by the exact-amount construction.
-struct Outcome {
+struct ExactPaymentTokens {
     /// The token worth EXACTLY the charge — this is what is presented.
     send_token: String,
     /// The leftover change token (`None` when the held token equalled the charge).
@@ -358,7 +358,7 @@ async fn build_exact_payment(
     token_total: u64,
     unit: &CurrencyUnit,
     keyset_infos: &[KeySetInfo],
-) -> Result<Outcome, Box<dyn std::error::Error>> {
+) -> Result<ExactPaymentTokens, Box<dyn std::error::Error>> {
     let mint_url_typed = MintUrl::from_str(base)
         .map_err(|e| PopError::invalid_input(format!("mint url `{base}` is invalid: {e}")))?;
 
@@ -381,7 +381,7 @@ async fn build_exact_payment(
             send_proofs_json: Some(send_proofs_json),
             change_proofs_json: None,
         })?;
-        return Ok(Outcome {
+        return Ok(ExactPaymentTokens {
             send_token,
             change_token: None,
         });
@@ -459,7 +459,7 @@ async fn build_exact_payment(
         None => None,
     };
 
-    Ok(Outcome {
+    Ok(ExactPaymentTokens {
         send_token,
         change_token,
     })

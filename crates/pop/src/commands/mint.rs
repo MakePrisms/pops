@@ -629,7 +629,7 @@ fn parse_duration_secs(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let n: u64 = num.parse().map_err(|_| {
         PopError::invalid_input(format!("invalid duration `{s}` (expected e.g. 30d, 12h, 45m)"))
     })?;
-    let mult = match unit {
+    let secs_per_unit = match unit {
         "d" | "" => SECS_PER_DAY,
         "h" => 3_600,
         "m" => 60,
@@ -641,7 +641,7 @@ fn parse_duration_secs(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
             .into())
         }
     };
-    n.checked_mul(mult)
+    n.checked_mul(secs_per_unit)
         .ok_or_else(|| PopError::invalid_input(format!("duration `{s}` is too large")).into())
 }
 
@@ -725,34 +725,34 @@ fn verify_quote_address(
         .into());
     }
 
-    if let Some(ik) = &quote.internal_key {
-        let ours = hex::encode(c.internal_key.serialize());
-        if !ik.eq_ignore_ascii_case(&ours) {
+    if let Some(mint_internal_key) = &quote.internal_key {
+        let our_internal_key = hex::encode(c.internal_key.serialize());
+        if !mint_internal_key.eq_ignore_ascii_case(&our_internal_key) {
             return Err(PopError::AddressMismatch {
-                expected: ours,
-                got: ik.clone(),
+                expected: our_internal_key,
+                got: mint_internal_key.clone(),
             }
             .into());
         }
     }
 
-    if let Some(ls) = &quote.leaf_script {
-        let ours = hex::encode(c.leaf_script.as_bytes());
-        if !ls.eq_ignore_ascii_case(&ours) {
+    if let Some(mint_leaf_script) = &quote.leaf_script {
+        let our_leaf_script = hex::encode(c.leaf_script.as_bytes());
+        if !mint_leaf_script.eq_ignore_ascii_case(&our_leaf_script) {
             return Err(PopError::AddressMismatch {
-                expected: ours,
-                got: ls.clone(),
+                expected: our_leaf_script,
+                got: mint_leaf_script.clone(),
             }
             .into());
         }
     }
 
-    if let Some(fp) = &quote.funder_pubkey {
-        let ours = hex::encode(funder_xonly.serialize());
-        if !fp.eq_ignore_ascii_case(&ours) {
+    if let Some(mint_funder_pubkey) = &quote.funder_pubkey {
+        let our_funder_pubkey = hex::encode(funder_xonly.serialize());
+        if !mint_funder_pubkey.eq_ignore_ascii_case(&our_funder_pubkey) {
             return Err(PopError::AddressMismatch {
-                expected: ours,
-                got: fp.clone(),
+                expected: our_funder_pubkey,
+                got: mint_funder_pubkey.clone(),
             }
             .into());
         }

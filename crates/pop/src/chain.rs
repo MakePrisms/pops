@@ -144,12 +144,12 @@ impl Esplora {
     ) -> Result<(u64, ScriptBuf), Box<dyn std::error::Error>> {
         let vouts = self.tx_vouts(txid).await?;
         let idx = usize::try_from(vout).map_err(|_| "vout does not fit usize")?;
-        let v = vouts
+        let output = vouts
             .get(idx)
             .ok_or_else(|| format!("funding tx has no vout[{vout}]"))?;
-        let bytes = hex::decode(&v.scriptpubkey)
+        let bytes = hex::decode(&output.scriptpubkey)
             .map_err(|e| format!("esplora scriptpubkey hex decode failed: {e}"))?;
-        Ok((v.value, ScriptBuf::from_bytes(bytes)))
+        Ok((output.value, ScriptBuf::from_bytes(bytes)))
     }
 
     /// Lists the UTXOs currently at an address.

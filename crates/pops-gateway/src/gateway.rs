@@ -96,8 +96,8 @@ impl AppState<CashuCredential<CdkMintClient>> {
 
 /// Build the `WWW-Authenticate: Payment …` value once from the requirement.
 fn build_www_authenticate(requirement: &CashuRequirement) -> HeaderValue {
-    let creq_a = encode_challenge(requirement);
-    let request_envelope = encode_request_envelope(&creq_a);
+    let encoded_challenge = encode_challenge(requirement);
+    let request_envelope = encode_request_envelope(&encoded_challenge);
     let header = format!(
         r#"{PAYMENT_SCHEME} id="{CHALLENGE_ID}", realm="{REALM}", method="cashu", intent="{INTENT_CHARGE}", request="{request_envelope}""#
     );
@@ -156,10 +156,10 @@ where
     };
 
     // Swap (verify + redeem).
-    let charge_req = charge_requirement_from_cashu(&state.config.requirement);
+    let charge_requirement = charge_requirement_from_cashu(&state.config.requirement);
     let redeemed = match state
         .credential
-        .verify_and_redeem(&token, &charge_req)
+        .verify_and_redeem(&token, &charge_requirement)
         .await
     {
         Ok(r) => r,

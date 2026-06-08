@@ -131,7 +131,7 @@ fn charge_error_to_js(e: &ChargeError) -> JsValue {
 
 /// Full verify + redeem over an injected `fetch`.
 ///
-/// `presented` is the holder's `cashuB…` token string; `req_json` is the
+/// `presented_token` is the holder's `cashuB…` token string; `requirement_json` is the
 /// JSON form of a [`ChargeRequirement`] (`{ amount, unit, mints, payment_id,
 /// description, single_use }`). Constructs a
 /// [`CashuCredential<WasmMintClient>`] and runs the same decode → structural
@@ -143,18 +143,18 @@ fn charge_error_to_js(e: &ChargeError) -> JsValue {
 /// success, or REJECTS with `{ ok:false, code, message }` carrying the
 /// [`ChargeError`] discriminant so the JS route maps 402 / 503 / 400.
 ///
-/// A malformed `req_json` (server-side config error, never the holder's fault)
+/// A malformed `requirement_json` (server-side config error, never the holder's fault)
 /// rejects with `code = "malformed-request"`.
 #[wasm_bindgen]
-pub fn verify_and_redeem(presented: &str, req_json: &str) -> js_sys::Promise {
-    let presented = presented.to_string();
-    let req_json = req_json.to_string();
+pub fn verify_and_redeem(presented_token: &str, requirement_json: &str) -> js_sys::Promise {
+    let presented_token = presented_token.to_string();
+    let requirement_json = requirement_json.to_string();
 
     future_to_promise(async move {
         // Parse the requirement JSON. A bad requirement is server config, not a
         // payment failure → surface as MalformedRequest (the route maps it off
         // `code`, distinctly from a MalformedCredential).
-        let req: ChargeRequirement = match serde_json::from_str(&req_json) {
+        let requirement: ChargeRequirement = match serde_json::from_str(&requirement_json) {
             Ok(r) => r,
             Err(e) => {
                 let err = ChargeError::MalformedRequest(format!("requirement json: {e}"));
@@ -164,7 +164,7 @@ pub fn verify_and_redeem(presented: &str, req_json: &str) -> js_sys::Promise {
 
         let cred = CashuCredential::new(WasmMintClient::new());
 
-        match cred.verify_and_redeem(&presented, &req).await {
+        match cred.verify_and_redeem(&presented_token, &requirement).await {
             Ok(redeemed) => {
                 let obj = js_sys::Object::new();
                 let set = |k: &str, v: &JsValue| {

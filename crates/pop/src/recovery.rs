@@ -90,8 +90,12 @@ impl RecoveryFile {
         funder_derivation_path: &str,
         funding_outpoint: Option<&str>,
     ) -> Self {
-        let c = reconstruct(params);
-        let descriptor = descriptor(&c.internal_key, params.ts_expiry, &params.funder_pubkey);
+        let reconstructed = reconstruct(params);
+        let descriptor = descriptor(
+            &reconstructed.internal_key,
+            params.ts_expiry,
+            &params.funder_pubkey,
+        );
         RecoveryFile {
             version: RECOVERY_VERSION.to_string(),
             deposit_id: deposit_id.to_string(),
@@ -105,10 +109,10 @@ impl RecoveryFile {
             funder_pubkey: hex::encode(params.funder_pubkey.serialize()),
             funder_derivation_path: funder_derivation_path.to_string(),
             network: params.network.to_string(),
-            p_internal: hex::encode(c.internal_key.serialize()),
-            leaf_script: hex::encode(c.leaf_script.as_bytes()),
+            p_internal: hex::encode(reconstructed.internal_key.serialize()),
+            leaf_script: hex::encode(reconstructed.leaf_script.as_bytes()),
             descriptor,
-            funding_address: c.address,
+            funding_address: reconstructed.address,
             funding_outpoint: funding_outpoint.map(str::to_string),
             recover_after_utc: utc_iso8601(params.ts_expiry),
             how_to_recover: format!(
