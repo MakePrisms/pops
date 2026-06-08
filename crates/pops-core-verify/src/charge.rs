@@ -40,7 +40,7 @@ pub enum ChargeError {
     /// Presented value ≠ `amount + expected_swap_fee` (over- or under-funded; the
     /// server makes no change).
     ///
-    /// HTTP 402 · `payment-insufficient` · terminal.
+    /// HTTP 402 · `amount-mismatch` · terminal.
     #[error("amount mismatch: presented {presented}, required {required} (= amount {amount} + swap_fee {expected_swap_fee})")]
     AmountMismatch {
         /// `amount + expected_swap_fee` the server requires.

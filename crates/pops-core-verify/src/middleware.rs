@@ -238,7 +238,7 @@ fn challenge_is_expired(expires: &str) -> bool {
 fn problem_parts(e: &ChargeError) -> (&'static str, &'static str) {
     match e {
         ChargeError::MintUnreachable { .. } => ("mint-unavailable", "Mint unavailable"),
-        ChargeError::AmountMismatch { .. } => ("payment-insufficient", "Payment insufficient"),
+        ChargeError::AmountMismatch { .. } => ("amount-mismatch", "Amount mismatch"),
         ChargeError::WrongUnit { .. }
         | ChargeError::MintNotAllowed { .. }
         | ChargeError::MultiMintOrUnit

@@ -404,7 +404,7 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 amount: 100,
                 expected_swap_fee: 0,
             },
-            "cashu/payment-insufficient",
+            "cashu/amount-mismatch",
             402,
         ),
         (
