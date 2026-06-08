@@ -66,6 +66,15 @@ pub const MIN_RELAY_FEERATE_SAT_PER_VB: f64 = 1.0;
 /// safe — the funds are not at risk and the tx can be fee-bumped if it stalls.
 pub const FALLBACK_FEERATE_SAT_PER_VB: f64 = 2.0;
 
+/// Hard ceiling on an AUTO-ESTIMATED feerate (sat/vB). The `/fee-estimates`
+/// endpoint is a fully-trusted third party; a hostile or misconfigured one can
+/// return an absurd rate, and the recovery spend auto-broadcasts. Capping the
+/// mempool-derived feerate bounds the worst-case miner fee on that un-prompted
+/// broadcast. 1000 sat/vB is far above any real mempool peak, so it never blocks
+/// a legitimate estimate; a funder who genuinely needs more passes an explicit
+/// `--fee <sats>` (the `Absolute` policy), which never flows through here.
+pub const MAX_SANE_FEERATE_SAT_PER_VB: f64 = 1_000.0;
+
 /// An esplora client bound to a base URL.
 pub struct Esplora {
     base: String,
@@ -290,7 +299,9 @@ impl FeeEstimates {
     /// Picks the feerate (sat/vB) for `target` confirmation blocks. Esplora keys
     /// are sparse, so an absent `target` falls to the nearest HIGHER key (never a
     /// slower one); a `target` above every key uses the largest (slowest) key.
-    /// Floored at min-relay so we never emit a sub-relay tx.
+    /// Clamped to `[MIN_RELAY, MAX_SANE]`: the floor keeps the tx relayable, the
+    /// ceiling bounds a hostile/misconfigured endpoint (also coerces a negative
+    /// rate up to min-relay).
     pub fn pick_feerate(&self, target: u32) -> f64 {
         // First key >= target (nearest higher).
         let chosen = self
@@ -301,7 +312,7 @@ impl FeeEstimates {
             // None ⇒ target exceeds all keys: take the largest (slowest).
             .or_else(|| self.by_target.values().next_back().copied())
             .unwrap_or(MIN_RELAY_FEERATE_SAT_PER_VB);
-        chosen.max(MIN_RELAY_FEERATE_SAT_PER_VB)
+        chosen.clamp(MIN_RELAY_FEERATE_SAT_PER_VB, MAX_SANE_FEERATE_SAT_PER_VB)
     }
 }
 
@@ -368,5 +379,17 @@ mod tests {
         let fe = estimates(&[(144, 0.5), (1008, 0.1)]);
         assert_eq!(fe.pick_feerate(144), MIN_RELAY_FEERATE_SAT_PER_VB);
         assert_eq!(fe.pick_feerate(1008), MIN_RELAY_FEERATE_SAT_PER_VB);
+    }
+
+    #[test]
+    fn pick_feerate_caps_a_hostile_estimate() {
+        // A hostile/misconfigured endpoint quoting an absurd rate is capped at
+        // MAX_SANE so the auto-broadcast can't burn the UTXO to miner fee.
+        let fe = estimates(&[(1, 9_999_999.0), (6, 50_000.0)]);
+        assert_eq!(fe.pick_feerate(6), MAX_SANE_FEERATE_SAT_PER_VB);
+        assert_eq!(fe.pick_feerate(1), MAX_SANE_FEERATE_SAT_PER_VB);
+        // A negative quote is coerced up to the floor (clamp lower bound).
+        let neg = estimates(&[(6, -5.0)]);
+        assert_eq!(neg.pick_feerate(6), MIN_RELAY_FEERATE_SAT_PER_VB);
     }
 }

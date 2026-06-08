@@ -15,6 +15,7 @@ use cdk_common::nuts::{CurrencyUnit, Proofs};
 use clap::Parser;
 
 use pops_core_funder::{reconstruct, Construction, ConstructionParams};
+use pops_core_verify::unit::{format_pop_unit, parse_pop_unit};
 
 use crate::chain::Esplora;
 use crate::config::Config;
@@ -601,18 +602,21 @@ fn resolve_unit(args: &MintArgs) -> Result<String, Box<dyn std::error::Error>> {
     }
     let dur = args.duration.as_deref().unwrap_or("30d");
     let secs = parse_duration_secs(dur)?;
-    let ts = now_unix() + secs;
-    Ok(format!("pop_{ts}"))
+    let ts = now_unix().checked_add(secs).ok_or_else(|| {
+        PopError::invalid_input(format!("duration `{dur}` overflows the expiry timestamp"))
+    })?;
+    Ok(format_pop_unit(ts))
 }
 
-/// Parses a `pop_<ts>` unit's expiry timestamp.
+/// Parses + range-checks a `pop_<ts>` unit via the canonical shared grammar
+/// ([`pops_core_verify::unit::parse_pop_unit`]). This enforces the BIP-65
+/// timestamp floor (`500_000_000`: below it `OP_CHECKLOCKTIMEVERIFY` reads the
+/// locktime as a block HEIGHT, so the deposit could never mature on the
+/// timestamp path and the BTC would be bricked) and the `u32::MAX` ceiling.
+/// Sharing the verifier/mint parser keeps the wallet's unit grammar
+/// byte-identical to theirs, so any unit that funds here is one the mint honors.
 fn parse_unit_ts(unit: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    let ts_str = unit
-        .strip_prefix("pop_")
-        .ok_or_else(|| PopError::invalid_input(format!("unit `{unit}` is not pop_<ts>")))?;
-    ts_str
-        .parse::<u64>()
-        .map_err(|e| PopError::invalid_input(format!("unit `{unit}` has a non-numeric ts: {e}")).into())
+    parse_pop_unit(unit).map_err(|e| PopError::invalid_input(e.to_string()).into())
 }
 
 /// Parses a duration like `30d`, `12h`, `45m`, `3600s` into seconds.
@@ -637,7 +641,8 @@ fn parse_duration_secs(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
             .into())
         }
     };
-    Ok(n * mult)
+    n.checked_mul(mult)
+        .ok_or_else(|| PopError::invalid_input(format!("duration `{s}` is too large")).into())
 }
 
 /// Extracts the required 32-byte nonce from the quote response.
@@ -800,6 +805,12 @@ mod tests {
         assert_eq!(parse_duration_secs("3600s").unwrap(), 3600);
         assert_eq!(parse_duration_secs("7").unwrap(), 7 * SECS_PER_DAY);
         assert!(parse_duration_secs("5y").is_err());
+        // A duration that would overflow `n * secs_per_unit` is rejected, not
+        // wrapped to a small (near/past) expiry.
+        assert!(
+            parse_duration_secs(&format!("{}d", u64::MAX)).is_err(),
+            "overflowing duration must error, not wrap"
+        );
     }
 
     #[test]
@@ -807,6 +818,19 @@ mod tests {
         assert_eq!(parse_unit_ts("pop_1782259200").unwrap(), 1_782_259_200);
         assert!(parse_unit_ts("pop_notanumber").is_err());
         assert!(parse_unit_ts("sat").is_err());
+        // C1 regression: a sub-500_000_000 ts encodes a block HEIGHT under
+        // OP_CLTV (un-minable for millennia → permanent loss), so it MUST be
+        // rejected at parse time rather than silently funded.
+        assert!(
+            parse_unit_ts("pop_400000000").is_err(),
+            "sub-floor (block-height) ts must be rejected"
+        );
+        assert!(parse_unit_ts("pop_499999999").is_err(), "one below the floor is rejected");
+        assert!(parse_unit_ts("pop_500000000").is_ok(), "the floor boundary is valid");
+        // Above u32::MAX has no valid CLTV locktime encoding.
+        assert!(parse_unit_ts("pop_4294967296").is_err(), "above u32::MAX must be rejected");
+        // Non-canonical spellings (currency-identity drift) are rejected too.
+        assert!(parse_unit_ts("pop_01782259200").is_err(), "leading zero is non-canonical");
     }
 
     #[test]

@@ -113,7 +113,10 @@ impl RecoveryFile {
             recover_after_utc: utc_iso8601(params.ts_expiry),
             how_to_recover: format!(
                 "After {} (UTC): `pop recover --deposit {} --dest <your-address>`. \
-                 OR import `descriptor` (private form) into Bitcoin Core >= 26, then \
+                 If wallet.db was lost, recover from THIS file (seed still required): \
+                 `pop recover --from-file <this-file> --dest <your-address>`. \
+                 OR import `descriptor` (substitute the seed-derived funder privkey at \
+                 funder_derivation_path for the x-only key) into Bitcoin Core >= 26, then \
                  walletcreatefundedpsbt with nLockTime={} and a non-final sequence, \
                  walletprocesspsbt, finalizepsbt, sendrawtransaction.",
                 utc_iso8601(params.ts_expiry),
@@ -130,7 +133,6 @@ impl RecoveryFile {
     /// # Errors
     ///
     /// A malformed/wrong-length hex field or an unknown network string.
-    #[allow(dead_code)]
     pub fn construction_params(&self) -> Result<ConstructionParams, Box<dyn std::error::Error>> {
         let mint_pubkey_bytes = hex::decode(&self.mint_pubkey)
             .map_err(|e| format!("recovery mint_pubkey hex decode failed: {e}"))?;
