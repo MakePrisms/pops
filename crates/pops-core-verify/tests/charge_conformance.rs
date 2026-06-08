@@ -386,7 +386,8 @@ async fn problem_for(make: fn() -> ChargeError) -> (StatusCode, serde_json::Valu
 #[tokio::test]
 async fn charge_errors_map_to_spec_problem_types_and_statuses() {
     // (problem-type, HTTP status) per draft-cashu-charge-01 §Errors.
-    let cases: Vec<(fn() -> ChargeError, &str, u16)> = vec![
+    type ErrorCase = (fn() -> ChargeError, &'static str, u16);
+    let cases: Vec<ErrorCase> = vec![
         (
             || ChargeError::MintUnreachable {
                 mint_url: "https://mint.example".into(),
