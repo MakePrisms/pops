@@ -10,19 +10,13 @@ description = "PoPs funder-side crypto: taproot output-key + CLTV recovery scrip
 # pulls C, so the WASM surface lives elsewhere. Native consumers only.
 
 [dependencies]
-# bitcoin 0.32.2 with the exact feature set pop-wallet proved compiles this
-# script code. std + serde + rand + rand-std. NOT default-features.
+# bitcoin 0.32.2, default-features off, with the feature set this script code
+# needs: std + serde + rand + rand-std.
 bitcoin = { version = "0.32.2", default-features = false, features = ["std", "serde", "rand", "rand-std"] }
 
-# Typed kernel errors (RecoverError) — stable, exhaustive, agent-DX. Already
-# in the workspace lockfile via pops-core-types.
+# Typed kernel errors (RecoverError) — stable, exhaustive.
 thiserror = "1"
 
 # Hex encoding for the recovery leaf-script / scriptPubKey mismatch diagnostics
 # carried inside RecoverError variants.
 hex = "0.4"
-
-# Topology edge: declare the dependency on pops-core-types even though
-# script.rs does not consume it yet (the pop_<ts> grammar will be the
-# shared vocabulary once the funder flow lands).
-pops-core-types = { path = "../pops-core-types" }

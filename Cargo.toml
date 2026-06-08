@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/pops-core-types", "crates/pops-core-funder", "crates/pops-core-verify", "crates/pop", "crates/pops-gateway"]
+members = ["crates/pops-core-funder", "crates/pops-core-verify", "crates/pop", "crates/pops-gateway"]

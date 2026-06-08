@@ -52,7 +52,7 @@ impl Error for SignerError {}
 /// The funder signing seam for the recovery + issuance flows. `index` is the
 /// per-deposit BIP-32 funder index; [`Signer::sign`] takes no index because the
 /// sighash is already deposit-specific and a [`HotKeySigner`] is bound to that
-/// deposit's key. SYNC v1 (async signing would be a different impl).
+/// deposit's key. The trait is sync; an async signer would be a separate impl.
 pub trait Signer {
     /// Returns the funder pubkey (both encodings) for the deposit at `index`.
     ///
@@ -142,7 +142,7 @@ impl Signer for HotKeySigner {
             .map_err(|e| SignerError::Signing(format!("funder secret -> cdk secret: {e}")))?;
         req.sign(cdk_secret.clone())
             .map_err(|e| SignerError::Signing(format!("NUT-20 sign: {e}")))?;
-        // Defense-in-depth self-verify (mirrors the former mint_client pre-flight).
+        // Defense-in-depth self-verify.
         req.verify_signature(cdk_secret.public_key())
             .map_err(|e| SignerError::Signing(format!("NUT-20 self-verify: {e}")))?;
         Ok(())

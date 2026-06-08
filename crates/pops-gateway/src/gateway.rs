@@ -4,7 +4,9 @@
 //! ([`CashuCredential::verify_and_redeem`]): it decides whether a path is gated,
 //! runs the gate, **persists `fresh_proofs` durably BEFORE forwarding**, then
 //! proxies the ORIGINAL request to `upstream_url` and streams back. The
-//! `ChargeError` → HTTP mapping (503/400/402) mirrors `middleware.rs`.
+//! `ChargeError` → HTTP status mapping (503/400/402) is the single-sourced
+//! [`charge_error_status`],
+//! shared with `middleware.rs`.
 
 use std::sync::Arc;
 
@@ -13,10 +15,11 @@ use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 
-use pops_core_types::ChargeError;
+use pops_core_verify::charge::ChargeError;
 use pops_core_verify::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use pops_core_verify::cdk_mint_client::CdkMintClient;
 use pops_core_verify::challenge::{encode_challenge, CashuRequirement};
+use pops_core_verify::http_status::charge_error_status;
 use pops_core_verify::redeemer::Redeemer;
 use pops_core_verify::envelope::{
     encode_request_envelope, parse_payment_authorization, AuthParseError, PAYMENT_SCHEME,
@@ -26,14 +29,14 @@ use crate::config::ValidatedConfig;
 use crate::proofs_sink::ProofsSink;
 use crate::routes::{gate_for, Gate};
 
-/// `realm` advertised in the challenge (fixed in v1).
+/// `realm` advertised in the challenge.
 pub const REALM: &str = "pops-gateway";
 
 /// The `intent` value — a one-shot charge.
 pub const INTENT_CHARGE: &str = "charge";
 
-/// A fixed challenge `id`: the gate does NOT enforce challenge-id binding
-/// (stateless v1), so a constant keeps the prebuilt header truly constant.
+/// A fixed challenge `id`: the gate does not enforce challenge-id binding, so a
+/// constant keeps the prebuilt header truly constant.
 pub const CHALLENGE_ID: &str = "pops-gateway";
 
 /// Per-request shared state, built once at startup (`Arc`). `C` is the credential
@@ -119,14 +122,14 @@ where
 
 /// The gated path: enforce payment, persist on success, then forward.
 ///
-/// The ORDERING is load-bearing for value-safety + DoS-resistance:
-/// 1. extract the credential FIRST — a bare/malformed request 402s without ever
+/// The ordering is load-bearing for value-safety + DoS-resistance:
+/// 1. extract the credential first — a bare/malformed request 402s without ever
 ///    buffering its body (an unauthenticated caller can't make us buffer up to
 ///    the cap);
-/// 2. buffer the body (capped) BEFORE the swap — over-cap → 413, read failure →
-///    4xx, BOTH while the pop is still UNSPENT (so we never spend a pop on a
-///    request we then can't read — the retriable-looking-400 value-loss edge);
-/// 3. swap + persist (BEFORE forwarding);
+/// 2. buffer the body (capped) before the swap — over-cap → 413, read failure →
+///    4xx, both while the pop is still unspent (so we never spend a pop on a
+///    request we then can't read);
+/// 3. swap + persist (before forwarding);
 /// 4. forward the already-buffered body (no read can fail after the charge).
 async fn gate_then_forward<C>(state: Arc<AppState<C>>, req: Request) -> Response
 where
@@ -134,14 +137,15 @@ where
 {
     let (parts, body) = req.into_parts();
 
-    // Step 1.
+    // Extract the credential first (a bare/malformed request 402s without
+    // buffering its body).
     let token = match extract_token(&parts.headers) {
         Ok(t) => t,
         Err(TokenExtract::NoAttempt) => return challenge_402(&state, None),
         Err(TokenExtract::Malformed(reason)) => return challenge_402(&state, Some(&reason)),
     };
 
-    // Step 2.
+    // Buffer the body (capped) before the swap, while the pop is still unspent.
     let body_bytes = match read_body_capped(body, state.config.max_body_bytes).await {
         Ok(b) => b,
         Err(BodyReadError::TooLarge) => return payload_too_large(state.config.max_body_bytes),
@@ -151,7 +155,7 @@ where
         }
     };
 
-    // Step 3.
+    // Swap (verify + redeem).
     let charge_req = charge_requirement_from_cashu(&state.config.requirement);
     let redeemed = match state
         .credential
@@ -162,9 +166,9 @@ where
         Err(e) => return charge_error_to_response(&state, e),
     };
 
-    // Step 4: PERSIST before forwarding — a crash between forward and persist
-    // would lose already-consumed proofs. On failure, do NOT forward; emit the
-    // proofs + token_hash to stderr so value is never silently lost.
+    // Persist before forwarding — a crash between forward and persist would lose
+    // already-consumed proofs. On failure, do NOT forward; emit the proofs +
+    // token_hash to stderr so value is never silently lost.
     if let Err(e) = state.sink.persist(&redeemed.proofs) {
         eprintln!(
             "FATAL persist failure (value at risk): {e}\n  token_hash={}\n  fresh_proofs={}",
@@ -191,7 +195,7 @@ where
         "charge settled and persisted; forwarding upstream"
     );
 
-    // Step 5.
+    // Forward the already-buffered body (no read can fail after the charge).
     forward_buffered(&state, parts, body_bytes).await
 }
 
@@ -292,8 +296,7 @@ where
         Ok(r) => r,
         Err(e) => {
             // Upstream down. The proofs are ALREADY persisted — the operator keeps
-            // the value; the client loses the pop (documented v1 edge). 504 on
-            // timeout, else 502.
+            // the value; the client loses the pop. 504 on timeout, else 502.
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -435,16 +438,19 @@ where
         .into_response()
 }
 
-/// Map a [`ChargeError`] to an HTTP response (mirrors `middleware.rs`):
-/// [`ChargeError::MintUnreachable`] → `503` + `Retry-After` (token NOT consumed;
-/// NEVER a 402), [`ChargeError::MalformedRequest`] → `400`, everything else
-/// (verification / malformed-credential) → `402` + a fresh challenge.
+/// Map a [`ChargeError`] to an HTTP response. The status is the single-sourced
+/// [`charge_error_status`] trichotomy (shared with `middleware.rs` so the two
+/// hosts cannot drift): [`ChargeError::MintUnreachable`] → `503` + `Retry-After`
+/// (token NOT consumed; NEVER a 402), [`ChargeError::MalformedRequest`] → `400`,
+/// everything else (verification / malformed-credential) → `402` + a fresh
+/// challenge. Only the JSON *body* is gateway-specific (a flat advisory frame,
+/// not the middleware's RFC-9457 `problem+json`).
 fn charge_error_to_response<C>(state: &AppState<C>, e: ChargeError) -> Response
 where
     C: Redeemer,
 {
-    match &e {
-        ChargeError::MintUnreachable { .. } => (
+    match charge_error_status(&e) {
+        StatusCode::SERVICE_UNAVAILABLE => (
             StatusCode::SERVICE_UNAVAILABLE,
             [
                 (header::RETRY_AFTER, HeaderValue::from_static("2")),
@@ -461,7 +467,7 @@ where
         )
             .into_response(),
 
-        ChargeError::MalformedRequest(_) => (
+        StatusCode::BAD_REQUEST => (
             StatusCode::BAD_REQUEST,
             [
                 (

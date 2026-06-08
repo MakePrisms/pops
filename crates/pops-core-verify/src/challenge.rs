@@ -104,11 +104,10 @@ pub fn encode_charge_request(req: &CashuRequirement) -> String {
 
 /// Decode the 402's `request` auth-param into a [`DecodedChargeRequest`].
 ///
-/// Reads the spec amount/currency/mints (the authoritative source per the spec's
-/// Request Schema), then enforces step-conformance against the inner `creqA`:
-/// `methodDetails.mints` MUST be a NON-EMPTY superset of the creqA's mints
-/// (`draft-cashu-charge-01` §Request Schema). A missing/short superset, an
-/// unparseable creqA, or a non-decimal `amount` is a [`Error::DecodeFailed`].
+/// Reads the authoritative amount/currency/mints, then enforces the
+/// `draft-cashu-charge-01` rule against the inner `creqA`: `methodDetails.mints`
+/// MUST be a NON-EMPTY superset of the creqA's mints. A missing/short superset,
+/// an unparseable creqA, or a non-decimal `amount` is a [`Error::DecodeFailed`].
 pub fn decode_charge_request(b64: &str) -> Result<DecodedChargeRequest, Error> {
     let object = decode_request_object(b64)?;
 
@@ -231,7 +230,7 @@ mod tests {
 
     #[test]
     fn encode_challenge_preserves_pop_custom_unit() {
-        // The pop_<ts> custom unit must survive the CBOR round-trip unchanged.
+        // The `pop_<ts>` custom unit must survive the CBOR round-trip unchanged.
         let req = CashuRequirement {
             unit: CurrencyUnit::Custom("pop_1700000000".to_string()),
             mints: vec![],

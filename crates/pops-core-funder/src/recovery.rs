@@ -5,10 +5,6 @@
 //! seed-derivable params using the SAME [`crate::script`] functions the mint
 //! uses. This is the single source of address truth shared by the wallet and
 //! the mint — they cannot drift.
-//!
-//! Lifted from `pop-wallet/src/recovery.rs`, minus the wallet-only
-//! `RecoveryFile` (JSON projection) and the `utc_iso8601` display helper —
-//! those stay in the wallet. This module needs no serde and no chrono.
 
 use bitcoin::secp256k1::XOnlyPublicKey;
 use bitcoin::{Network, ScriptBuf};
@@ -17,8 +13,8 @@ use crate::script::{
     compute_leaf_script, compute_output_key, compute_tap_tweak,
 };
 
-/// The construction parameters needed to (re)build a funding address. All of
-/// these are recorded in the recovery file and the DB.
+/// The public, seed-derivable parameters that fully determine a funding
+/// address. Feed to [`reconstruct`] to rebuild the taproot construction.
 #[derive(Debug, Clone)]
 pub struct ConstructionParams {
     /// Mint identity key, 33-byte compressed.
@@ -49,9 +45,8 @@ pub struct Construction {
     pub address: String,
 }
 
-/// Rebuilds the entire taproot construction from public params using the SAME
-/// [`crate::script`] functions the mint uses. This is the single source of
-/// address truth shared by the wallet and the mint — they cannot drift.
+/// Rebuilds the entire taproot construction from public params using the same
+/// [`crate::script`] functions the mint uses.
 #[must_use]
 pub fn reconstruct(params: &ConstructionParams) -> Construction {
     let cm = compute_cm(
@@ -97,7 +92,7 @@ mod tests {
     use super::*;
     use bitcoin::secp256k1::Secp256k1;
 
-    /// The same fixed inputs cdk-pop's own script tests pin against, so we can
+    /// Fixed inputs the script-stage tests also pin against, so we can
     /// cross-check the address our reconstruction produces.
     const TEST_MINT_PUBKEY: [u8; 33] = [
         0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
@@ -108,8 +103,7 @@ mod tests {
     const TEST_NONCE: [u8; 32] = [0x42; 32];
 
     fn test_funder() -> XOnlyPublicKey {
-        // secp256k1 generator G's x-coordinate — a known valid x-only point,
-        // matching cdk-pop's own test vector funder key.
+        // secp256k1 generator G's x-coordinate — a known valid x-only point.
         const G_X: [u8; 32] = [
             0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
             0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
@@ -128,8 +122,8 @@ mod tests {
         }
     }
 
-    /// Our reconstruction must reproduce cdk-pop's pinned regtest address —
-    /// proving the wallet uses the exact same construction as the mint, and
+    /// Our reconstruction must reproduce the pinned regtest address — proving
+    /// the wallet uses the exact same construction as the mint, and
     /// cross-validating that `script.rs` builds the OP_VERIFY leaf form (any
     /// drift to a non-OP_VERIFY script changes this address).
     #[test]
@@ -139,7 +133,7 @@ mod tests {
             c.address,
             "bcrt1psjw4ymy3cl0a2cp32nnh4kjj9fus8m5daust4kd4hzwnkm7ctmhq29z2wd"
         );
-        // And the internal key matches cdk-pop's pinned P_internal.
+        // And the internal key matches the pinned P_internal.
         assert_eq!(
             hex::encode(c.internal_key.serialize()),
             "0d13150199eb60fb907b6e00bd4efe0c3caadb9a4d7dfb8295a4f85428016db6"

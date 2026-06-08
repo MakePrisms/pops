@@ -31,8 +31,8 @@ use crate::SCHEMA_VERSION;
 /// self-consistent deposit, so it folds into `internal_error` (carrying the
 /// kernel's stable `code()` + `Display` for diagnosis). The security stops
 /// (`ScriptPubkeyMismatch`, `ScriptMismatch`, `OutputKeyMismatch`,
-/// `SignatureInvalid`, `ControlBlockInvalid`, `WrongFunderKey`) are real
-/// "do-not-broadcast" stops that could earn dedicated codes later.
+/// `SignatureInvalid`, `ControlBlockInvalid`, `WrongFunderKey`) are
+/// "do-not-broadcast" stops.
 fn map_recover_error(e: RecoverError) -> PopError {
     match e {
         RecoverError::ValueBelowFee {
@@ -348,7 +348,7 @@ async fn recover_one(
     let leaf_script = parse_script(&dep.leaf_script)?;
 
     // Custody-free at the kernel boundary (build_unsigned → signer.sign →
-    // apply_signature); hot-key today, the trait keeps hardware/remote open.
+    // apply_signature); the signer is a trait, here backed by a hot key.
     let signer = HotKeySigner::new(seed, network, dep.funder_index);
     let funder_pubkey = signer
         .funder_pubkey(dep.funder_index)

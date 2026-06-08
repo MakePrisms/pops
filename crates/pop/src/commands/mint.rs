@@ -115,7 +115,7 @@ impl MintArgs {
 }
 
 /// The product of the shared pre-poll half: quote created, funding address
-/// INDEPENDENTLY verified, deposit persisted (Unpaid), recovery file written.
+/// independently verified, deposit persisted (Unpaid), recovery file written.
 /// Consumed by both `quote::run` (stops here) and `mint::run` (polls + mints).
 pub struct QuoteOutcome {
     /// Wallet-local deposit id (uuid).
@@ -147,10 +147,10 @@ impl QuoteOutcome {
     }
 }
 
-/// The shared PRE-POLL half (both `pop mint` and `pop quote`): resolve unit,
-/// derive funder key, create quote, INDEPENDENTLY verify the funding address,
+/// The shared pre-poll half (both `pop mint` and `pop quote`): resolve unit,
+/// derive funder key, create quote, independently verify the funding address,
 /// persist the deposit (Unpaid), write the recovery file. Stops before polling.
-/// Prints NOTHING to stdout (diagnostics go to STDERR).
+/// Prints nothing to stdout (diagnostics go to stderr).
 ///
 /// # Errors
 ///
@@ -475,8 +475,8 @@ async fn finish_mint(
     )
     .await?;
 
-    // VALUE-RECOVERY GATE: `Token::to_string` PANICS on a CBOR `fmt::Error`,
-    // which here would VAPORIZE already-issued bearer ecash. Use the fallible
+    // VALUE-RECOVERY GATE: `Token::to_string` panics on a CBOR `fmt::Error`,
+    // which here would vaporize already-issued bearer ecash. Use the fallible
     // `token_to_string`; on Err, surface `token_encode_failed` carrying the raw
     // proofs so the ecash is recoverable. Must never fire (proof CBOR does not
     // fail).
@@ -860,9 +860,8 @@ mod tests {
             .collect()
     }
 
-    /// On issuance, a token that can't be stringified MUST surface the issued
-    /// ecash as recoverable raw proofs in `token_encode_failed`, NEVER panic (the
-    /// `pay` bug, ported to `mint`).
+    /// On issuance, a token that can't be stringified must surface the issued
+    /// ecash as recoverable raw proofs in `token_encode_failed`, never panic.
     #[test]
     fn token_encode_failure_carries_recoverable_proofs() {
         let proofs = sample_proofs(&[16, 32, 2]); // 50 sats total
@@ -892,8 +891,7 @@ mod tests {
         assert!(cp.is_none());
     }
 
-    /// The fallible stringify (which replaced the panicking `token.to_string()`)
-    /// produces a parseable `cashuB` that round-trips.
+    /// The fallible stringify produces a parseable `cashuB` that round-trips.
     #[test]
     fn token_to_string_roundtrips_a_real_token() {
         use cdk_common::mint_url::MintUrl;

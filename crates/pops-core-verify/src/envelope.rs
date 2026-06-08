@@ -17,17 +17,17 @@
 //! }
 //! ```
 //!
-//! The credential blob is JCS-canonical (`draft-cashu-charge-01` §Encoding); the
-//! inner `request` echo and `cashu_token` strings are opaque (not
-//! re-canonicalized). The echoed `challenge` carries optional `digest`/`opaque`/
-//! `expires` (present iff the 402 carried them) and an optional top-level
-//! `source`; the parser tolerates these and any further unknown fields.
+//! The credential blob is JCS-canonical (RFC 8785); the inner `request` echo and
+//! `cashu_token` strings are opaque (not re-canonicalized). The echoed
+//! `challenge` carries optional `digest`/`opaque`/`expires` (present iff the 402
+//! carried them) and an optional top-level `source`; the parser tolerates these
+//! and any further unknown fields.
 //!
 //! Request object (`request="…"`): a base64url-nopad encoding of the JCS-canonical
 //! bytes of the `draft-cashu-charge-01` request schema —
 //! `{ amount, currency, description?, externalId?, methodDetails: { request, mints } }`
 //! — where `methodDetails.request` is the opaque `creqA…` and `methodDetails.mints`
-//! is the non-empty superset of the creqA's accepted mints.
+//! is the non-empty superset of the `creqA`'s accepted mints.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -45,9 +45,9 @@ pub const PAYMENT_SCHEME: &str = "Payment";
 pub const CASHU_METHOD: &str = "cashu";
 
 /// Echo of the `WWW-Authenticate` auth-params the client round-trips from the
-/// 402 (`draft-cashu-charge-01` steps 4-6). The client echoes `digest`, `opaque`,
-/// and `expires` iff the 402 carried them; each is `None` (and absent on the
-/// JCS-canonical wire) otherwise. Any further unknown field is tolerated.
+/// 402. The client echoes `digest`, `opaque`, and `expires` iff the 402 carried
+/// them; each is `None` (and absent on the JCS-canonical wire) otherwise. Any
+/// further unknown field is tolerated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EchoedChallenge {
     /// Echo of the server-issued challenge id.
@@ -67,8 +67,7 @@ pub struct EchoedChallenge {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opaque: Option<String>,
     /// Echo of the optional challenge expiry (RFC 3339), present iff the 402
-    /// carried it. The verifier rejects an echo whose `expires` is in the past
-    /// (`draft-cashu-charge-01` step 7).
+    /// carried it. The verifier rejects an echo whose `expires` is in the past.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
 }
@@ -81,9 +80,9 @@ pub struct CashuPayload {
     pub cashu_token: String,
 }
 
-/// Full credentials object (`draft-cashu-charge-01` §Credential). The top-level
-/// `source` is optional (tolerated, MUST NOT be required); any further unknown
-/// field is tolerated.
+/// Full `draft-cashu-charge-01` credentials object. The top-level `source` is
+/// optional (tolerated, MUST NOT be required); any further unknown field is
+/// tolerated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentCredentials {
     /// Echo of the WWW-Authenticate auth-params.
@@ -173,7 +172,7 @@ pub fn parse_payment_authorization(
 
 /// Build a credentials blob (inverse of [`parse_payment_authorization`]),
 /// returning the bare base64url-nopad string — the caller prepends `Payment `.
-/// The bytes are JCS-canonical (`draft-cashu-charge-01` §Encoding).
+/// The bytes are JCS-canonical (RFC 8785).
 pub fn encode_payment_credentials(credentials: &PaymentCredentials) -> String {
     // Serialization of owned-String fields cannot fail; `expect` rather than a
     // result-typed signature for a non-recoverable path.
@@ -280,9 +279,8 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
     })
 }
 
-/// Cashu method-details of the request object (`draft-cashu-charge-01` §Request
-/// Schema): the opaque `creqA…` and the non-empty superset of the creqA's
-/// accepted mints.
+/// Cashu method-details of the `draft-cashu-charge-01` request object: the
+/// opaque `creqA…` and the non-empty superset of the `creqA`'s accepted mints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MethodDetails {
     /// The opaque `creqA…` payment-request string.
@@ -291,10 +289,9 @@ pub struct MethodDetails {
     pub mints: Vec<String>,
 }
 
-/// The `request` auth-param object (`draft-cashu-charge-01` §Request Schema).
-/// `amount` is the canonical decimal string and `currency` is the unit; the
-/// cashu specifics live under `methodDetails`. Carried base64url-nopad over its
-/// JCS-canonical bytes.
+/// The `draft-cashu-charge-01` `request` auth-param object. `amount` is the
+/// canonical decimal string and `currency` is the unit; the cashu specifics live
+/// under `methodDetails`. Carried base64url-nopad over its JCS-canonical bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestObject {
     /// Exact amount required, as a decimal string.
@@ -313,8 +310,8 @@ pub struct RequestObject {
 }
 
 /// Encode a [`RequestObject`] as the `request="…"` auth-param: base64url-nopad
-/// over its JCS-canonical bytes (`draft-cashu-charge-01` §Encoding). Cannot fail
-/// (the owned-`String` fields always serialize).
+/// over its JCS-canonical (RFC 8785) bytes. Cannot fail (the owned-`String`
+/// fields always serialize).
 pub fn encode_request_object(object: &RequestObject) -> String {
     let json = serde_jcs::to_string(object).expect("RequestObject always serializes");
     URL_SAFE_NO_PAD.encode(json.as_bytes())
@@ -334,10 +331,8 @@ pub fn decode_request_object(b64: &str) -> Result<RequestObject, Error> {
 
 /// The JSON object inside the `pops-gateway` binary's `request` auth-param,
 /// holding the `creqA…` under a single `cashu_request` field. The gateway
-/// (`gateway.rs`) is a SEPARATE call-site that has not yet been folded onto the
-/// spec [`RequestObject`] codec (`draft-cashu-charge-01` conformance is the
-/// library path — `middleware.rs` — for now); this flat codec serves it until
-/// that de-dup lands.
+/// (`gateway.rs`) is a separate call-site with its own flat codec; the
+/// `draft-cashu-charge-01` request codec is [`RequestObject`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RequestEnvelope {
     cashu_request: String,
@@ -703,7 +698,7 @@ mod tests {
         assert_eq!(strip_quoted(r#""a"b""#), None); // interior quote
     }
 
-    // ---- spec request object (draft-cashu-charge-01 §Request Schema) ---------
+    // ---- draft-cashu-charge-01 request object --------------------------------
 
     fn sample_request_object() -> RequestObject {
         RequestObject {

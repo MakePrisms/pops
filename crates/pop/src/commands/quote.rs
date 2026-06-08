@@ -1,20 +1,19 @@
-//! `pop quote` — the NON-BLOCKING half of `pop mint`.
+//! `pop quote` — the non-blocking half of `pop mint`.
 //!
-//! Does exactly the pre-poll work — resolve the unit, derive a fresh funder
-//! key, create the quote, INDEPENDENTLY verify the funding address, persist the
-//! deposit (Unpaid), and write the recovery file — then prints the funding
-//! instruction and EXITS without waiting for funding. This makes the wallet
-//! cleanly drivable by an agent:
+//! Does the pre-poll work — resolve the unit, derive a fresh funder key, create
+//! the quote, independently verify the funding address, persist the deposit
+//! (Unpaid), and write the recovery file — then prints the funding instruction
+//! and exits without waiting for funding:
 //!
 //! ```text
 //! pop quote ... --json    # -> {deposit_id, funding_address, bip21_uri, ...}
-//! # (agent funds the address)
+//! # (fund the address)
 //! pop mint --resume <deposit_id> --json   # -> the cashuB token
 //! ```
 //!
-//! The crypto is identical to `mint`: it reuses the exact same
-//! `create_and_persist_quote` helper (and thus the same independent address
-//! verification + recovery-file write).
+//! It reuses `mint`'s `create_and_persist_quote` helper, so the crypto —
+//! including the independent address verification and recovery-file write — is
+//! identical.
 
 use std::path::Path;
 
@@ -25,7 +24,7 @@ use crate::recovery::utc_iso8601;
 use crate::wallet::Wallet;
 
 /// Arguments for `pop quote`. These mirror the relevant `pop mint` args; the
-/// funding-poll / token-output / resume knobs do not apply (quote never polls).
+/// funding-poll, token-output, and resume knobs do not apply (quote never polls).
 #[derive(Debug, Parser)]
 #[command(group(
     // A quote ALWAYS needs a unit/lifetime, so exactly one of duration|unit is
@@ -69,7 +68,7 @@ pub struct QuoteArgs {
 
 impl QuoteArgs {
     /// Projects the quote args onto a `MintArgs` so the shared pre-poll helper
-    /// can be reused verbatim. The poll/token-out/resume fields are unused by
+    /// can be reused. The poll, token-out, and resume fields are unused by
     /// `create_and_persist_quote` and are left at inert defaults.
     fn as_mint_args(&self) -> MintArgs {
         MintArgs {

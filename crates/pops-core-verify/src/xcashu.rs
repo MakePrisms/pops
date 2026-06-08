@@ -26,8 +26,8 @@ pub const X_CASHU: &str = "X-Cashu";
 /// Build the `X-Cashu` challenge header value: the bare `creqA…` for `req`.
 ///
 /// There is no inverse envelope — the header value IS the `creqA`, so this is
-/// [`encode_challenge`][crate::challenge::encode_challenge] verbatim. Kept as a
-/// named transport entry point so the `X-Cashu` wire has one obvious producer.
+/// [`encode_challenge`] verbatim, named as
+/// the one transport entry point for the `X-Cashu` wire.
 pub fn xcashu_challenge_value(req: &CashuRequirement) -> String {
     encode_challenge(req)
 }

@@ -188,8 +188,8 @@ write is caught at boot rather than on the first redeemed proof.
 
 ## Building the image yourself
 
-The crate is a workspace member (path deps on `pops-core-verify` /
-`pops-core-types`), so the Docker build context is the **workspace root**:
+The crate is a workspace member (path dep on `pops-core-verify`), so the
+Docker build context is the **workspace root**:
 
 ```sh
 docker build -f crates/pops-gateway/Dockerfile -t pops-gateway .

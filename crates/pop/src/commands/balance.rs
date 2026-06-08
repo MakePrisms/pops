@@ -261,7 +261,7 @@ mod tests {
 
     /// A ledger spanning every state with distinct amounts (a mis-bucket changes a
     /// sum). Includes BOTH a funded-expired row (locked) and an un-funded one (must
-    /// NOT count) to exercise the funding-gated `is_locked` fix.
+    /// NOT count) to exercise the funding-gated `is_locked`.
     fn fixture() -> Vec<Deposit> {
         vec![
             dep(DepositState::Unpaid, 100, 1_000),
@@ -301,7 +301,7 @@ mod tests {
     }
 
     /// Locked is funding-gated, not state-gated: a funded `Expired` counts, an
-    /// identical un-funded one does NOT (the money-overcount fix).
+    /// identical un-funded one does NOT.
     #[test]
     fn expired_counts_as_locked_only_when_funded() {
         let funded = fund(dep(DepositState::Expired, 5_000, 1_000));
@@ -313,7 +313,7 @@ mod tests {
         let only_unfunded = Summary::build(std::slice::from_ref(&unfunded), None);
         assert_eq!(
             only_unfunded.total_locked_sats, 0,
-            "un-funded expired holds no locked BTC (the overcount fix)"
+            "un-funded expired holds no locked BTC"
         );
         // Still in the expired by_state bucket (a state count, not money).
         assert_eq!((only_unfunded.expired.count, only_unfunded.expired.sats), (1, 5_000));

@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use pops_core_types::{ChargeError, RedeemedProofs};
+use pops_core_verify::charge::{ChargeError, RedeemedProofs};
 use pops_core_verify::redeemer::{ChargeRequirement, Redeemed, Redeemer};
 
 /// One redeemable voucher in the ledger: the value it carries and the canonical

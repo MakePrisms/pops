@@ -2,7 +2,7 @@
 //!
 //! `list` is a purely local table (no network). `status` is the human
 //! dashboard; with esplora reachable it computes the live "Recoverable now"
-//! vs "Recoverable-after-<date>" display state from the chain tip's MTP.
+//! vs `Recoverable-after-<date>` display state from the chain tip's MTP.
 
 use std::path::Path;
 

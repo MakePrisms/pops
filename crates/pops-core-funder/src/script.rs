@@ -6,7 +6,7 @@
 //!
 //! The construction is taproot with a NUMS-commit internal key and a single-leaf
 //! script tree holding the CLTV recovery script. The stage functions expose each
-//! intermediate value so callers/tests can pin a single step;
+//! intermediate value so callers/tests can pin one stage in isolation;
 //! [`compute_funding_address`] wires them together.
 
 use bitcoin::hashes::{sha256, Hash, HashEngine};

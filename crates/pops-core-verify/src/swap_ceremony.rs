@@ -27,10 +27,9 @@ use crate::mint_client::MintClientError;
 /// wrong-key) outputs and the verifier would treat the resulting proofs as
 /// redeemed bearer value — and the gateway would serve the resource against them.
 ///
-/// Mirrors the wallet's `verify_blind_signatures` with ONE deliberate
-/// difference: a redeemed-VALUE path MUST NOT tolerate a missing DLEQ. Where the
-/// wallet treats [`nut12::Error::MissingDleqProof`] as acceptable (optional
-/// offline check), here it is a HARD REJECT.
+/// STRICT, not lenient: a redeemed-VALUE path MUST NOT tolerate a missing DLEQ.
+/// A [`nut12::Error::MissingDleqProof`] is a HARD REJECT here (an offline wallet
+/// check may treat it as acceptable; this path cannot).
 ///
 /// Pairs each signature with its blinded message by position — `construct_proofs`
 /// consumes signatures and secrets in lockstep, so the same positional zip is
@@ -64,8 +63,7 @@ fn verify_swap_output_dleq(
             ))
         })?;
 
-        // STRICT: both present-but-invalid AND missing reject here — the single
-        // line that diverges from the wallet's lenient check.
+        // STRICT: both present-but-invalid AND missing reject here.
         sig.verify_dleq(key, premint.blinded_message.blinded_secret)
             .map_err(|e| match e {
                 nut12::Error::MissingDleqProof => MintClientError::SwapOutputDleqInvalid(
@@ -195,7 +193,7 @@ async fn resolve_output_keyset<H: MintHttp + ?Sized>(
 /// the [`MintHttp`] seam, so native and wasm share this body. The blinding RNG is
 /// why the `wasm` feature must select a js `getrandom` backend.
 ///
-/// MONEY-SAFETY INVARIANT: the DLEQ verification ([`verify_swap_output_dleq`])
+/// MONEY-SAFETY INVARIANT: the DLEQ verification (`verify_swap_output_dleq`)
 /// runs BEFORE the unblind, so this never returns proofs whose swap-output DLEQ
 /// was not verified. A DLEQ failure surfaces as
 /// [`MintClientError::SwapOutputDleqInvalid`].
@@ -293,8 +291,8 @@ mod tests {
     enum DleqMode {
         /// Real NUT-12 DLEQ bound to the correct signing key (happy path).
         Valid,
-        /// No DLEQ at all (`dleq: None`) — the core bug: `construct_proofs`
-        /// tolerates this, so the gate MUST reject it.
+        /// No DLEQ at all (`dleq: None`): `construct_proofs` tolerates this, so
+        /// the gate MUST reject it.
         Missing,
         /// A DLEQ that is present but computed against the WRONG key, so it
         /// fails verification against the keyset's advertised key.
@@ -491,8 +489,8 @@ mod tests {
 
     #[tokio::test]
     async fn swap_missing_dleq_rejects_and_yields_no_proofs() {
-        // THE BUG: `dleq: None` signatures. A redeemed-value path does NOT
-        // tolerate a missing DLEQ, so the gate must REJECT with no proofs.
+        // `dleq: None` signatures. A redeemed-value path does NOT tolerate a
+        // missing DLEQ, so the gate must REJECT with no proofs.
         let mint = MockMint::new(DleqMode::Missing);
         let proofs = inputs_for(&mint);
 
