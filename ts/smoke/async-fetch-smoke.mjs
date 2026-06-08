@@ -1,21 +1,19 @@
-// LOCAL async-fetch SMOKE (build-plan Step 2, risk-c / R3 — the key de-risk).
+// Smoke test for the async wasm-bindgen + injected-fetch boundary.
 //
-// Proves the async-across-wasm-bindgen + injected-fetch plumbing end to end:
-// the WASM `verify_and_redeem` reaches `globalThis.fetch`, the LOCAL pops mint
-// answers, and a STRUCTURED `ChargeError` (NOT a panic/hang) comes back across
-// the wasm-bindgen boundary.
+// Proves the plumbing end to end: the WASM `verify_and_redeem` reaches
+// `globalThis.fetch`, the local pops mint answers, and a structured
+// `ChargeError` (not a panic/hang) comes back across the wasm-bindgen boundary.
 //
-// We do NOT need a funded token. With an empty/garbage token the pipeline
-// short-circuits at decode (MalformedCredential) — that already proves the
-// boundary returns structure. With a STRUCTURALLY-VALID token pointed at the
+// A funded token is not required. With an empty/garbage token the pipeline
+// short-circuits at decode (MalformedCredential), which already proves the
+// boundary returns structure. With a structurally-valid token pointed at the
 // local mint, the pipeline proceeds to the injected-fetch keysets GET + swap
-// POST and the mint rejects the (unfunded) proofs — which additionally proves
-// the live fetch round-trip. Both outcomes are a structured rejection; the
-// failure mode this guards against is a panic, a hang, or an unstructured
-// throw.
+// POST and the mint rejects the unfunded proofs, which additionally proves the
+// live fetch round-trip. Both outcomes are a structured rejection; the failure
+// mode this guards against is a panic, a hang, or an unstructured throw.
 //
 // Run:  node ts/smoke/async-fetch-smoke.mjs  [tokenString]
-// Node ≥18 provides a global `fetch` (the runtime the WASM client reflects).
+// Node >=18 provides a global `fetch` (the runtime the WASM client reflects).
 
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -26,8 +24,8 @@ const UNIT = process.env.POPS_UNIT || "pop_1780372941";
 
 const wasm = require(PKG);
 
-// The requirement the route would advertise. Amount/mints are arbitrary for
-// the smoke — the point is the fetch plumbing, not amount conformance.
+// The requirement the route would advertise. Amount and mints are arbitrary
+// here; this test exercises the fetch plumbing, not amount conformance.
 const requirement = {
   amount: 1,
   unit: UNIT,
@@ -75,8 +73,8 @@ async function run(label, presented) {
 const main = async () => {
   let pass = true;
 
-  // Case 1: empty token. Decodes nowhere → MalformedCredential. Proves the
-  // boundary returns a STRUCTURED rejection (no panic) for a non-token input.
+  // Case 1: empty token. Decodes nowhere -> MalformedCredential. Proves the
+  // boundary returns a structured rejection (no panic) for a non-token input.
   {
     const r = await run("empty-token", "");
     const structured = r.code !== undefined && r.ok === false;
@@ -100,28 +98,27 @@ const main = async () => {
     }
   }
 
-  // Case 3 (the load-bearing one): a token argument was supplied — a
-  // STRUCTURALLY-VALID cashuB token for the local mint. This drives the
-  // injected-fetch keysets GET + swap POST against the LIVE mint; the mint
-  // rejects the unfunded/fake proofs. A structured rejection here (NOT a hang
-  // or panic) proves R3: async injected-fetch across wasm-bindgen works and a
-  // mint-side outcome crosses back as structure.
+  // Case 3: a token argument was supplied — a structurally-valid cashuB token
+  // for the local mint. This drives the injected-fetch keysets GET + swap POST
+  // against the live mint; the mint rejects the unfunded/fake proofs. A
+  // structured rejection here (not a hang or panic) proves async injected-fetch
+  // across wasm-bindgen works and a mint-side outcome crosses back as structure.
   const tokenArg = process.argv[2];
   if (tokenArg) {
     const r = await run("live-mint-token", tokenArg);
     const structured = r.code !== undefined && r.ok === false;
     // Any of these codes proves the fetch round-trip happened and returned
     // structure: a swap-rejection (double-spend), a transport classification
-    // (mint-unreachable — if the mint refused at HTTP level), or a decode
+    // (mint-unreachable, if the mint refused at HTTP level), or a decode
     // problem (malformed-credential) if the supplied token didn't parse.
     if (!structured) {
       console.log("  FAIL: expected a structured rejection from the live swap path");
       pass = false;
     } else {
       console.log(`  PASS: live fetch round-trip returned structured code=${r.code}`);
-      // The headline proof: the mint was actually contacted. A double-spend /
-      // expired / amount-mismatch code (vs malformed-credential) means decode
-      // passed and the GET keysets + POST swap fetch round-trip ran.
+      // Confirms the mint was actually contacted. A double-spend / expired /
+      // amount-mismatch code (vs malformed-credential) means decode passed and
+      // the GET keysets + POST swap fetch round-trip ran.
       if (r.code !== "malformed-credential") {
         console.log("  PROOF: decode passed -> injected fetch reached the live mint");
       } else {

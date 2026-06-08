@@ -634,7 +634,7 @@ fn read_token(args: &PayArgs) -> Result<String, Box<dyn std::error::Error>> {
     Ok(buf)
 }
 
-/// Parses the `--method` string into a reqwest [`Method`].
+/// Parses the `--method` string into a reqwest `Method`.
 fn parse_method(m: &str) -> Result<reqwest::Method, Box<dyn std::error::Error>> {
     reqwest::Method::from_bytes(m.to_uppercase().as_bytes())
         .map_err(|e| PopError::invalid_input(format!("invalid --method `{m}`: {e}")).into())

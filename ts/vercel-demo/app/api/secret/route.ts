@@ -1,27 +1,26 @@
 /**
- * The gated endpoint — build-plan Step 2.3.
+ * The Proof-of-Payment gated endpoint.
  *
  * A bare GET 402s with a `WWW-Authenticate: Payment …` challenge. On retry with
  * an `Authorization: Payment <blob>` credential, the route parses the credential
- * (WASM `parse_payment_credential`) and runs the FULL verify+redeem (WASM
- * `verify_and_redeem`) — which performs the NUT-03 swap against the real pops
- * mint over an injected `globalThis.fetch`, INSIDE this Node serverless
- * function. On success it returns 200 + the gated payload; a `ChargeError`
- * becomes 402 (or 503 for a transport failure / 400 for a malformed request),
- * mapped off the structured `code` the WASM rejection carries.
+ * (WASM `parse_payment_credential`) and runs the full verify+redeem (WASM
+ * `verify_and_redeem`), which performs the NUT-03 swap against the pops mint
+ * over an injected `globalThis.fetch`, inside this Node serverless function. On
+ * success it returns 200 + the gated payload; a `ChargeError` becomes 402 (or
+ * 503 for a transport failure / 400 for a malformed request), mapped off the
+ * structured `code` the WASM rejection carries.
  *
- * Node runtime (NOT Edge): the wasm-pack `nodejs` glue reads its `.wasm` via
- * `fs.readFileSync`, and the ~2.3 MB module sits well inside the Node function
- * budget. (Edge is a documented stretch goal, not the MVP — build-plan risk b.)
+ * Node runtime, not Edge: the wasm-pack `nodejs` glue reads its `.wasm` via
+ * `fs.readFileSync`, which Edge cannot do.
  */
 import { NextRequest } from "next/server";
 
-// Node runtime — required (Edge cannot do `fs.readFileSync` of the wasm).
+// Node runtime is required: Edge cannot `fs.readFileSync` the wasm.
 export const runtime = "nodejs";
 // Always run the gate; never cache the 402/200 decision.
 export const dynamic = "force-dynamic";
 
-// The wasm-pack (nodejs target) module type (exports only; structural).
+// Structural type for the wasm-pack (nodejs target) module's exports.
 type PopsWasm = {
   encode_request_envelope(creqA: string): string;
   parse_payment_credential(authorization: string): string;
@@ -35,9 +34,9 @@ type PopsWasm = {
   }>;
 };
 
-// Lazy, request-time load of the WASM package. Deferred (NOT a top-level
+// Lazy, request-time load of the WASM package. Deferred (not a top-level
 // import) so Next's build-time "collect page data" pass does not instantiate
-// the .wasm — only an actual request does. `serverExternalPackages` +
+// the .wasm; only an actual request does. `serverExternalPackages` +
 // `webpack.externals` (next.config.js) keep the package un-bundled so its glue
 // reads `${__dirname}/...bg.wasm` from node_modules with `__dirname` intact.
 let wasmPromise: Promise<PopsWasm> | null = null;
@@ -52,8 +51,8 @@ function loadWasm(): Promise<PopsWasm> {
 const REALM = "pops-vercel-demo";
 const CHALLENGE_ID = "pops-demo";
 
-// The demo charge requirement. THIS is what gates verification — passed to the
-// WASM `verify_and_redeem`. Points at the local pops mint; override the mint at
+// The demo charge requirement that gates verification, passed to the WASM
+// `verify_and_redeem`. Points at the local pops mint; override the mint at
 // deploy time via POPS_MINT_URL if reachable from the function.
 const MINT_URL = process.env.POPS_MINT_URL || "http://100.96.251.111:3338";
 const UNIT = process.env.POPS_UNIT || "pop_1780372941";
@@ -68,9 +67,8 @@ const requirement = {
   single_use: true,
 };
 
-// A FIXED pre-encoded `creqA` matching `requirement` (build-plan §2.3 allows a
-// fixed challenge — challenge-build conformance is not the de-risk). Wrapped in
-// the request envelope at response time via the WASM `encode_request_envelope`.
+// A fixed pre-encoded `creqA` matching `requirement`. Wrapped in the request
+// envelope at response time via the WASM `encode_request_envelope`.
 const CREQ_A =
   "creqApmFpaXBvcHMtZGVtb2FhAWF1bnBvcF8xNzgwMzcyOTQxYXP1YW2BeBpodHRwOi8vMTAwLjk2LjI1MS4xMTE6MzMzOGFkeBxwb3BzIFZlcmNlbC1Ob2RlIGdhdGluZyBkZW1v";
 
@@ -105,10 +103,10 @@ function challenge402(wasm: PopsWasm, detail?: { code: string; message: string }
 
 /**
  * Map a structured `ChargeError` rejection from the WASM boundary onto an HTTP
- * status. The three NON-COLLAPSING concerns the contract mandates:
- *   (A) transport  -> 503 (token NOT consumed, retryable)
- *   (B) verification-> 402 (+ fresh challenge, terminal for this token)
- *   (C) malformed request -> 400 (framework status, NOT 402)
+ * status. These three concerns map to distinct statuses:
+ *   (A) transport          -> 503 (token not consumed, retryable)
+ *   (B) verification        -> 402 (+ fresh challenge, terminal for this token)
+ *   (C) malformed request   -> 400 (not 402)
  */
 function errorToResponse(wasm: PopsWasm, err: unknown): Response {
   const code =
@@ -147,13 +145,13 @@ export async function GET(req: NextRequest): Promise<Response> {
   const wasm = await loadWasm();
   const authorization = req.headers.get("authorization");
 
-  // No credential presented → 402 challenge.
+  // No credential presented -> 402 challenge.
   if (!authorization || !/^payment\s/i.test(authorization.trim())) {
     return challenge402(wasm);
   }
 
   // Parse the credential blob (WASM, cashu-free). A parse failure is a
-  // malformed credential → 402 (the spec scopes malformed-credential to 402).
+  // malformed credential -> 402.
   let cashuToken: string;
   try {
     const credsJson = wasm.parse_payment_credential(authorization);
@@ -169,8 +167,8 @@ export async function GET(req: NextRequest): Promise<Response> {
   // FULL verify + NUT-03 swap over injected fetch, in this Node function.
   try {
     const redeemed = await wasm.verify_and_redeem(cashuToken, JSON.stringify(requirement));
-    // Success: the swap executed, the operator now holds `fresh_proofs`.
-    // (In a real operator this is stashed; here we confirm settlement and gate.)
+    // Success: the swap executed, the operator now holds `fresh_proofs`. A real
+    // operator would stash those; here we confirm settlement and gate.
     return new Response(
       JSON.stringify({
         secret: "the eagle lands at midnight",

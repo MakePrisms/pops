@@ -69,7 +69,7 @@ pub enum MintClientError {
     /// sending), so the outcome is INDETERMINATE: the mint MAY have consumed the
     /// inputs. Kept distinct so the validator surfaces `indeterminate: true` —
     /// same 503+retry, but the operator MUST checkstate before assuming the token
-    /// is good (spec §Durability). Raised ONLY around `post_swap`.
+    /// is good. Raised ONLY around `post_swap`.
     #[error("mint unreachable (indeterminate swap outcome): {0}")]
     UnreachableIndeterminate(String),
 

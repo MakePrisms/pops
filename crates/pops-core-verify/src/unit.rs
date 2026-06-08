@@ -1,13 +1,10 @@
-//! PoPs core types: the `pop_<ts_expiry>` unit grammar (cashu/cdk-free).
+//! The `pop_<ts_expiry>` unit grammar.
 //!
-//! The unit string is `pop_<ts_expiry>` where `ts_expiry` is the Unix-seconds
-//! value in the funding CLTV. The mint, wallet, and verifier all parse/format
-//! through these functions so the grammar cannot drift.
+//! The unit string is `pop_<ts_expiry>`, where `ts_expiry` is the funding CLTV
+//! expiry in Unix seconds. The verifier and the mint must format/parse it
+//! identically or the currency identity silently mismatches.
 
 use thiserror::Error;
-
-pub mod charge;
-pub use charge::{ChargeError, DleqLocation, RedeemedProofs};
 
 /// Errors from parsing the `pop_<ts_expiry>` unit grammar.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -22,24 +19,20 @@ pub enum TypesError {
     #[error("ts_expiry {0} is below the BIP-65 timestamp floor of {1} (values below this are block heights, not timestamps)")]
     TsExpiryTooSmall(u64, u64),
 
-    /// Above `u32::MAX`: the CLTV locktime / `compute_leaf_script` require a u32,
-    /// so rejecting here avoids a downstream `try_from` panic.
+    /// Above `u32::MAX`: a CLTV locktime is a `u32` field, so a larger value has
+    /// no valid timelock to encode.
     #[error("ts_expiry {0} exceeds the u32::MAX ceiling of {1} (CLTV locktime must fit in a u32)")]
     TsExpiryTooLarge(u64, u64),
 }
 
-/// Parse `pop_<u64>` into the leaf `ts_expiry`. The remainder must be the
-/// CANONICAL decimal form (byte-for-byte [`format_pop_unit`]'s output), then is
-/// range-checked to `500_000_000 ..= u32::MAX`.
+/// Parse `pop_<ts_expiry>` into `ts_expiry`, range-checked to
+/// `500_000_000 ..= u32::MAX` (the bounds and their reasons are on the
+/// [`TypesError`] variants).
 ///
-/// Canonical-form is the load-bearing tightening: `u64::from_str` is lenient (a
-/// leading `+` or zeros parse to the SAME integer but a DIFFERENT string), and
-/// the unit string IS the currency identity downstream — so a non-canonical
-/// spelling would mint a credential whose unit never matches the canonical
-/// challenge unit (a silent permanent `WrongUnit`/402). This single source of
-/// truth lets all consumers drop their own front gates. The range bounds:
-/// [`TypesError::TsExpiryTooSmall`] (BIP-65 floor) and
-/// [`TypesError::TsExpiryTooLarge`] (u32 ceiling) — see those variants.
+/// The remainder must be the CANONICAL decimal — byte-for-byte
+/// [`format_pop_unit`]'s output. The unit string is the currency identity, so a
+/// lenient spelling (a leading `+` or zeros) that parses to the same integer but
+/// a different string would silently never match the challenge unit.
 pub fn parse_pop_unit(unit_str: &str) -> Result<u64, TypesError> {
     const TS_EXPIRY_FLOOR: u64 = 500_000_000;
     const TS_EXPIRY_CEILING: u64 = u32::MAX as u64;
@@ -64,8 +57,7 @@ pub fn parse_pop_unit(unit_str: &str) -> Result<u64, TypesError> {
     Ok(ts_expiry)
 }
 
-/// Format a `ts_expiry` value back into its canonical `pop_<ts_expiry>` unit
-/// string. Inverse of [`parse_pop_unit`] on the valid domain.
+/// The canonical `pop_<ts_expiry>` unit string. Inverse of [`parse_pop_unit`].
 pub fn format_pop_unit(ts_expiry: u64) -> String {
     format!("pop_{ts_expiry}")
 }

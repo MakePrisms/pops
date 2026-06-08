@@ -15,9 +15,6 @@ path = "src/main.rs"
 # cashu-typed `CashuRequirement` + `encode_challenge`, the request-envelope
 # codec, and the `Credential` seam. Verify logic is NOT reimplemented here.
 pops-core-verify = { path = "../pops-core-verify", default-features = false, features = ["native"] }
-# The cross-slice contract: `ChargeError` (mapped to HTTP status here) +
-# `RedeemedProofs` (what we persist) + `parse_pop_unit` (config validation).
-pops-core-types = { path = "../pops-core-types" }
 # cashu 0.16 — only to build the cashu-typed `CashuRequirement` (CurrencyUnit /
 # MintUrl / Amount) the verify core's challenge codec consumes. Same major as
 # pops-core-verify; no fork.
@@ -46,7 +43,7 @@ toml = "0.8"
 serde_json = "1"
 
 # ── Observability ───────────────────────────────────────────────────────────
-# JSON structured logs so an agent/operator can parse outcomes (plan §4.2).
+# JSON structured logs for operators.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 

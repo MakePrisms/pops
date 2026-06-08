@@ -1,10 +1,10 @@
 //! `pops-gateway` binary entry point.
 //!
-//! Reads ONE declarative TOML (default `/etc/pops-gateway/config.toml`, override
+//! Reads one declarative TOML (default `/etc/pops-gateway/config.toml`, override
 //! with `POPS_GATEWAY_CONFIG`), fail-fast validates it (structured
-//! `config field <X>: <reason>` to stderr + nonzero exit; NEVER a panic /
-//! stacktrace), emits the LOUD `proofs_sink` value-at-risk warning, then serves
-//! the reverse proxy with JSON structured logs.
+//! `config field <X>: <reason>` to stderr + nonzero exit; never a panic /
+//! stacktrace), emits the `proofs_sink` value-at-risk warning, then serves the
+//! reverse proxy with JSON structured logs for operators.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -19,8 +19,8 @@ use pops_gateway::proofs_sink::ProofsSink;
 const DEFAULT_CONFIG_PATH: &str = "/etc/pops-gateway/config.toml";
 
 fn main() -> ExitCode {
-    // Structured JSON logs so an agent/operator can parse outcomes.
-    // `env-filter` honours RUST_LOG; default to `info`.
+    // JSON structured logs for operators. `env-filter` honours RUST_LOG;
+    // default to `info`.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt()
@@ -39,7 +39,7 @@ fn main() -> ExitCode {
         }
     };
 
-    // ── LOUD proofs_sink warning. ──
+    // ── proofs_sink value-at-risk warning. ──
     tracing::warn!(
         proofs_sink = %validated.proofs_sink.display(),
         "proofs_sink={} holds BEARER ecash = received value; ensure this is a PERSISTENT mount or you will lose received value.",

@@ -25,7 +25,7 @@ use cashu::{Amount, CurrencyUnit, MintUrl};
 use http::{header::AUTHORIZATION, Request, StatusCode};
 use tower::ServiceExt;
 
-use pops_core_types::{ChargeError, DleqLocation, RedeemedProofs};
+use pops_core_verify::charge::{ChargeError, DleqLocation, RedeemedProofs};
 use pops_core_verify::challenge::{
     decode_charge_request, encode_challenge, encode_charge_request, CashuRequirement,
 };

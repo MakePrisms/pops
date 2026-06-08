@@ -22,8 +22,7 @@
 //! The single derived child secret serves **both** funder roles: its
 //! **compressed** public form is the NUT-20 quote-lock pubkey (issuance auth),
 //! its **x-only** form is the `funder_pubkey` baked into `cm` and the CLTV
-//! recovery leaf (on-chain reclaim). This matches `pop_test_tool`, which
-//! derives both encodings from one secret.
+//! recovery leaf (on-chain reclaim).
 
 use bitcoin::bip32::{ChildNumber, DerivationPath, Xpriv};
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
@@ -32,8 +31,8 @@ use bitcoin::Network;
 /// The frozen PoP BIP-32 purpose: `0x506F50` = ASCII `"PoP"`, hardened.
 pub const POP_PURPOSE: u32 = 0x0050_6F50;
 
-/// Current derivation-scheme version recorded in `config.toml`. Bumped only
-/// if the path layout ever changes (it must not, for v1).
+/// Derivation-scheme version recorded in `config.toml`. Bumped only if the
+/// frozen path layout ever changes.
 pub const DERIVATION_VERSION: u32 = 1;
 
 /// SLIP-44 coin type for a network's PoP derivation path.
@@ -146,7 +145,7 @@ mod tests {
     fn pop_purpose_is_ascii_pop() {
         // 0x50 'P', 0x6F 'o', 0x50 'P'.
         assert_eq!(POP_PURPOSE, 0x0050_6F50);
-        // 0x506F50 == decimal 5_271_376 (NOT 5_271_888 — see the module note).
+        // 0x506F50 == decimal 5_271_376.
         assert_eq!(POP_PURPOSE, 5_271_376);
         let bytes = POP_PURPOSE.to_be_bytes();
         assert_eq!(&bytes[1..], b"PoP");
@@ -212,11 +211,9 @@ mod tests {
         assert_eq!(k.xonly, xonly_from_secret);
     }
 
-    /// Pin the derived key for a fixed (seed, mainnet, index 0) so any future
-    /// change to the path or derivation logic breaks loudly. Real-money
-    /// critical: a silent change here would make old deposits unrecoverable.
-    /// The pinned value is captured from this code's own first run; it is the
-    /// canary that the frozen path stays frozen.
+    /// Pins the derived key for a fixed (seed, mainnet, index 0) so any change
+    /// to the path or derivation logic breaks loudly. Real-money critical: a
+    /// silent change here would make old deposits unrecoverable.
     #[test]
     fn mainnet_index0_key_is_pinned() {
         let k = derive_funder_key(&TEST_SEED, Network::Bitcoin, 0).unwrap();
@@ -228,8 +225,8 @@ mod tests {
         );
     }
 
-    /// Captured from the first green run (see `mainnet_index0_key_is_pinned`).
-    /// Derived from TEST_SEED at m/5271376'/0'/0'/0/0.
+    /// The funder x-only pubkey derived from `TEST_SEED` at
+    /// `m/5271376'/0'/0'/0/0` (see `mainnet_index0_key_is_pinned`).
     const PINNED_MAINNET_IDX0_XONLY: &str =
         "875851f8d6c12eaa9eb74393b69c7c6225156ff69bad896b490dbdf8a6aa5d8d";
 }

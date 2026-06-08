@@ -1,19 +1,19 @@
 //! The ecash-agnostic verify seam: the [`Redeemer`] trait + its
 //! decoupled request/result types.
 //!
-//! This is the Axis-A generalization: a `Redeemer` verifies a presented
-//! credential string against a [`ChargeRequirement`] and, on success, redeems
-//! it — returning a [`Redeemed`] whose payload is the cross-slice
-//! [`pops_core_types::RedeemedProofs`] contract. The only ecash-specific logic
+//! A `Redeemer` verifies a presented credential string against a
+//! [`ChargeRequirement`] and, on success, redeems it — returning a
+//! [`Redeemed`] whose payload is the cross-slice
+//! [`crate::charge::RedeemedProofs`] contract. The only ecash-specific logic
 //! lives in the impl ([`CashuCredential`][crate::cashu_credential::CashuCredential]);
 //! the trait + these types name no `cashu` type (all `String`/`u64`), so a
 //! second ecash method could implement the same seam without touching this
 //! module.
 //!
-//! Errors are [`pops_core_types::ChargeError`] — the committed contract the
-//! verifier SDK / HTTP envelope maps off (status / problem-type / retryability).
+//! Errors are [`crate::charge::ChargeError`] — the contract the verifier SDK /
+//! HTTP envelope maps off (status / problem-type / retryability).
 
-use pops_core_types::{ChargeError, RedeemedProofs};
+use crate::charge::{ChargeError, RedeemedProofs};
 use serde::{Deserialize, Serialize};
 
 /// What the verifier requires from a holder for a single charge, decoupled
@@ -32,7 +32,7 @@ pub struct ChargeRequirement {
     /// Currency unit the presented credential must carry. For PoP this is
     /// `pop_<unix_ts>`.
     pub unit: String,
-    /// Mints the verifier accepts (string identity — URL today). Empty means
+    /// Mints the verifier accepts (string identity, a URL). Empty means
     /// "any mint".
     #[serde(default)]
     pub mints: Vec<String>,
@@ -59,7 +59,7 @@ pub struct Redeemed {
     /// Net value the operator received (the requested `amount`).
     pub amount: u64,
     /// The cross-slice redeemed-proofs payload (fresh proofs, active keyset,
-    /// token hash) — `pops_core_types::RedeemedProofs`.
+    /// token hash) — `crate::charge::RedeemedProofs`.
     pub proofs: RedeemedProofs,
 }
 
@@ -70,8 +70,8 @@ pub struct Redeemed {
 /// `wasm32` it is `#[async_trait(?Send)]` (single-threaded, matching the
 /// [`MintClient`][crate::mint_client::MintClient] seam it composes over).
 ///
-/// One impl exists for the MVP ([`CashuCredential`][crate::cashu_credential::CashuCredential]);
-/// the trait is the place a second ecash method would slot in.
+/// The Cashu impl is [`CashuCredential`][crate::cashu_credential::CashuCredential];
+/// a second ecash method would slot in at this trait.
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 pub trait Redeemer {

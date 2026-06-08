@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Build pops-core-verify (feature `wasm`) to a Node-target wasm-pack package
-# consumed by ts/vercel-demo. Output lands in ts/pops-core-wasm/pkg/ (which is
-# git-ignored — wasm-pack writes its own .gitignore there; only this script +
-# the package manifests are committed).
+# consumed by ts/vercel-demo. Output lands in ts/pops-core-wasm/pkg/, which is
+# git-ignored (wasm-pack writes its own .gitignore there); only this script and
+# the package manifests are committed.
 #
-# Prereqs (see /tmp/pops-wasm-notes.md for the canonical setup):
-#   * `source /tmp/pops-env.sh`  — nix rust 1.95 + CC_wasm32/AR_wasm32
-#   * wasm-pack (nixpkgs 0.13.1) + wasm-bindgen-cli 0.2.122 on PATH
-#     (0.2.122 MUST match Cargo.lock; --mode no-install pins to it)
+# Prereqs:
+#   * Rust 1.95 with CC_wasm32 / AR_wasm32 set for the wasm32 target
+#   * wasm-pack 0.13.1 + wasm-bindgen-cli 0.2.122 on PATH
+#     (wasm-bindgen-cli must match Cargo.lock; --mode no-install pins to it)
 #   * a writable CARGO_HOME
 #
 # Usage:  bash ts/build-wasm.sh
@@ -23,7 +23,7 @@ echo ">> building pops-core-verify --features wasm --target nodejs"
 echo ">> out: ${OUT_DIR}"
 
 # Cargo feature flags go AFTER `--`; wasm-pack's own flags come before the
-# crate path (see /tmp/pops-wasm-notes.md gotchas).
+# crate path.
 wasm-pack build "${REPO_ROOT}/crates/pops-core-verify" \
   --target nodejs \
   --out-dir "${OUT_DIR}" \

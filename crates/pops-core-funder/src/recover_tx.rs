@@ -27,7 +27,10 @@ use bitcoin::{
 use crate::error::RecoverError;
 use crate::script::{compute_leaf_hash, compute_leaf_script, compute_output_key, compute_tap_tweak};
 
-/// The mempool-relay floor we never go below (BIP-141 min-relay is 1 sat/vB).
+/// The mempool-relay floor we never go below. 1 sat/vB is Bitcoin Core's
+/// historical min-relay *policy* default (not consensus, not a BIP). Core 29.1
+/// (2025) lowered the default to 0.1 sat/vB; we keep 1 so the tx still relays
+/// on the majority of nodes that have not yet adopted the lower floor.
 pub const MIN_RELAY_FEERATE_SAT_PER_VB: f64 = 1.0;
 
 /// Input `nSequence` for the recovery spend: `0xFFFFFFFD`. Two properties, both

@@ -16,7 +16,7 @@
 //!    route can map the [`ChargeError`] discriminant to an HTTP status
 //!    (402 / 503 / 400).
 
-use pops_core_types::ChargeError;
+use crate::charge::ChargeError;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -96,8 +96,8 @@ pub fn build_payment_credential(credentials_json: &str) -> Result<String, JsValu
 
 /// Stable, machine-readable discriminant for a [`ChargeError`], carried as the
 /// `code` field of the rejection object so the JS route can pick an HTTP status
-/// without parsing prose. Values mirror the spec's problem-types / status
-/// concerns (A=transport→503, B=verification→402, C=malformed→400/402).
+/// without parsing prose. Values mirror the `draft-cashu-charge-01` problem-types:
+/// transport → 503, verification → 402, malformed → 400/402.
 fn charge_error_code(e: &ChargeError) -> &'static str {
     match e {
         ChargeError::MintUnreachable { .. } => "mint-unreachable",
@@ -115,9 +115,6 @@ fn charge_error_code(e: &ChargeError) -> &'static str {
         ChargeError::MalformedCredential(_) => "malformed-credential",
         ChargeError::MalformedRequest(_) => "malformed-request",
         ChargeError::TooManyProofs { .. } => "too-many-proofs",
-        // `#[non_exhaustive]`: any future variant degrades to a generic code
-        // (the route should treat an unknown code conservatively, e.g. 402).
-        _ => "charge-error",
     }
 }
 
@@ -132,7 +129,7 @@ fn charge_error_to_js(e: &ChargeError) -> JsValue {
     obj.into()
 }
 
-/// Full verify + redeem over an injected `fetch`. THE Step-2 export.
+/// Full verify + redeem over an injected `fetch`.
 ///
 /// `presented` is the holder's `cashuB…` token string; `req_json` is the
 /// JSON form of a [`ChargeRequirement`] (`{ amount, unit, mints, payment_id,

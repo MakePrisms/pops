@@ -22,10 +22,10 @@
 //!
 //! **Swap ceremony.** The blinded-output generation + `construct_proofs`
 //! unblind live in the transport-generic
-//! [`swap_to_redeem`][crate::swap_ceremony::swap_to_redeem] helper;
+//! [`swap_to_redeem`] helper;
 //! `CdkMintClient` supplies only the three raw HTTP calls via [`MintHttp`] and
 //! delegates [`MintClient::swap`] to that shared ceremony. The wasm client
-//! ([`WasmMintClient`][crate::wasm_mint_client::WasmMintClient]) drives the
+//! (`WasmMintClient`) drives the
 //! *same* ceremony over an injected `fetch`.
 //!
 //! The implementation assumes a zero-fee keyset (PoP v1 fixes fees at 0).

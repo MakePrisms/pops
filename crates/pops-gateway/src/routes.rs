@@ -7,7 +7,7 @@
 //! free.
 //!
 //! The glob is intentionally tiny: `*` matches any run of characters (including
-//! `/`), `?` matches exactly one. That covers the documented "<glob>" surface
+//! `/`), `?` matches exactly one. That covers the documented `<glob>` surface
 //! (`/free/*`, `*.png`, `/api/v1/*`) without a regex dependency.
 
 use crate::config::RouteConfig;

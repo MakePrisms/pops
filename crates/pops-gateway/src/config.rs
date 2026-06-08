@@ -209,7 +209,7 @@ impl Config {
 
         // charge.unit — keep the parsed ts so the advertised requirement carries
         // the CANONICAL `format_pop_unit(ts)`, never the raw operator spelling.
-        let charge_ts = pops_core_types::parse_pop_unit(self.charge.unit.trim()).map_err(|e| {
+        let charge_ts = pops_core_verify::unit::parse_pop_unit(self.charge.unit.trim()).map_err(|e| {
             ConfigError::new("charge.unit", format!("not a valid pop_<ts> unit: {e}"))
         })?;
 
@@ -253,7 +253,7 @@ impl Config {
         // volume — the exact "lose received value" failure we guard against.
         validate_proofs_sink(&self.proofs_sink)?;
 
-        let unit = CurrencyUnit::Custom(pops_core_types::format_pop_unit(charge_ts));
+        let unit = CurrencyUnit::Custom(pops_core_verify::unit::format_pop_unit(charge_ts));
         let requirement = CashuRequirement {
             unit,
             mints,
@@ -401,7 +401,7 @@ amount = 1
 
     #[test]
     fn unit_is_canonicalized_in_requirement() {
-        // A whitespace-padded unit still advertises a CANONICAL trimmed pop_<ts>
+        // A whitespace-padded unit still advertises a CANONICAL trimmed `pop_<ts>`
         // (built from format_pop_unit(parsed_ts), not the raw string).
         let toml = r#"
 upstream_url = "http://127.0.0.1:9999"

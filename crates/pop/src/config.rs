@@ -17,7 +17,7 @@ pub const CONFIG_FILE: &str = "config.toml";
 
 /// Default mainnet esplora endpoint.
 pub const DEFAULT_ESPLORA_MAINNET: &str = "https://blockstream.info/api";
-/// Default signet (Mutinynet) esplora endpoint — matches `pop_test_tool`.
+/// Default signet (Mutinynet) esplora endpoint.
 pub const DEFAULT_ESPLORA_SIGNET: &str = "https://mutinynet.com/api";
 /// Default testnet esplora endpoint.
 pub const DEFAULT_ESPLORA_TESTNET: &str = "https://blockstream.info/testnet/api";

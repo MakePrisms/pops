@@ -15,9 +15,9 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pops_core_types::RedeemedProofs;
+use pops_core_verify::charge::RedeemedProofs;
 
-/// One persisted settlement record. Mirrors the spec's required shape:
+/// One persisted settlement record:
 /// `{received_at, token_hash, amount, unit, active_keyset_id, fresh_proofs}`.
 ///
 /// `received_at` is Unix seconds at persist time. `fresh_proofs` is the
@@ -44,7 +44,7 @@ pub struct ProofsRecord<'a> {
 /// Holds the open file under a [`Mutex`] so concurrent gated requests serialize
 /// their appends (each line atomic; no interleaving). `append(true)` means the
 /// OS positions every write at EOF, so even multi-process operators do not
-/// clobber, though a single gateway process is the v1 shape.
+/// clobber, though a single gateway process is the expected shape.
 #[derive(Debug)]
 pub struct ProofsSink {
     file: Mutex<File>,
@@ -52,7 +52,7 @@ pub struct ProofsSink {
 
 /// A failure to durably persist redeemed proofs. The caller treats this as
 /// fatal-for-this-request (must NOT forward) and emits the lost `fresh_proofs`
-/// + `token_hash` to stderr as a last resort (spec step 3).
+/// + `token_hash` to stderr as a last resort.
 #[derive(Debug)]
 pub struct PersistError {
     /// What went wrong (open / write / flush / fsync).

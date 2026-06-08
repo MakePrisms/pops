@@ -32,10 +32,6 @@ use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
-// `recovery_address` (the P2TR wrap of an already-tweaked output key) now lives
-// in the `pops-core-funder` kernel as `pops_core_funder::recovery_address`; the
-// recovery flow calls it through the kernel.
-
 /// Funder-side CLI wallet for PoP credentials.
 #[derive(Debug, Parser)]
 #[command(

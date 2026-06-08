@@ -30,7 +30,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::{header::HeaderValue, HeaderName, StatusCode};
-use pops_core_types::ChargeError;
+use crate::charge::ChargeError;
 
 use crate::cashu_credential::charge_requirement_from_cashu;
 use crate::challenge::CashuRequirement;

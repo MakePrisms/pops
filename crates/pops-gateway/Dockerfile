@@ -5,14 +5,11 @@
 # /etc/pops-gateway/config.toml and points clients at the gateway.
 #
 # Build context = the WORKSPACE ROOT (the gateway depends on the sibling
-# path-crates pops-core-verify / pops-core-types, so the whole workspace must
-# be in context):
+# path-crate pops-core-verify, so the whole workspace must be in context):
 #
 #   docker build -f crates/pops-gateway/Dockerfile -t pops-gateway .
 #
-# (The published image — ghcr.io/makeprisms/pops-gateway — is produced by
-# CI/release; this Dockerfile is the buildable shape, no local build for the
-# operator.)
+# The published image is ghcr.io/makeprisms/pops-gateway.
 
 # ── Stage 1: builder ────────────────────────────────────────────────────────
 FROM rust:1.95-slim-bookworm AS builder

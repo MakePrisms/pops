@@ -9,14 +9,14 @@
 //! obviously-bad token — or a flood of them — never reaches the mint.
 //!
 //! [`ChargeValidator`] is the cashu-typed engine; [`CashuCredential`] wraps it
-//! to expose the ecash-agnostic [`Redeemer`][crate::redeemer::Redeemer]
-//! seam (converting to `String`/`u64` and the [`pops_core_types`] contract).
+//! to expose the ecash-agnostic [`Redeemer`]
+//! seam (converting to `String`/`u64` and the [`charge`](crate::charge) contract).
 
 use std::str::FromStr;
 
 use cashu::nuts::nut00::ProofsMethods;
 use cashu::{Amount, CurrencyUnit, MintUrl, Proofs, Token};
-use pops_core_types::{ChargeError, DleqLocation, RedeemedProofs};
+use crate::charge::{ChargeError, DleqLocation, RedeemedProofs};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -43,7 +43,7 @@ pub struct ValidatedCharge {
 /// `MintNotAllowed`, `AmountMismatch`, `TokenEmpty`, `LockedToken`,
 /// `MultiMintOrUnit`, `TooManyProofs`) are raised BEFORE the swap is ever
 /// attempted; the rest are raised at/after it. [`CashuCredential`] maps these
-/// onto [`pops_core_types::ChargeError`][pops_core_types::ChargeError].
+/// onto [`crate::charge::ChargeError`].
 #[derive(Debug, Error)]
 pub enum ValidationError {
     /// Token unit does not match the requirement's unit.
@@ -374,7 +374,7 @@ fn token_hash_hex(presented: &str) -> String {
 
 /// Map a cashu-typed [`ValidationError`] onto the cross-slice [`ChargeError`].
 /// `mint_url` supplies the transport context the cashu arm does not carry. The
-/// two money-safety arms (DoubleSpend interim, DLEQ) are noted inline.
+/// two money-safety arms (DoubleSpend, DLEQ) are noted inline.
 fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
     match e {
         ValidationError::MintUnreachable(detail) => ChargeError::MintUnreachable {
@@ -410,9 +410,9 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
         ValidationError::MalformedToken(msg) => {
             ChargeError::MalformedCredential(format!("malformed token: {msg}"))
         }
-        // SAFE interim: both swap-rejections (expired credential OR
-        // double-spent proof) collapse to DoubleSpend=402. The Expired split
-        // needs the mint's NUT-03 error-body parse (conformance stream, G5).
+        // Both swap-rejections (expired credential OR double-spent proof)
+        // currently surface as DoubleSpend=402. Splitting out an Expired arm
+        // needs the mint's NUT-03 error-body parse, which is not yet done.
         ValidationError::MintRejectedSwap(_) => ChargeError::DoubleSpend,
         // Money-safety: a missing/invalid swap-output DLEQ is verification-
         // failed at the SwapOutput location — a 402 (gateway serves nothing),
@@ -1280,7 +1280,7 @@ mod tests {
 
     use super::CashuCredential;
     use crate::redeemer::{ChargeRequirement, Redeemer};
-    use pops_core_types::ChargeError;
+    use crate::charge::ChargeError;
 
     fn charge_req(unit: &str, mints: Vec<MintUrl>, amount: u64) -> ChargeRequirement {
         ChargeRequirement {
@@ -1398,8 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_rejected_swap_to_double_spend() {
-        // SAFE interim: any swap rejection collapses to DoubleSpend (see
-        // `map_validation_error`).
+        // Any swap rejection collapses to DoubleSpend (see `map_validation_error`).
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)])
             .to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
@@ -1421,7 +1420,7 @@ mod tests {
     async fn verify_and_redeem_maps_swap_output_dleq_to_dleq_invalid_swap_output() {
         // Money-safety: a swap-output DLEQ failure maps to DleqInvalid{SwapOutput},
         // NOT DoubleSpend — the gateway serves nothing and no proofs are produced.
-        use pops_core_types::DleqLocation;
+        use crate::charge::DleqLocation;
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
 
