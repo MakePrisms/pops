@@ -113,7 +113,7 @@ fn list_is_json_by_default_with_envelope() {
 }
 
 /// `balance` degrades gracefully on an unreachable chain: `recoverable_now` null
-/// + `mtp_available` false, but still EXITS 0 with a single JSON object (a chain
+/// and `mtp_available` false, but still EXITS 0 with a single JSON object (a chain
 /// read never hard-fails balance); the warning lands on stderr.
 #[test]
 fn balance_degrades_to_null_recoverable_when_chain_unreachable() {

@@ -75,6 +75,19 @@ pub enum PopError {
         /// Computed fee, sats.
         fee_sats: u64,
     },
+    /// An AUTO-ESTIMATED recovery fee would consume an unreasonable fraction of
+    /// the UTXO (a hostile/misconfigured `/fee-estimates` endpoint, or a tiny
+    /// UTXO in a high-fee market). Refused BEFORE broadcast so the BTC isn't
+    /// burned to the miner; pass an explicit `--fee <sats>` to set the fee
+    /// yourself, or `--no-broadcast` to inspect the tx first. (`fee_too_high`)
+    FeeTooHigh {
+        /// The resolved fee, sats.
+        fee_sats: u64,
+        /// The UTXO value, sats.
+        value_sats: u64,
+        /// The guard threshold: max fee as a percent of value.
+        max_percent: u64,
+    },
     /// A wallet is required but none is initialized. (`wallet_not_initialized`)
     WalletNotInitialized {
         /// Human help.
@@ -302,6 +315,7 @@ impl PopError {
             PopError::AmountMismatch { .. } => "amount_mismatch",
             PopError::QuoteExpired { .. } => "quote_expired",
             PopError::ValueBelowFee { .. } => "value_below_fee",
+            PopError::FeeTooHigh { .. } => "fee_too_high",
             PopError::WalletNotInitialized { .. } => "wallet_not_initialized",
             PopError::WalletExists { .. } => "wallet_exists",
             PopError::InvalidMnemonic { .. } => "invalid_mnemonic",
@@ -381,6 +395,15 @@ impl PopError {
             } => Some(json!({
                 "value_sats": value_sats,
                 "fee_sats": fee_sats,
+            })),
+            PopError::FeeTooHigh {
+                fee_sats,
+                value_sats,
+                max_percent,
+            } => Some(json!({
+                "fee_sats": fee_sats,
+                "value_sats": value_sats,
+                "max_percent": max_percent,
             })),
             PopError::MintUnreachable { mint_url } => Some(json!({
                 "mint_url": mint_url,
@@ -606,6 +629,15 @@ impl PopError {
             } => format!(
                 "UTXO value ({value_sats} sat) is not greater than the fee ({fee_sats} sat); \
                  lower the fee or wait for the feerate to drop"
+            ),
+            PopError::FeeTooHigh {
+                fee_sats,
+                value_sats,
+                max_percent,
+            } => format!(
+                "estimated fee {fee_sats} sat is >= {max_percent}% of the UTXO ({value_sats} sat); \
+                 refusing to burn it to the miner. Re-run with an explicit --fee <sats> if this is \
+                 intentional, --no-broadcast to inspect first, or wait for the feerate to drop"
             ),
             PopError::WalletNotInitialized { message }
             | PopError::WalletExists { message }
@@ -1098,6 +1130,11 @@ mod tests {
             PopError::ValueBelowFee {
                 value_sats: 1,
                 fee_sats: 2,
+            },
+            PopError::FeeTooHigh {
+                fee_sats: 90,
+                value_sats: 100,
+                max_percent: 50,
             },
             PopError::WalletNotInitialized {
                 message: "m".into(),
