@@ -57,14 +57,14 @@ pub fn compute_cm(
 ) -> [u8; 32] {
     // Tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg).
     let tag_hash = sha256::Hash::hash(POP_COMMIT_TAG);
-    let mut eng = sha256::Hash::engine();
-    eng.input(tag_hash.as_ref());
-    eng.input(tag_hash.as_ref());
-    eng.input(mint_pubkey);
-    eng.input(&ts_expiry.to_be_bytes());
-    eng.input(nonce);
-    eng.input(&funder_pubkey.serialize());
-    sha256::Hash::from_engine(eng).to_byte_array()
+    let mut hash_engine = sha256::Hash::engine();
+    hash_engine.input(tag_hash.as_ref());
+    hash_engine.input(tag_hash.as_ref());
+    hash_engine.input(mint_pubkey);
+    hash_engine.input(&ts_expiry.to_be_bytes());
+    hash_engine.input(nonce);
+    hash_engine.input(&funder_pubkey.serialize());
+    sha256::Hash::from_engine(hash_engine).to_byte_array()
 }
 
 /// Computes `P_internal = NUMS_H + cm·G` (`cm` as a scalar mod the curve order,

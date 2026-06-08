@@ -53,7 +53,7 @@ fn verify_swap_output_dleq(
         )));
     }
 
-    for (sig, premint) in signatures.iter().zip(pre_mint.secrets.iter()) {
+    for (sig, pre_mint_secret) in signatures.iter().zip(pre_mint.secrets.iter()) {
         // No advertised key for this amount ⇒ the mint signed an amount it never
         // published a key for — reject.
         let key = keys.amount_key(sig.amount).ok_or_else(|| {
@@ -64,7 +64,7 @@ fn verify_swap_output_dleq(
         })?;
 
         // STRICT: both present-but-invalid AND missing reject here.
-        sig.verify_dleq(key, premint.blinded_message.blinded_secret)
+        sig.verify_dleq(key, pre_mint_secret.blinded_message.blinded_secret)
             .map_err(|e| match e {
                 nut12::Error::MissingDleqProof => MintClientError::SwapOutputDleqInvalid(
                     "mint omitted the DLEQ proof on a swap-output blind signature \
@@ -405,21 +405,28 @@ mod tests {
             let last = outputs.len().saturating_sub(1);
 
             let mut signatures = Vec::with_capacity(outputs.len());
-            for (i, bm) in outputs.iter().enumerate() {
-                let k = self.secret_key(bm.amount);
+            for (i, blinded_message) in outputs.iter().enumerate() {
+                let k = self.secret_key(blinded_message.amount);
                 // Correct blind signature C_ = k * B_ in every mode, so the
                 // ONLY thing under test is the DLEQ (not the unblinding).
-                let c = sign_message(&k, &bm.blinded_secret).expect("mock sign_message");
+                let c =
+                    sign_message(&k, &blinded_message.blinded_secret).expect("mock sign_message");
 
                 let attach_valid_dleq = |c: PublicKey, k: &SecretKey| -> BlindSignature {
-                    BlindSignature::new(bm.amount, c, id, &bm.blinded_secret, k.clone())
-                        .expect("mock DLEQ generation")
+                    BlindSignature::new(
+                        blinded_message.amount,
+                        c,
+                        id,
+                        &blinded_message.blinded_secret,
+                        k.clone(),
+                    )
+                    .expect("mock DLEQ generation")
                 };
 
                 let sig = match self.mode {
                     DleqMode::Valid => attach_valid_dleq(c, &k),
                     DleqMode::Missing => BlindSignature {
-                        amount: bm.amount,
+                        amount: blinded_message.amount,
                         keyset_id: id,
                         c,
                         dleq: None,
@@ -427,14 +434,21 @@ mod tests {
                     DleqMode::InvalidWrongKey => {
                         // Correct C_, but the DLEQ is proved against a DIFFERENT
                         // key, so it fails verification against the real key.
-                        let wrong = mint_secret_for_amount(u64::from(bm.amount) + 1000);
-                        BlindSignature::new(bm.amount, c, id, &bm.blinded_secret, wrong)
-                            .expect("mock (wrong-key) DLEQ generation")
+                        let wrong =
+                            mint_secret_for_amount(u64::from(blinded_message.amount) + 1000);
+                        BlindSignature::new(
+                            blinded_message.amount,
+                            c,
+                            id,
+                            &blinded_message.blinded_secret,
+                            wrong,
+                        )
+                        .expect("mock (wrong-key) DLEQ generation")
                     }
                     DleqMode::ValidButOneMissing => {
                         if i == last {
                             BlindSignature {
-                                amount: bm.amount,
+                                amount: blinded_message.amount,
                                 keyset_id: id,
                                 c,
                                 dleq: None,

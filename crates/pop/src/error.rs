@@ -736,13 +736,13 @@ impl PopError {
                 change_token,
                 ..
             } => {
-                let ct = match change_token {
+                let change_suffix = match change_token {
                     Some(_) => " plus a change token",
                     None => "",
                 };
                 format!(
                     "the gateway rejected the payment (HTTP {status}): {body}. The gateway did \
-                     NOT redeem, so the send token{ct} are unspent ecash — RECOVER them \
+                     NOT redeem, so the send token{change_suffix} are unspent ecash — RECOVER them \
                      (json: `details.send_token`/`details.change_token`; human mode prints them below)"
                 )
             }
@@ -751,14 +751,14 @@ impl PopError {
                 change_token,
                 ..
             } => {
-                let ct = match change_token {
+                let change_suffix = match change_token {
                     Some(_) => " plus a change token",
                     None => "",
                 };
                 format!(
                     "the payment retry to the gateway failed after the swap already spent the \
                      held proofs ({reason}). The retry never reached the gateway, so the send \
-                     token{ct} are unspent ecash — RECOVER them and present the send token to \
+                     token{change_suffix} are unspent ecash — RECOVER them and present the send token to \
                      the gateway directly; do NOT retry with the original --token (it is spent) \
                      (json: `details.send_token`/`details.change_token`; human mode prints them below)"
                 )

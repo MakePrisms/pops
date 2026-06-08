@@ -110,20 +110,20 @@ impl HotKeySigner {
 impl Signer for HotKeySigner {
     fn funder_pubkey(&self, index: u32) -> Result<FunderPubkey, SignerError> {
         let secp = Secp256k1::new();
-        let fk = derive_funder_key(&self.seed, self.network, index)
+        let funder_key = derive_funder_key(&self.seed, self.network, index)
             .map_err(|e| SignerError::Derivation(e.to_string()))?;
-        let compressed = fk.secret_key.public_key(&secp);
+        let compressed = funder_key.secret_key.public_key(&secp);
         Ok(FunderPubkey {
-            xonly: fk.xonly,
+            xonly: funder_key.xonly,
             compressed,
         })
     }
 
     fn sign(&self, sighash: TapSighash) -> Result<schnorr::Signature, SignerError> {
         let secp = Secp256k1::new();
-        let fk = derive_funder_key(&self.seed, self.network, self.index)
+        let funder_key = derive_funder_key(&self.seed, self.network, self.index)
             .map_err(|e| SignerError::Derivation(e.to_string()))?;
-        let keypair = Keypair::from_secret_key(&secp, &fk.secret_key);
+        let keypair = Keypair::from_secret_key(&secp, &funder_key.secret_key);
         let msg = Message::from_digest(sighash.to_byte_array());
         Ok(secp.sign_schnorr_no_aux_rand(&msg, &keypair))
     }
@@ -135,9 +135,9 @@ impl Signer for HotKeySigner {
     ) -> Result<(), SignerError> {
         // Bridge the funder secret into cdk-common's key type (hex round-trip),
         // NUT-20-sign + self-verify in place.
-        let fk = derive_funder_key(&self.seed, self.network, index)
+        let funder_key = derive_funder_key(&self.seed, self.network, index)
             .map_err(|e| SignerError::Derivation(e.to_string()))?;
-        let funder_secret_hex = Zeroizing::new(hex::encode(fk.secret_key.secret_bytes()));
+        let funder_secret_hex = Zeroizing::new(hex::encode(funder_key.secret_key.secret_bytes()));
         let cdk_secret = cdk_common::SecretKey::from_hex(funder_secret_hex.as_str())
             .map_err(|e| SignerError::Signing(format!("funder secret -> cdk secret: {e}")))?;
         req.sign(cdk_secret.clone())
