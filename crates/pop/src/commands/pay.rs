@@ -153,7 +153,7 @@ pub async fn run(
         reason: format!("WWW-Authenticate Payment params did not parse: {e}"),
     })?;
 
-    // ---- 3b/3c. Unwrap the request envelope → creqA → the concrete charge. ----
+    // ---- 3b/3c. Decode the request object → creqA → the concrete charge. ----
     let charge = decode_charge_from_params(&params)?;
     eprintln!(
         "Charge: {} sat of {} (mints: {})",
@@ -466,9 +466,11 @@ async fn build_exact_payment(
 }
 
 /// Decodes the concrete [`Charge`] from parsed 402 params: read the
-/// `draft-cashu-charge-01` request object (`amount`/`currency`/`methodDetails`),
-/// enforcing its mints-superset over the inner creqA. A 0-sat charge is rejected
-/// before any spend (an exact 0-sat charge is meaningless).
+/// `draft-cashu-charge-01` request object, deriving amount/unit/mints from the
+/// authoritative `methodDetails.paymentRequest` (the shared codec rejects a
+/// creqA missing `a`/`u`/`m` or disagreeing with the top-level
+/// `amount`/`currency`). A 0-sat charge is rejected before any spend (an exact
+/// 0-sat charge is meaningless).
 fn decode_charge_from_params(params: &PaymentParams) -> Result<Charge, Box<dyn std::error::Error>> {
     let decoded =
         decode_charge_request(&params.request).map_err(|e| PopError::ChallengeParseFailed {
@@ -854,7 +856,7 @@ mod tests {
             description: None,
             single_use: true,
         };
-        let request = encode_charge_request(&req);
+        let request = encode_charge_request(&req).expect("requirement encodes");
         let header = format!(
             r#"Payment id="ch-1", realm="pops", method="cashu", intent="charge", request="{request}""#
         );
@@ -867,6 +869,29 @@ mod tests {
         assert_eq!(c.amount, 777);
         assert_eq!(c.unit, pop_unit());
         assert_eq!(c.mints, vec![mint_a()]);
+    }
+
+    #[test]
+    fn decode_charge_from_params_rejects_legacy_request_shape() {
+        // The pre-spec wire carried `methodDetails.request` + `methodDetails.mints`;
+        // the client parses ONLY the `paymentRequest` shape.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let legacy = URL_SAFE_NO_PAD.encode(
+            br#"{"amount":"777","currency":"pop_1782668279","methodDetails":{"mints":["https://mint.example"],"request":"creqAx"}}"#,
+        );
+        let params = PaymentParams {
+            id: "ch-1".into(),
+            realm: "pops".into(),
+            method: "cashu".into(),
+            intent: "charge".into(),
+            request: legacy,
+        };
+        let err = decode_charge_from_params(&params).expect_err("legacy shape must not parse");
+        assert_eq!(
+            crate::error::from_boxed(err).code(),
+            "challenge_parse_failed"
+        );
     }
 
     #[test]
@@ -892,7 +917,7 @@ mod tests {
             description: None,
             single_use: true,
         };
-        let request = encode_charge_request(&req);
+        let request = encode_charge_request(&req).expect("requirement encodes");
         let header = format!(
             r#"Payment id="ch-42", realm="pops", method="cashu", intent="charge", request="{request}""#
         );

@@ -139,30 +139,36 @@ fn body_json(bytes: &[u8]) -> serde_json::Value {
     serde_json::from_slice(bytes).expect("body is JSON")
 }
 
-// ──────────────────── request object (D-3 / D-4 / D-8 mints) ─────────────────
+// ──────────────────── request object (spec Request Schema + Encoding) ────────
 
 #[test]
 fn spec_request_object_round_trips_and_is_jcs_canonical() {
     // requirement → 402 request param → decoded amount/unit/mints + creqA.
-    let request = encode_charge_request(&requirement());
+    let request = encode_charge_request(&requirement()).expect("requirement encodes");
 
     let decoded = decode_charge_request(&request).expect("request object decodes");
     assert_eq!(decoded.amount, Amount::from(100));
     assert_eq!(decoded.unit, pop_unit());
-    assert_eq!(decoded.mints, vec![mint_a()]);
+    assert_eq!(decoded.mints, vec![mint_a()], "mints derive from the creqA `m`");
     assert_eq!(decoded.external_id.as_deref(), Some("inv-42"));
     assert!(decoded.creq_a.starts_with("creqA"));
 
     // The base64url-nopad payload is the JCS-canonical bytes: keys sorted at both
-    // levels, ECMAScript number/string forms, no insignificant whitespace.
+    // levels, ECMAScript number/string forms, no insignificant whitespace, and
+    // methodDetails carrying exactly ONE field — paymentRequest. (Expected JSON
+    // hand-written from the spec's Request Schema example.)
     let obj = decode_request_object(&request).expect("request object struct");
     let bytes = URL_SAFE_NO_PAD.decode(&request).expect("base64url decodes");
     let json = std::str::from_utf8(&bytes).expect("utf8");
     let expected = format!(
-        r#"{{"amount":"100","currency":"pop_1782668279","description":"read access","externalId":"inv-42","methodDetails":{{"mints":["https://mint.example"],"request":"{}"}}}}"#,
-        obj.method_details.request
+        r#"{{"amount":"100","currency":"pop_1782668279","description":"read access","externalId":"inv-42","methodDetails":{{"paymentRequest":"{}"}}}}"#,
+        obj.method_details.payment_request
     );
     assert_eq!(json, expected, "request object must be JCS-canonical");
+    assert!(
+        !json.contains("\"mints\""),
+        "methodDetails.mints is deleted from the wire: {json}"
+    );
 
     // It is base64url-nopad (no '+', '/', '=').
     for c in request.chars() {
@@ -174,25 +180,59 @@ fn spec_request_object_round_trips_and_is_jcs_canonical() {
 }
 
 #[test]
-fn request_object_rejects_mints_subset() {
-    // The creqA names mint.example; methodDetails names a DIFFERENT mint only, so
-    // it is not a superset → reject (draft-cashu-charge-01 §Request Schema).
-    let creq = encode_challenge(&requirement());
-    let object = RequestObject {
-        amount: "100".into(),
-        currency: "pop_1782668279".into(),
-        description: None,
-        external_id: None,
-        method_details: MethodDetails {
-            request: creq,
-            mints: vec!["https://other.example".into()],
-        },
-    };
-    let encoded = encode_request_object(&object);
+fn emitted_creqa_carries_amount_unit_and_nonempty_mints() {
+    // Spec Method Details: the server MUST encode `a` and `u` and MUST populate
+    // `m` with a non-empty mint set; transports MUST be empty; nut10 MUST be
+    // absent. Decode the emitted creqA independently and check each.
+    use cashu::nuts::nut18::PaymentRequest;
+    use std::str::FromStr as _;
+
+    let request = encode_charge_request(&requirement()).expect("requirement encodes");
+    let obj = decode_request_object(&request).expect("request object struct");
+    let creq = PaymentRequest::from_str(&obj.method_details.payment_request)
+        .expect("paymentRequest is a parseable creqA");
+
+    assert_eq!(creq.amount, Some(Amount::from(100)), "creqA carries `a`");
+    assert_eq!(creq.unit, Some(pop_unit()), "creqA carries `u`");
+    assert_eq!(creq.mints, vec![mint_a()], "creqA carries a non-empty `m`");
+    assert!(creq.transports.is_empty(), "transport set must be empty (in-band)");
+    assert!(creq.nut10.is_none(), "bearer profile: nut10 must be absent");
+}
+
+#[test]
+fn requirement_without_mints_cannot_be_emitted() {
+    // Emit-side a/u/m enforcement: `m` must be non-empty, so a no-mints
+    // requirement fails at encode (server misconfiguration, caught early).
+    let mut req = requirement();
+    req.mints = vec![];
     assert!(
-        decode_charge_request(&encoded).is_err(),
-        "a mints-subset request object must be rejected"
+        encode_charge_request(&req).is_err(),
+        "a requirement naming no mints must not encode into a challenge"
     );
+}
+
+#[test]
+fn request_object_rejects_top_level_fields_disagreeing_with_creqa() {
+    // The creqA is authoritative; top-level amount/currency must match it
+    // (amounts compared as integers). Hand-build a disagreeing object.
+    let creq = encode_challenge(&requirement()); // a=100, u=pop_1782668279
+    for (amount, currency) in [("101", "pop_1782668279"), ("100", "sat")] {
+        let object = RequestObject {
+            amount: amount.into(),
+            currency: currency.into(),
+            description: None,
+            external_id: None,
+            method_details: MethodDetails {
+                payment_request: creq.clone(),
+            },
+        };
+        let encoded = encode_request_object(&object);
+        assert!(
+            decode_charge_request(&encoded).is_err(),
+            "amount/currency disagreeing with the creqA must be rejected \
+             (amount={amount}, currency={currency})"
+        );
+    }
 }
 
 // ──────────────────── credential echo with optional fields ──────────────────

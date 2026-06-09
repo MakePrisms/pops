@@ -18,11 +18,11 @@ use http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use pops_core_verify::charge::ChargeError;
 use pops_core_verify::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use pops_core_verify::cdk_mint_client::CdkMintClient;
-use pops_core_verify::challenge::{encode_challenge, CashuRequirement};
+use pops_core_verify::challenge::{encode_charge_request, CashuRequirement};
 use pops_core_verify::http_status::charge_error_status;
 use pops_core_verify::redeemer::Redeemer;
 use pops_core_verify::envelope::{
-    encode_request_envelope, parse_payment_authorization, AuthParseError, PAYMENT_SCHEME,
+    parse_payment_authorization, AuthParseError, PAYMENT_SCHEME,
 };
 
 use crate::config::ValidatedConfig;
@@ -95,15 +95,18 @@ impl AppState<CashuCredential<CdkMintClient>> {
 }
 
 /// Build the `WWW-Authenticate: Payment …` value once from the requirement.
+/// The `request` param is the shared `draft-cashu-charge-01` request object
+/// codec ([`encode_charge_request`]) — the same object the core middleware
+/// emits, so the two hosts speak ONE wire.
 fn build_www_authenticate(requirement: &CashuRequirement) -> HeaderValue {
-    let encoded_challenge = encode_challenge(requirement);
-    let request_envelope = encode_request_envelope(&encoded_challenge);
+    let request_object = encode_charge_request(requirement)
+        .expect("ValidatedConfig guarantees a non-empty mint set (charge.mints defaults to [mint_url])");
     let header = format!(
-        r#"{PAYMENT_SCHEME} id="{CHALLENGE_ID}", realm="{REALM}", method="cashu", intent="{INTENT_CHARGE}", request="{request_envelope}""#
+        r#"{PAYMENT_SCHEME} id="{CHALLENGE_ID}", realm="{REALM}", method="cashu", intent="{INTENT_CHARGE}", request="{request_object}""#
     );
     // All components are base64url-nopad / ASCII; from_str validates as a guard.
     HeaderValue::from_str(&header)
-        .expect("WWW-Authenticate value is ASCII (creqA envelope is base64url-nopad)")
+        .expect("WWW-Authenticate value is ASCII (request object is base64url-nopad)")
 }
 
 /// The axum catch-all handler. Every request (except the gateway-own health

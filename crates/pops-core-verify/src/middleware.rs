@@ -280,7 +280,18 @@ fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>)
     // bound to its params (no HMAC over them).
     let id = Uuid::new_v4().to_string();
 
-    let request = encode_charge_request(requirement);
+    // The one encode failure is a requirement naming no mints — server
+    // misconfiguration, never the client's fault → 500, not a payment status.
+    let request = match encode_charge_request(requirement) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to encode challenge request object: {e}"),
+            )
+                .into_response();
+        }
+    };
 
     // TODO: wire `realm` through middleware state.
     let realm = DEFAULT_REALM;

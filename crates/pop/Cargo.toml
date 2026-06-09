@@ -19,7 +19,7 @@ path = "src/main.rs"
 pops-core-funder = { path = "../pops-core-funder" }
 
 # The cashu-free `Payment` auth-scheme codec (HTTP-402 client primitives:
-# parse_payment_params / decode_request_envelope / encode_payment_credentials +
+# parse_payment_params / decode_charge_request / encode_payment_credentials +
 # their structs). `default-features = false` drops the crate's `native` surface
 # (cdk/axum/http/uuid) — `pay` only needs the envelope codec. See `crate::http402`
 # for the thin re-export the pay command uses.
@@ -60,6 +60,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Hand-builds legacy/raw `request` auth-param blobs in the pay-command tests.
+base64 = "0.22"
 # Recovery-path integration tests (`tests/pay_recovery.rs`) stand up an
 # in-process TCP stub that plays both the pops-gateway (the 402 + retry) and the
 # mint (`/v1/keysets`, `/v1/keys`, `/v1/swap`) so the post-swap value-recovery

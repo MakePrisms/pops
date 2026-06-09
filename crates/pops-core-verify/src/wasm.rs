@@ -47,7 +47,7 @@ pub fn parse_payment_params(www_authenticate: &str) -> Result<String, JsValue> {
 
 /// Decode the base64url-nopad `request` auth-param into the JSON
 /// `draft-cashu-charge-01` request object (`{amount, currency, description?,
-/// externalId?, methodDetails:{request, mints}}`).
+/// externalId?, methodDetails:{paymentRequest}}`).
 #[wasm_bindgen]
 pub fn decode_request_object(b64: &str) -> Result<String, JsValue> {
     let object = core_decode_request_object(b64).map_err(js_err)?;

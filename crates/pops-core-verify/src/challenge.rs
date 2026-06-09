@@ -1,10 +1,12 @@
 //! The cashu-coupled `creqA` layer (the cashu-free envelopes live in
 //! [`crate::envelope`]). [`encode_challenge`] serializes a [`CashuRequirement`]
 //! into the opaque `creqA…`; [`encode_charge_request`] wraps it in the
-//! `draft-cashu-charge-01` request object the 402's `request` auth-param carries,
-//! and [`decode_charge_request`] reads that object back (enforcing the
-//! mints-superset over the inner creqA); [`decode_token`] parses the `cashuB…`
-//! token the client returns on retry.
+//! `draft-cashu-charge-01` request object the 402's `request` auth-param carries
+//! (`methodDetails.paymentRequest`, the authoritative artifact), and
+//! [`decode_charge_request`] reads that object back, enforcing the spec's
+//! creqA requirements (`a`/`u`/non-empty-`m` present, top-level
+//! `amount`/`currency` matching them, empty transports, no `nut10`);
+//! [`decode_token`] parses the `cashuB…` token the client returns on retry.
 //!
 //! Transports are left empty (the challenge is in-band) and `nut10` is `None` (a
 //! bearer charge has no spend lock). This module does NOT enforce the `pop_<ts>`
@@ -27,7 +29,10 @@ use crate::error::Error;
 pub struct CashuRequirement {
     /// Currency unit the proofs must carry (`pop_<unix_ts>` for PoP).
     pub unit: CurrencyUnit,
-    /// Mints the verifier accepts. Empty means "any mint".
+    /// Mints the verifier accepts. Empty means "any mint" at the validator and
+    /// on the bare-creqA `X-Cashu` transport; a `Payment` charge challenge
+    /// cannot be emitted from an empty set ([`encode_charge_request`] requires
+    /// a non-empty `m`).
     pub mints: Vec<MintUrl>,
     /// Exact amount of proofs required.
     pub amount: Amount,
@@ -65,49 +70,69 @@ pub fn encode_challenge(req: &CashuRequirement) -> String {
     req.to_payment_request().to_string()
 }
 
-/// The decoded `draft-cashu-charge-01` request object: the spec amount/unit/mints
-/// (the authoritative source) plus the opaque `creqA…` they were issued with.
+/// The decoded `draft-cashu-charge-01` request object: the payment parameters
+/// derived from the authoritative `methodDetails.paymentRequest` (already
+/// checked against the top-level `amount`/`currency`), plus the opaque `creqA…`
+/// itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedChargeRequest {
-    /// Exact amount required.
+    /// Exact amount required (the creqA's `a`, equal to the top-level `amount`).
     pub amount: Amount,
-    /// Currency unit the proofs must carry.
+    /// Currency unit the proofs must carry (the creqA's `u`, equal to the
+    /// top-level `currency`).
     pub unit: CurrencyUnit,
-    /// Mints the verifier accepts (a non-empty superset of the creqA's mints).
+    /// Mints the verifier accepts: the creqA's `m`, always non-empty.
     pub mints: Vec<MintUrl>,
     /// Optional human-readable description.
     pub description: Option<String>,
     /// Optional external correlation id.
     pub external_id: Option<String>,
-    /// The opaque `creqA…` carried under `methodDetails.request`.
+    /// The opaque `creqA…` carried under `methodDetails.paymentRequest`.
     pub creq_a: String,
 }
 
 /// Build the `draft-cashu-charge-01` request object for the 402's `request`
-/// auth-param: the spec amount/currency/description plus `methodDetails`
-/// (`{ request: creqA, mints }`). `methodDetails.mints` is the requirement's
-/// accepted set, which IS the creqA's set, so the spec's mints-superset holds by
-/// construction. Returns the base64url-nopad JCS string (`encode_request_object`).
-pub fn encode_charge_request(req: &CashuRequirement) -> String {
+/// auth-param: the spec amount/currency/description plus
+/// `methodDetails.paymentRequest` (the creqA, carrying the same amount/unit and
+/// the accepted mint set). Returns the base64url-nopad JCS string
+/// (`encode_request_object`).
+///
+/// The spec REQUIRES the emitted creqA to carry `a`, `u`, and a NON-EMPTY `m`;
+/// `a`/`u` always exist on a [`CashuRequirement`], so the one emit-side failure
+/// is a requirement naming no mints — [`Error::EncodeFailed`].
+pub fn encode_charge_request(req: &CashuRequirement) -> Result<String, Error> {
+    if req.mints.is_empty() {
+        return Err(Error::EncodeFailed(
+            "requirement names no mints; the charge challenge requires a non-empty \
+             mint set (`m`) in its payment request"
+                .to_string(),
+        ));
+    }
     let object = RequestObject {
         amount: u64::from(req.amount).to_string(),
         currency: req.unit.to_string(),
         description: req.description.clone(),
         external_id: req.payment_id.clone(),
         method_details: MethodDetails {
-            request: encode_challenge(req),
-            mints: req.mints.iter().map(|m| m.to_string()).collect(),
+            payment_request: encode_challenge(req),
         },
     };
-    encode_request_object(&object)
+    Ok(encode_request_object(&object))
 }
 
-/// Decode the 402's `request` auth-param into a [`DecodedChargeRequest`].
+/// Decode the 402's `request` auth-param into a [`DecodedChargeRequest`],
+/// enforcing the `draft-cashu-charge-01` rules on the embedded payment request
+/// (the authoritative artifact):
 ///
-/// Reads the authoritative amount/currency/mints, then enforces the
-/// `draft-cashu-charge-01` rule against the inner `creqA`: `methodDetails.mints`
-/// MUST be a NON-EMPTY superset of the creqA's mints. A missing/short superset,
-/// an unparseable creqA, or a non-decimal `amount` is a [`Error::DecodeFailed`].
+/// - the creqA MUST carry `a` (amount), `u` (unit), and a NON-EMPTY `m` (mints);
+/// - the top-level `amount`/`currency` MUST equal the creqA's `a`/`u`
+///   (amounts compared as integers);
+/// - the creqA's transport set MUST be empty (the credential is in-band);
+/// - the creqA MUST carry no `nut10` spending condition (bearer-only profile —
+///   rejecting here is what lets a future locked profile degrade closed).
+///
+/// Any violation, an unparseable creqA, or a non-decimal `amount` is a
+/// [`Error::DecodeFailed`].
 pub fn decode_charge_request(b64: &str) -> Result<DecodedChargeRequest, Error> {
     let object = decode_request_object(b64)?;
 
@@ -117,39 +142,56 @@ pub fn decode_charge_request(b64: &str) -> Result<DecodedChargeRequest, Error> {
     let unit = CurrencyUnit::from_str(&object.currency)
         .map_err(|e| Error::DecodeFailed(format!("request currency {:?}: {e}", object.currency)))?;
 
-    let mut mints = Vec::with_capacity(object.method_details.mints.len());
-    for m in &object.method_details.mints {
-        mints.push(
-            MintUrl::from_str(m)
-                .map_err(|e| Error::DecodeFailed(format!("methodDetails mint {m:?}: {e}")))?,
-        );
-    }
+    let creq = PaymentRequest::from_str(&object.method_details.payment_request)
+        .map_err(|e| Error::DecodeFailed(format!("methodDetails.paymentRequest creqA: {e}")))?;
 
-    // The inner creqA is the ground truth for the accepted mints; methodDetails
-    // MUST be a non-empty superset of it.
-    let creq = PaymentRequest::from_str(&object.method_details.request)
-        .map_err(|e| Error::DecodeFailed(format!("methodDetails.request creqA: {e}")))?;
-    if mints.is_empty() {
+    let creq_amount = creq.amount.ok_or_else(|| {
+        Error::DecodeFailed("payment request omits `a` (amount); the charge method requires it".to_string())
+    })?;
+    let creq_unit = creq.unit.clone().ok_or_else(|| {
+        Error::DecodeFailed("payment request omits `u` (unit); the charge method requires it".to_string())
+    })?;
+    if creq.mints.is_empty() {
         return Err(Error::DecodeFailed(
-            "methodDetails.mints is empty (spec requires a non-empty superset of the creqA mints)"
+            "payment request omits `m` (mints); the charge method requires a non-empty mint set"
                 .to_string(),
         ));
     }
-    for cm in &creq.mints {
-        if !mints.contains(cm) {
-            return Err(Error::DecodeFailed(format!(
-                "methodDetails.mints is not a superset of the creqA mints (missing {cm})"
-            )));
-        }
+
+    if u64::from(creq_amount) != amount_u64 {
+        return Err(Error::DecodeFailed(format!(
+            "request `amount` ({amount_u64}) does not equal the payment request's `a` ({})",
+            u64::from(creq_amount)
+        )));
+    }
+    if creq_unit != unit {
+        return Err(Error::DecodeFailed(format!(
+            "request `currency` ({unit}) does not equal the payment request's `u` ({creq_unit})"
+        )));
+    }
+
+    if !creq.transports.is_empty() {
+        return Err(Error::DecodeFailed(
+            "payment request names a transport; the charge credential is in-band \
+             (the transport set must be empty)"
+                .to_string(),
+        ));
+    }
+    if creq.nut10.is_some() {
+        return Err(Error::DecodeFailed(
+            "payment request carries a nut10 spending condition; this bearer-only \
+             profile requires it absent"
+                .to_string(),
+        ));
     }
 
     Ok(DecodedChargeRequest {
         amount: Amount::from(amount_u64),
         unit,
-        mints,
+        mints: creq.mints,
         description: object.description,
         external_id: object.external_id,
-        creq_a: object.method_details.request,
+        creq_a: object.method_details.payment_request,
     })
 }
 
@@ -181,7 +223,6 @@ pub fn decode_token(token_str: &str) -> Result<Token, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{decode_request_envelope, encode_request_envelope};
 
     fn sample_requirement() -> CashuRequirement {
         CashuRequirement {
@@ -322,22 +363,10 @@ mod tests {
     }
 
     #[test]
-    fn creqa_request_envelope_roundtrips() {
-        // creqA → request-envelope → creqA.
-        let req = sample_requirement();
-        let creq = encode_challenge(&req);
-        let envelope = encode_request_envelope(&creq);
-        let unwrapped = decode_request_envelope(&envelope)
-            .expect("request envelope round-trips");
-        assert_eq!(unwrapped, creq);
-        assert!(unwrapped.starts_with("creqA"));
-    }
-
-    #[test]
     fn charge_request_roundtrips_through_request_object() {
         // requirement → spec request object → decoded amount/unit/mints + creqA.
         let req = sample_requirement();
-        let encoded = encode_charge_request(&req);
+        let encoded = encode_charge_request(&req).expect("encodes");
         let decoded = decode_charge_request(&encoded).expect("charge request round-trips");
         assert_eq!(decoded.amount, req.amount);
         assert_eq!(decoded.unit, req.unit);
@@ -347,31 +376,30 @@ mod tests {
         assert!(decoded.creq_a.starts_with("creqA"));
     }
 
-    #[test]
-    fn decode_charge_request_rejects_mints_subset() {
-        // methodDetails.mints MUST be a superset of the creqA's mints. Hand-build
-        // an object whose creqA names two mints but methodDetails names only one.
-        let req = sample_requirement(); // creqA carries mint1 + mint2
-        let creq = encode_challenge(&req);
-        let object = RequestObject {
-            amount: u64::from(req.amount).to_string(),
-            currency: req.unit.to_string(),
+    /// Hand-build the request object around an arbitrary `PaymentRequest`, so
+    /// each reject test controls exactly one creqA property. `amount`/`currency`
+    /// default to the creqA's own values (overridable for the mismatch tests).
+    fn object_for(creq: &PaymentRequest, amount: &str, currency: &str) -> String {
+        encode_request_object(&RequestObject {
+            amount: amount.to_string(),
+            currency: currency.to_string(),
             description: None,
             external_id: None,
             method_details: MethodDetails {
-                request: creq,
-                mints: vec!["https://mint1.example.com".into()], // missing mint2
+                payment_request: creq.to_string(),
             },
-        };
-        let err = decode_charge_request(&encode_request_object(&object))
-            .expect_err("a mints-subset must be rejected");
-        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+        })
+    }
+
+    /// A fully spec-conformant `PaymentRequest` to mutate per test.
+    fn conformant_creq() -> PaymentRequest {
+        sample_requirement().to_payment_request()
     }
 
     #[test]
-    fn decode_charge_request_rejects_empty_mints() {
-        // A requirement with no mints yields an empty methodDetails.mints, which
-        // the spec forbids (must be a non-empty superset).
+    fn encode_charge_request_rejects_empty_mints() {
+        // Emit-side enforcement: the spec requires a non-empty `m`, so a
+        // requirement naming no mints cannot become a challenge.
         let req = CashuRequirement {
             unit: CurrencyUnit::Custom("pop_1700000000".to_string()),
             mints: vec![],
@@ -380,8 +408,116 @@ mod tests {
             description: None,
             single_use: false,
         };
-        let encoded = encode_charge_request(&req);
-        let err = decode_charge_request(&encoded).expect_err("empty mints must be rejected");
+        let err = encode_charge_request(&req).expect_err("no-mints requirement must not encode");
+        assert!(matches!(err, Error::EncodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_creqa_missing_amount() {
+        let mut creq = conformant_creq();
+        creq.amount = None;
+        let err = decode_charge_request(&object_for(&creq, "42", "pop_1700000000"))
+            .expect_err("creqA without `a` must be rejected");
         assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_creqa_missing_unit() {
+        let mut creq = conformant_creq();
+        creq.unit = None;
+        let err = decode_charge_request(&object_for(&creq, "42", "pop_1700000000"))
+            .expect_err("creqA without `u` must be rejected");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_creqa_empty_mints() {
+        let mut creq = conformant_creq();
+        creq.mints = vec![];
+        let err = decode_charge_request(&object_for(&creq, "42", "pop_1700000000"))
+            .expect_err("creqA without a non-empty `m` must be rejected");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_amount_disagreeing_with_creqa() {
+        // Top-level `amount` and creqA `a` are compared as integers; any
+        // disagreement is a tampered/inconsistent challenge.
+        let creq = conformant_creq(); // a = 42
+        let err = decode_charge_request(&object_for(&creq, "43", "pop_1700000000"))
+            .expect_err("amount ≠ creqA `a` must be rejected");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_currency_disagreeing_with_creqa() {
+        let creq = conformant_creq(); // u = pop_1700000000
+        let err = decode_charge_request(&object_for(&creq, "42", "sat"))
+            .expect_err("currency ≠ creqA `u` must be rejected");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_nonempty_transports() {
+        use cashu::nuts::nut18::{Transport, TransportType};
+        let mut creq = conformant_creq();
+        creq.transports = vec![Transport {
+            _type: TransportType::HttpPost,
+            target: "https://elsewhere.example/pay".to_string(),
+            tags: Vec::new(),
+        }];
+        let err = decode_charge_request(&object_for(&creq, "42", "pop_1700000000"))
+            .expect_err("a creqA naming a transport must be rejected (in-band only)");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_nut10_locked_challenge() {
+        // Bearer-only profile: a nut10-carrying challenge must be rejected by
+        // the client, so a future locked profile degrades closed.
+        use cashu::nuts::nut10::Kind;
+        use cashu::nuts::nut18::Nut10SecretRequest;
+        let mut creq = conformant_creq();
+        creq.nut10 = Some(Nut10SecretRequest::new(
+            Kind::P2PK,
+            "02a9acc1e48c25eeeb9289b5031cc57da9fe72f3fe2861d264bdc074209b107ba2",
+            None::<Vec<Vec<String>>>,
+        ));
+        let err = decode_charge_request(&object_for(&creq, "42", "pop_1700000000"))
+            .expect_err("a nut10-locked challenge must be rejected");
+        assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_accepts_padded_creqa_inside_json() {
+        // The creqA is an opaque string INSIDE the JSON; its own encoding allows
+        // padding, so a padded creqA must be accepted (spec Encoding §) even
+        // though the OUTER header value must be unpadded. Pick a description
+        // length whose CBOR encodes with `=` padding so both forms are distinct.
+        let (creq_padded, req) = (0..4usize)
+            .map(|n| {
+                let mut r = sample_requirement();
+                r.description = Some("x".repeat(n));
+                (r.to_payment_request().to_string(), r)
+            })
+            .find(|(s, _)| s.ends_with('='))
+            .expect("some description length yields a padded creqA");
+        let creq_unpadded = creq_padded.trim_end_matches('=').to_string();
+        assert_ne!(creq_padded, creq_unpadded);
+        for creq_str in [creq_padded, creq_unpadded] {
+            let object = encode_request_object(&RequestObject {
+                amount: u64::from(req.amount).to_string(),
+                currency: req.unit.to_string(),
+                description: None,
+                external_id: None,
+                method_details: MethodDetails {
+                    payment_request: creq_str,
+                },
+            });
+            let decoded =
+                decode_charge_request(&object).expect("padded and unpadded creqA both decode");
+            assert_eq!(decoded.amount, req.amount);
+            assert_eq!(decoded.mints, req.mints);
+        }
     }
 }
