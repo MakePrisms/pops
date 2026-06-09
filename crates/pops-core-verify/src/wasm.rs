@@ -106,7 +106,7 @@ fn charge_error_code(e: &ChargeError) -> &'static str {
         ChargeError::MintNotAllowed { .. } => "mint-not-allowed",
         ChargeError::MultiMintOrUnit => "multi-mint-or-unit",
         ChargeError::LockedToken => "locked-token",
-        ChargeError::DleqInvalid { .. } => "dleq-invalid",
+        ChargeError::DleqInvalid => "dleq-invalid",
         ChargeError::ShortKeysetIdUnresolved { .. } => "short-keyset-id-unresolved",
         ChargeError::DoubleSpend => "double-spend",
         ChargeError::Expired => "expired",

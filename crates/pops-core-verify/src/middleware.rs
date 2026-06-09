@@ -243,7 +243,7 @@ fn problem_parts(e: &ChargeError) -> (&'static str, &'static str) {
         | ChargeError::MintNotAllowed { .. }
         | ChargeError::MultiMintOrUnit
         | ChargeError::LockedToken
-        | ChargeError::DleqInvalid { .. }
+        | ChargeError::DleqInvalid
         | ChargeError::ShortKeysetIdUnresolved { .. }
         | ChargeError::DoubleSpend => ("verification-failed", "Verification failed"),
         ChargeError::Expired | ChargeError::ChallengeExpired => {
