@@ -11,11 +11,12 @@
 //! [`Redeemed`] to `request.extensions_mut()` and
 //! emits a `Payment-Receipt`.
 //!
-//! Status mapping: a verification or malformed-credential failure → 402 + a fresh
-//! re-challenge; a transport failure to reach the mint → 503; a malformed request
-//! frame → 400. Every error body is RFC-9457 `application/problem+json` carrying
-//! the `draft-cashu-charge-01` problem-type. Every 402 carries
-//! `Cache-Control: no-store`; the 200 carries `Cache-Control: private`.
+//! Status mapping (the single-sourced [`crate::problem`] map): a verification
+//! or malformed-credential failure → 402 + a fresh re-challenge; a transport
+//! failure to reach the mint → 503; a malformed request frame or a non-"cashu"
+//! method → 400. Every error body is RFC-9457 `application/problem+json`
+//! carrying the absolute `draft-cashu-charge-01` problem-type URI. Every 402
+//! carries `Cache-Control: no-store`; the 200 carries `Cache-Control: private`.
 
 use std::sync::Arc;
 
@@ -36,6 +37,7 @@ use crate::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use crate::cdk_mint_client::CdkMintClient;
 use crate::http_status::charge_error_status;
 use crate::challenge::{encode_charge_request, CashuRequirement};
+use crate::problem::{Problem, PROBLEM_JSON};
 use crate::redeemer::{Redeemed, Redeemer};
 use crate::envelope::{
     parse_payment_authorization, AuthParseError, EchoedChallenge, CASHU_METHOD, PAYMENT_SCHEME,
@@ -91,6 +93,17 @@ pub async fn require_charge<C>(
 where
     C: Redeemer + Send + Sync + 'static,
 {
+    // More than one `Authorization: Payment` credential is a malformed REQUEST
+    // frame → 400 per the framework (clients MUST send exactly one).
+    if count_payment_credentials(req.headers()) > 1 {
+        return charge_error_to_response(
+            ChargeError::MalformedRequest(
+                "request bears more than one Authorization: Payment credential".to_string(),
+            ),
+            &ctx.requirement,
+        );
+    }
+
     // A missing header or any non-`Payment` scheme is "no payment attempt" → 402.
     let Some(header_raw) = req.headers().get(http::header::AUTHORIZATION) else {
         return challenge_response(&ctx.requirement, None);
@@ -109,11 +122,18 @@ where
     };
 
     // `UnknownScheme` (Basic/Bearer/…) is control-flow-identical to no header at
-    // all; every OTHER parse error is a malformed credential → 402 re-challenge.
+    // all; a non-"cashu" method is the framework's method-unsupported (400);
+    // every OTHER parse error is a malformed credential → 402 re-challenge.
     let credentials = match parse_payment_authorization(header_value) {
         Ok(c) => c,
         Err(AuthParseError::UnknownScheme) => {
             return challenge_response(&ctx.requirement, None);
+        }
+        Err(AuthParseError::WrongMethod(method)) => {
+            return charge_error_to_response(
+                ChargeError::MethodUnsupported { method },
+                &ctx.requirement,
+            )
         }
         Err(e) => {
             return charge_error_to_response(
@@ -172,9 +192,22 @@ where
 const PAYMENT_RECEIPT_HEADER: http::header::HeaderName =
     http::header::HeaderName::from_static("payment-receipt");
 
-/// The problem-type URI prefix for the `draft-cashu-charge-01` cashu
-/// problem-types.
-const PROBLEM_TYPE_PREFIX: &str = "cashu/";
+/// Count the `Authorization` values whose scheme token is `Payment` —
+/// the framework allows at most one Payment credential per request.
+fn count_payment_credentials(headers: &http::HeaderMap) -> usize {
+    headers
+        .get_all(http::header::AUTHORIZATION)
+        .iter()
+        .filter(|v| {
+            v.to_str().is_ok_and(|s| {
+                s.trim()
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PAYMENT_SCHEME))
+            })
+        })
+        .count()
+}
 
 /// The `Payment-Receipt` JSON. `reference` is the redeemed `token_hash` (a
 /// settlement id exposing no secret); `externalId` is omitted when absent.
@@ -188,16 +221,6 @@ struct PaymentReceipt<'a> {
     timestamp: String,
     #[serde(rename = "externalId", skip_serializing_if = "Option::is_none")]
     external_id: Option<&'a str>,
-}
-
-/// An RFC-9457 `application/problem+json` body.
-#[derive(Debug, Serialize)]
-struct Problem {
-    #[serde(rename = "type")]
-    type_uri: String,
-    title: String,
-    status: u16,
-    detail: String,
 }
 
 /// Build the `Payment-Receipt` header value: base64url-nopad over the receipt
@@ -228,47 +251,6 @@ fn challenge_is_expired(expires: &str) -> bool {
         Ok(ts) => ts.with_timezone(&Utc) <= Utc::now(),
         Err(_) => true,
     }
-}
-
-/// The spec problem-type slug and RFC-9457 `title` for a [`ChargeError`]
-/// (`draft-cashu-charge-01` §Errors — the per-variant docs on `ChargeError`
-/// name these). The slug is bare (no `cashu/`); `problem_for` prepends the
-/// prefix. The HTTP status is NOT decided here — it comes from the shared
-/// [`charge_error_status`] so the gateway and this middleware cannot drift.
-fn problem_parts(e: &ChargeError) -> (&'static str, &'static str) {
-    match e {
-        ChargeError::MintUnreachable { .. } => ("mint-unavailable", "Mint unavailable"),
-        ChargeError::AmountMismatch { .. } => ("amount-mismatch", "Amount mismatch"),
-        ChargeError::WrongUnit { .. }
-        | ChargeError::MintNotAllowed { .. }
-        | ChargeError::MultiMintOrUnit
-        | ChargeError::LockedToken
-        | ChargeError::DleqInvalid
-        | ChargeError::ShortKeysetIdUnresolved { .. }
-        | ChargeError::DoubleSpend => ("verification-failed", "Verification failed"),
-        ChargeError::Expired | ChargeError::ChallengeExpired => {
-            ("payment-expired", "Payment expired")
-        }
-        ChargeError::InvalidChallenge => ("invalid-challenge", "Invalid challenge"),
-        ChargeError::MalformedCredential(_) | ChargeError::TooManyProofs { .. } => {
-            ("malformed-credential", "Malformed credential")
-        }
-        ChargeError::MalformedRequest(_) => ("invalid-challenge", "Malformed request"),
-    }
-}
-
-/// Build the RFC-9457 [`Problem`] + its status for a [`ChargeError`]. The status
-/// is the single-sourced [`charge_error_status`] trichotomy.
-fn problem_for(e: &ChargeError) -> (Problem, StatusCode) {
-    let (slug, title) = problem_parts(e);
-    let status = charge_error_status(e);
-    let problem = Problem {
-        type_uri: format!("{PROBLEM_TYPE_PREFIX}{slug}"),
-        title: title.to_string(),
-        status: status.as_u16(),
-        detail: e.to_string(),
-    };
-    (problem, status)
 }
 
 /// Build a 402 carrying a fresh challenge (always `Cache-Control: no-store`).
@@ -317,22 +299,19 @@ fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>)
     let cache_control = HeaderValue::from_static("no-store");
 
     match problem {
-        Some(p) => {
-            let body = serde_json::to_string(p).expect("Problem always serializes");
-            (
-                StatusCode::PAYMENT_REQUIRED,
-                [
-                    (http::header::WWW_AUTHENTICATE, www_auth),
-                    (http::header::CACHE_CONTROL, cache_control),
-                    (
-                        http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/problem+json"),
-                    ),
-                ],
-                body,
-            )
-                .into_response()
-        }
+        Some(p) => (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                (http::header::WWW_AUTHENTICATE, www_auth),
+                (http::header::CACHE_CONTROL, cache_control),
+                (
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(PROBLEM_JSON),
+                ),
+            ],
+            p.to_json(),
+        )
+            .into_response(),
         None => (
             StatusCode::PAYMENT_REQUIRED,
             [
@@ -346,32 +325,33 @@ fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>)
 }
 
 /// Map a [`ChargeError`] to an HTTP response with an RFC-9457
-/// `application/problem+json` body (`draft-cashu-charge-01` §Errors). The three
+/// `application/problem+json` body from the single-sourced
+/// [`crate::problem`] map (`draft-cashu-charge-01` §Errors). The three
 /// non-collapsing concerns drive the status: `MintUnreachable` is 503 (transport,
-/// token NOT consumed, NEVER a 402); `MalformedRequest` is 400 (not a well-formed
-/// payment attempt); everything else (verification / malformed-credential) is a
-/// 402 with a fresh re-challenge. The 402 carries the problem body alongside the
-/// fresh `WWW-Authenticate`; a 503/400 carries the problem body with
-/// `Cache-Control: no-store`.
+/// token NOT consumed, NEVER a 402); `MalformedRequest`/`MethodUnsupported` are
+/// 400 (not a well-formed payment attempt); everything else (verification /
+/// malformed-credential) is a 402 with a fresh re-challenge. The 402 carries the
+/// problem body alongside the fresh `WWW-Authenticate`; a 503/400 carries the
+/// problem body with `Cache-Control: no-store`.
 fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
-    let (problem, status) = problem_for(&e);
+    let problem = Problem::for_error(&e);
+    let status = charge_error_status(&e);
     if status == StatusCode::PAYMENT_REQUIRED {
         return challenge_response(requirement, Some(&problem));
     }
-    let body = serde_json::to_string(&problem).expect("Problem always serializes");
     (
         status,
         [
             (
                 http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/problem+json"),
+                HeaderValue::from_static(PROBLEM_JSON),
             ),
             (
                 http::header::CACHE_CONTROL,
                 HeaderValue::from_static("no-store"),
             ),
         ],
-        body,
+        problem.to_json(),
     )
         .into_response()
 }
@@ -1111,8 +1091,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_method_returns_402() {
-        // Valid envelope but `method="tempo"` → validation failure → 402.
+    async fn non_cashu_method_returns_400_method_unsupported() {
+        // Valid envelope but `method="tempo"` → the framework's
+        // method-unsupported (HTTP 400), NOT a 402 malformed-credential.
         let creds = PaymentCredentials {
             challenge: EchoedChallenge {
                 id: "id".into(),
@@ -1136,15 +1117,78 @@ mod tests {
             .oneshot(request_with_authorization(&header))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>");
-        assert!(
-            body.contains("must be 'cashu'"),
-            "expected wrong-method message, got: {body}"
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/method-unsupported"
         );
+        assert_eq!(problem["status"], 400);
+        assert!(
+            problem["detail"].as_str().unwrap_or("").contains("tempo"),
+            "detail names the offending method: {problem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_payment_credentials_return_400_bad_request() {
+        // Framework: clients MUST send only one Authorization: Payment
+        // credential; two of them are a malformed request frame → 400 with the
+        // about:blank type (no registered slug), never the invalid-challenge 402.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let header = payment_header_with_token(&token.to_string());
+        let mut req = HttpRequest::builder()
+            .uri("/gated")
+            .body(Body::empty())
+            .expect("build request");
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_str(&header).expect("ascii"),
+        );
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_str(&header).expect("ascii"),
+        );
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(problem["type"], "about:blank");
+        assert_eq!(problem["status"], 400);
+    }
+
+    #[tokio::test]
+    async fn one_payment_credential_among_other_schemes_still_verifies() {
+        // The >1 rule counts PAYMENT credentials only; a Basic header alongside
+        // the one Payment credential is not a malformed frame. (The Payment
+        // value must come first for the single-get parse to see it.)
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let header = payment_header_with_token(&token.to_string());
+        let mut req = HttpRequest::builder()
+            .uri("/gated")
+            .body(Body::empty())
+            .expect("build request");
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_str(&header).expect("ascii"),
+        );
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_static("Basic dXNlcjpwdw=="),
+        );
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

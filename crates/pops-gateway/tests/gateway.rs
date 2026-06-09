@@ -282,11 +282,65 @@ async fn bare_request_returns_402_with_www_authenticate() {
             .unwrap(),
         "no-store"
     );
+    // The bare-402 body is the framework's payment-required problem.
+    assert_eq!(
+        resp.headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/problem+json"
+    );
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem body");
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/payment-required"
+    );
+    assert_eq!(problem["status"], 402);
     // Neither the mint nor the upstream was contacted.
     assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "no swap on bare req");
     assert_eq!(up_hits.load(Ordering::SeqCst), 0, "upstream not hit on 402");
     // Nothing persisted.
     assert!(read_lines(&sink).is_empty(), "no proofs on a bare request");
+}
+
+// The gateway's challenge is the SHARED draft-cashu-charge-01 request object —
+// the flat {"cashu_request": ...} dialect is dead.
+#[tokio::test]
+async fn gateway_challenge_request_param_is_the_spec_request_object() {
+    use pops_core_verify::challenge::decode_charge_request;
+    use pops_core_verify::envelope::parse_payment_params;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, _up_hits) = spawn_upstream("SECRET").await;
+    let (app, _swap_calls) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let www = resp
+        .headers()
+        .get(http::header::WWW_AUTHENTICATE)
+        .expect("WWW-Authenticate present")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let params = parse_payment_params(&www).expect("Payment params parse");
+    let decoded = decode_charge_request(&params.request)
+        .expect("request param decodes via the shared spec codec");
+    assert_eq!(decoded.amount, Amount::from(10));
+    assert_eq!(decoded.unit, pop_unit());
+    assert_eq!(decoded.mints, vec![mint_a()], "mints derive from the creqA");
+    assert!(decoded.creq_a.starts_with("creqA"));
 }
 
 // (b) valid credential → fresh_proofs line + upstream hit + body returned.
@@ -558,6 +612,176 @@ async fn oversized_body_on_gated_path_returns_413_before_charge() {
         "nothing persisted for an over-cap request"
     );
     assert_eq!(up_hits.load(Ordering::SeqCst), 0, "not forwarded");
+}
+
+// ───────────── error map: the gateway emits the shared problem wire ──────────
+
+/// A [`Redeemer`] whose failure is fixed up front, so the map test drives every
+/// `ChargeError` through the REAL gateway response path.
+struct CannedFailRedeemer {
+    make: fn() -> pops_core_verify::charge::ChargeError,
+}
+
+#[async_trait]
+impl pops_core_verify::redeemer::Redeemer for CannedFailRedeemer {
+    async fn verify_and_redeem(
+        &self,
+        _presented: &str,
+        _req: &pops_core_verify::redeemer::ChargeRequirement,
+    ) -> Result<pops_core_verify::redeemer::Redeemed, pops_core_verify::charge::ChargeError> {
+        Err((self.make)())
+    }
+}
+
+#[tokio::test]
+async fn gateway_emits_the_shared_problem_mapping_for_every_charge_error() {
+    // The gateway's (status, problem body) must equal the single-sourced
+    // problem_mapping table for every variant — the same table the core
+    // middlewares are tested against, so all hosts emit identically.
+    use pops_core_verify::charge::ChargeError;
+    use pops_core_verify::problem::problem_mapping;
+
+    let cases: Vec<fn() -> ChargeError> = vec![
+        || ChargeError::MintUnreachable {
+            mint_url: "https://mint-a.example.com".into(),
+            transport_detail: "timeout".into(),
+            indeterminate: false,
+        },
+        || ChargeError::AmountMismatch {
+            required: 10,
+            presented: 20,
+            amount: 10,
+            expected_swap_fee: 0,
+        },
+        || ChargeError::WrongUnit {
+            expected: "pop_1700000000".into(),
+            got: "sat".into(),
+        },
+        || ChargeError::MintNotAllowed {
+            got: "https://evil.example".into(),
+            allowed: vec!["https://mint-a.example.com".into()],
+        },
+        || ChargeError::MultiMintOrUnit,
+        || ChargeError::LockedToken,
+        || ChargeError::FeeTooHigh {
+            keyset_id: "009a1f293253e41e".into(),
+            input_fee_ppk: 100,
+        },
+        || ChargeError::DleqInvalid,
+        || ChargeError::ShortKeysetIdUnresolved {
+            short_id: "00aabbccddeeff00".into(),
+        },
+        || ChargeError::DoubleSpend,
+        || ChargeError::Expired,
+        || ChargeError::ChallengeExpired,
+        || ChargeError::InvalidChallenge,
+        || ChargeError::MalformedCredential("bad".into()),
+        || ChargeError::TooManyProofs { got: 99, max: 8 },
+        || ChargeError::MethodUnsupported {
+            method: "tempo".into(),
+        },
+        || ChargeError::MalformedRequest("bad config".into()),
+    ];
+
+    for make in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let sink_path = dir.path().join("proofs.jsonl");
+        let (upstream, _hits) = spawn_upstream("SECRET").await;
+        let credential = CannedFailRedeemer { make };
+        let sink = ProofsSink::open(&sink_path).expect("open sink");
+        let state = Arc::new(AppState::new(
+            validated_config(&upstream, &sink_path, vec![]),
+            credential,
+            sink,
+        ));
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(AUTHORIZATION, payment_header(&valid_token_string()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mapping = problem_mapping(&make());
+        assert_eq!(
+            resp.status().as_u16(),
+            mapping.status,
+            "gateway status drift for {}",
+            make()
+        );
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .expect("Content-Type present")
+                .to_str()
+                .unwrap(),
+            "application/problem+json",
+            "gateway error body must be problem+json for {}",
+            make()
+        );
+        let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body).expect("gateway problem body");
+        assert_eq!(problem["type"], mapping.type_uri, "{}", make());
+        assert_eq!(problem["title"], mapping.title, "{}", make());
+        assert_eq!(problem["status"], mapping.status, "{}", make());
+        assert!(problem["detail"].is_string(), "{}", make());
+    }
+}
+
+#[tokio::test]
+async fn gateway_non_cashu_method_returns_400_method_unsupported() {
+    // A credential naming method="tempo" → the framework's method-unsupported
+    // 400, identical to the core middleware's mapping.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, up_hits) = spawn_upstream("SECRET").await;
+    let (app, swap_calls) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
+
+    let creds = PaymentCredentials {
+        challenge: EchoedChallenge {
+            id: "test-id".into(),
+            realm: "pops-gateway".into(),
+            method: "tempo".into(),
+            intent: "charge".into(),
+            request: "echoed".into(),
+            digest: None,
+            opaque: None,
+            expires: None,
+        },
+        payload: CashuPayload {
+            cashu_token: "cashuBabc".into(),
+        },
+        source: None,
+    };
+    let header = format!("Payment {}", encode_payment_credentials(&creds));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(AUTHORIZATION, header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem body");
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/method-unsupported"
+    );
+    assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "no swap on a 400");
+    assert_eq!(up_hits.load(Ordering::SeqCst), 0, "not forwarded on a 400");
+    assert!(read_lines(&sink).is_empty(), "nothing persisted on a 400");
 }
 
 // A body AT/under the cap still forwards normally (the cap doesn't break

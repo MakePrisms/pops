@@ -12,13 +12,17 @@
 //! money core with the `Payment` middleware; only the wire differs (single
 //! `X-Cashu` header both directions, vs `WWW-Authenticate`/`Authorization`).
 //!
-//! Status mapping (stricter and safer than NUT-24's bare `400`):
+//! Status mapping (stricter and safer than NUT-24's bare `400`) — the
+//! single-sourced [`crate::problem`] map, shared with every other host:
 //! `MintUnreachable` → `503` (transport blip, token NOT consumed — never a
 //! `400`/`402` that says "re-pay" against a valid token); `MalformedRequest` →
 //! `400` (server-side requirement is misconfigured); every other validation
 //! failure → `402` + a fresh `X-Cashu: <creqA>` re-challenge. Amount is EXACT:
 //! an over- or under-funded token is an `AmountMismatch` rejection, never
-//! silent overage capture. Every `402` carries `Cache-Control: no-store`.
+//! silent overage capture. Every `402` carries `Cache-Control: no-store`, and
+//! every failure body is RFC-9457 `application/problem+json` with the absolute
+//! problem-type URI (NUT-24 leaves the body unspecified, so the richer body is
+//! compatible).
 //!
 //! [`Redeemer`]: crate::redeemer::Redeemer
 
@@ -34,7 +38,9 @@ use crate::charge::ChargeError;
 
 use crate::cashu_credential::charge_requirement_from_cashu;
 use crate::challenge::CashuRequirement;
+use crate::http_status::charge_error_status;
 use crate::middleware::ChargeMiddlewareState;
+use crate::problem::{Problem, PROBLEM_JSON};
 use crate::redeemer::Redeemer;
 use crate::xcashu::{xcashu_challenge_value, xcashu_token_from_header};
 
@@ -65,7 +71,10 @@ where
     let header_value = match header_raw.to_str() {
         Ok(v) => v,
         Err(_) => {
-            return challenge_response(&ctx.requirement, Some("invalid X-Cashu header encoding"));
+            return charge_error_to_response(
+                ChargeError::MalformedCredential("invalid X-Cashu header encoding".to_string()),
+                &ctx.requirement,
+            );
         }
     };
 
@@ -73,7 +82,12 @@ where
     // Like every other malformed presentation it is non-serving → 402.
     let token = match xcashu_token_from_header(header_value) {
         Ok(t) => t,
-        Err(e) => return challenge_response(&ctx.requirement, Some(&e.to_string())),
+        Err(e) => {
+            return charge_error_to_response(
+                ChargeError::MalformedCredential(e.to_string()),
+                &ctx.requirement,
+            )
+        }
     };
 
     // Verify + redeem via the generic seam; the `ChargeError` variant decides the
@@ -91,11 +105,11 @@ where
 }
 
 /// Build a `402` carrying a fresh `X-Cashu: <creqA>` challenge (always
-/// `Cache-Control: no-store`). `failure_reason`, when set, becomes the body so
-/// the client sees why the previous attempt failed; a bare "no attempt yet"
-/// `402` gets an empty body. NUT-24 has no challenge id / realm / echo, so the
-/// header value is the bare `creqA`.
-fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&str>) -> Response {
+/// `Cache-Control: no-store`). `problem`, when set, becomes the
+/// `application/problem+json` body naming why the previous attempt failed; a
+/// bare "no attempt yet" `402` gets an empty body. NUT-24 has no challenge id /
+/// realm / echo, so the header value is the bare `creqA`.
+fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>) -> Response {
     let creq_a = xcashu_challenge_value(requirement);
 
     // The `creqA` is base64url, always a valid header value; the `from_str`
@@ -112,35 +126,61 @@ fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&st
     };
 
     let cache_control = HeaderValue::from_static("no-store");
-    let body = failure_reason.unwrap_or("").to_string();
 
-    (
-        StatusCode::PAYMENT_REQUIRED,
-        [
-            (x_cashu_header(), x_cashu),
-            (http::header::CACHE_CONTROL, cache_control),
-        ],
-        body,
-    )
-        .into_response()
+    match problem {
+        Some(p) => (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                (x_cashu_header(), x_cashu),
+                (http::header::CACHE_CONTROL, cache_control),
+                (
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(PROBLEM_JSON),
+                ),
+            ],
+            p.to_json(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                (x_cashu_header(), x_cashu),
+                (http::header::CACHE_CONTROL, cache_control),
+            ],
+            String::new(),
+        )
+            .into_response(),
+    }
 }
 
-/// Map a [`ChargeError`] to an HTTP response. The three non-collapsing concerns
-/// drive the status (the `402` body is the Display string; every `402` is
-/// no-store): `MintUnreachable` → `503` (transport, token NOT consumed, NEVER a
-/// `402`), `MalformedRequest` → `400` (server-side requirement misconfigured),
-/// everything else (verification / malformed-credential / amount mismatch) →
-/// `402` + a fresh `X-Cashu: <creqA>` re-challenge.
+/// Map a [`ChargeError`] to an HTTP response from the single-sourced
+/// [`crate::problem`] map (every failure body is `application/problem+json`):
+/// `MintUnreachable` → `503` (transport, token NOT consumed, NEVER a `402`),
+/// `MalformedRequest`/`MethodUnsupported` → `400`, everything else
+/// (verification / malformed-credential / amount mismatch) → `402` + a fresh
+/// `X-Cashu: <creqA>` re-challenge. A non-402 carries NO re-challenge — on a
+/// 503 re-presenting the SAME token is correct.
 fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
-    match &e {
-        ChargeError::MintUnreachable { .. } => {
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
-        ChargeError::MalformedRequest(_) => {
-            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
-        }
-        _ => challenge_response(requirement, Some(&e.to_string())),
+    let problem = Problem::for_error(&e);
+    let status = charge_error_status(&e);
+    if status == StatusCode::PAYMENT_REQUIRED {
+        return challenge_response(requirement, Some(&problem));
     }
+    (
+        status,
+        [
+            (
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static(PROBLEM_JSON),
+            ),
+            (
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            ),
+        ],
+        problem.to_json(),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

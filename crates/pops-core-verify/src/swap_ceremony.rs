@@ -166,10 +166,12 @@ async fn resolve_output_keyset<H: MintHttp + ?Sized>(
         .clone();
 
     if active_keyset.input_fee_ppk != 0 {
-        return Err(MintClientError::RejectedSwap(format!(
-            "active keyset {} has non-zero input_fee_ppk; PoP v1 requires zero fee",
-            active_keyset.id
-        )));
+        // A policy reject, raised BEFORE any swap is submitted (the token is
+        // not consumed) — typed so it never surfaces as a double-spend.
+        return Err(MintClientError::FeeTooHigh {
+            keyset_id: active_keyset.id.to_string(),
+            input_fee_ppk: active_keyset.input_fee_ppk,
+        });
     }
 
     let active_keyset_full = http.get_keyset_keys(mint_url, active_keyset.id).await?;
@@ -324,6 +326,8 @@ mod tests {
     struct MockMint {
         unit: CurrencyUnit,
         mode: DleqMode,
+        /// `input_fee_ppk` the keyset advertises (0 = the fee-free profile).
+        fee_ppk: u64,
     }
 
     impl MockMint {
@@ -331,6 +335,15 @@ mod tests {
             Self {
                 unit: CurrencyUnit::Custom("pop_1700000000".to_string()),
                 mode,
+                fee_ppk: 0,
+            }
+        }
+
+        /// As [`Self::new`] but the keyset advertises a non-zero fee.
+        fn with_fee(mode: DleqMode, fee_ppk: u64) -> Self {
+            Self {
+                fee_ppk,
+                ..Self::new(mode)
             }
         }
 
@@ -373,7 +386,7 @@ mod tests {
                     id: self.keyset_id(),
                     unit: self.unit.clone(),
                     active: true,
-                    input_fee_ppk: 0,
+                    input_fee_ppk: self.fee_ppk,
                     final_expiry: None,
                 }],
             })
@@ -537,6 +550,29 @@ mod tests {
             matches!(err, MintClientError::SwapOutputDleqInvalid(_)),
             "expected SwapOutputDleqInvalid, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn fee_bearing_keyset_rejects_as_fee_too_high_before_swap() {
+        // A non-zero `input_fee_ppk` on the active keyset is a POLICY reject:
+        // its own typed error (never RejectedSwap → never read as a
+        // double-spend), raised before any swap is submitted.
+        let mint = MockMint::with_fee(DleqMode::Valid, 100);
+        let proofs = inputs_for(&mint);
+
+        let err = swap_to_redeem(&mint, &mint_url(), proofs)
+            .await
+            .expect_err("a fee-bearing keyset must be rejected");
+        match err {
+            MintClientError::FeeTooHigh {
+                keyset_id,
+                input_fee_ppk,
+            } => {
+                assert_eq!(input_fee_ppk, 100, "carries the published fee");
+                assert!(!keyset_id.is_empty(), "names the offending keyset");
+            }
+            other => panic!("expected FeeTooHigh, got {other:?}"),
+        }
     }
 
     /// A mock that fails a chosen call with `Unreachable`, to prove the ceremony

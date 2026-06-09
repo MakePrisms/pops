@@ -78,6 +78,21 @@ pub enum MintClientError {
     #[error("mint rejected swap: {0}")]
     RejectedSwap(String),
 
+    /// The active keyset charges an `input_fee_ppk` over the supported maximum
+    /// (0 in the fee-free profile), detected BEFORE the swap is submitted. The
+    /// token was NOT consumed. Distinct from [`Self::RejectedSwap`] so the
+    /// policy reject never reads as a double-spend.
+    #[error(
+        "fee-bearing keyset {keyset_id} disallowed: input_fee_ppk {input_fee_ppk} \
+         exceeds the fee-free profile"
+    )]
+    FeeTooHigh {
+        /// Keyset whose fee exceeded the profile (hex id).
+        keyset_id: String,
+        /// The disallowed `input_fee_ppk` the mint publishes for it.
+        input_fee_ppk: u64,
+    },
+
     /// A returned blind signature failed DLEQ verification (NUT-12 proof MISSING
     /// or INVALID against the advertised key).
     ///

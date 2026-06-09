@@ -1,32 +1,29 @@
-//! The load-bearing `ChargeError` → HTTP status mapping, single-sourced.
+//! Native adapter lifting the single-sourced [`problem_mapping`] status into
+//! `http::StatusCode`.
 //!
-//! Both the axum [`middleware`](crate::middleware) and out-of-crate hosts (e.g.
-//! `pops-gateway`) derive their HTTP status from this one function, so the
-//! 503/400/402 trichotomy the charge contract pins cannot drift between them.
-//! The response *body* still differs per host (RFC-9457 `problem+json` in the
-//! middleware, a flat advisory JSON in the gateway) — only the status decision
-//! is shared.
+//! The mapping itself (status + problem type + slug) lives in
+//! [`crate::problem`], feature-independent, so every host — the axum
+//! middlewares, `pops-gateway`, the wasm surface — derives from ONE table and
+//! the 503/400/402 trichotomy cannot drift between them.
 
-use http::StatusCode;
 use crate::charge::ChargeError;
+use crate::problem::problem_mapping;
+use http::StatusCode;
 
-/// Map a [`ChargeError`] to its HTTP status per `draft-cashu-charge-01` §Errors.
+/// Map a [`ChargeError`] to its HTTP status per `draft-cashu-charge-01` §Errors
+/// — the [`problem_mapping`] status as a typed `StatusCode`.
 ///
 /// THE load-bearing trichotomy (see the [`ChargeError`] banner): a transport
 /// failure ([`ChargeError::MintUnreachable`]) is `503` — the token is NOT
 /// consumed and the caller MAY retry it, so it MUST NEVER collapse into a `402`
 /// ("your payment was wrong, re-pay"). A malformed *request frame*
-/// ([`ChargeError::MalformedRequest`]) is `400`. EVERY other variant —
+/// ([`ChargeError::MalformedRequest`]) and an unsupported method
+/// ([`ChargeError::MethodUnsupported`]) are `400`. EVERY other variant —
 /// verification failures and a malformed *credential* — is `402` with a fresh
 /// re-challenge.
 pub fn charge_error_status(e: &ChargeError) -> StatusCode {
-    match e {
-        ChargeError::MintUnreachable { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        ChargeError::MalformedRequest(_) => StatusCode::BAD_REQUEST,
-        // `#[non_exhaustive]`: an unmodelled future variant degrades to the
-        // conservative 402 (verification-failed), never a 503/400.
-        _ => StatusCode::PAYMENT_REQUIRED,
-    }
+    StatusCode::from_u16(problem_mapping(e).status)
+        .expect("problem_mapping emits only valid HTTP statuses")
 }
 
 #[cfg(test)]
@@ -50,6 +47,14 @@ mod tests {
     }
 
     #[test]
+    fn method_unsupported_is_400() {
+        let e = ChargeError::MethodUnsupported {
+            method: "tempo".into(),
+        };
+        assert_eq!(charge_error_status(&e), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn verification_and_malformed_credential_are_402() {
         for e in [
             ChargeError::WrongUnit {
@@ -64,6 +69,10 @@ mod tests {
                 presented: 2,
                 amount: 1,
                 expected_swap_fee: 0,
+            },
+            ChargeError::FeeTooHigh {
+                keyset_id: "009a1f293253e41e".into(),
+                input_fee_ppk: 100,
             },
         ] {
             assert_eq!(

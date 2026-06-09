@@ -76,6 +76,22 @@ pub enum ChargeError {
         allowed: Vec<String>,
     },
 
+    /// The keyset charges a swap fee this server's fee-free profile disallows
+    /// (`input_fee_ppk` over the supported maximum of 0). A policy-disallowed
+    /// unit per the spec's Errors §, NOT a double-spend.
+    ///
+    /// HTTP 402 · `verification-failed` · terminal.
+    #[error(
+        "fee-bearing keyset disallowed by server policy: keyset {keyset_id} charges \
+         input_fee_ppk {input_fee_ppk} (this server's profile is fee-free)"
+    )]
+    FeeTooHigh {
+        /// Keyset whose fee exceeded the profile (hex id).
+        keyset_id: String,
+        /// The disallowed `input_fee_ppk` the mint publishes for it.
+        input_fee_ppk: u64,
+    },
+
     /// Token's proofs reference more than one mint or unit.
     ///
     /// HTTP 402 · `verification-failed` · terminal.
@@ -147,11 +163,24 @@ pub enum ChargeError {
     #[error("malformed credential: {0}")]
     MalformedCredential(String),
 
-    /// The credential names an unsupported method, or the request bore more than
-    /// one `Authorization: Payment` credential.
+    /// The credential names a payment method this server does not support
+    /// (anything ≠ `"cashu"`). Framework problem type `method-unsupported`.
     ///
-    /// HTTP 400 · framework status (not a well-formed payment attempt).
-    #[error("unsupported method or malformed request: {0}")]
+    /// HTTP 400 · `method-unsupported` (the framework's status table; not a
+    /// payment-verification failure, so no 402 re-challenge).
+    #[error("unsupported payment method {method:?} (this server accepts \"cashu\")")]
+    MethodUnsupported {
+        /// The method string the credential carried.
+        method: String,
+    },
+
+    /// The REQUEST frame is malformed — more than one `Authorization: Payment`
+    /// credential, or a server-side requirement that cannot be parsed. Follows
+    /// the framework's status handling (400), NOT a 402: there is no problem
+    /// type registered for it, so the body's `type` is `about:blank`.
+    ///
+    /// HTTP 400 · no registered slug.
+    #[error("malformed request: {0}")]
     MalformedRequest(String),
 
     /// Token carries more proofs than the configured maximum (DoS guard),

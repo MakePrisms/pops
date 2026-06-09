@@ -2,14 +2,16 @@
 //! (a separate crate sees the same surface a consumer does).
 //!
 //! Covers the conformance bar this build raises: the spec request-object
-//! round-trip + JCS-canonical bytes; the credential echo carrying the optional
-//! `digest`/`opaque`/`expires`/`source`; the `methodDetails.mints` superset
-//! rejection; and — driving the `require_charge` middleware through a router with
-//! a canned [`Redeemer`] — the `Payment-Receipt` shape + `Cache-Control:
-//! private` on 200, an echoed `challenge.expires` in the past → `payment-expired`
-//! `application/problem+json`, and each [`ChargeError`] mapping to its spec
-//! problem-type + status. The money core is NOT exercised here (it is unchanged);
-//! the canned redeemer stands in so the test isolates the WIRE.
+//! round-trip + JCS-canonical bytes (`methodDetails.paymentRequest` only, mints
+//! gone from the wire); the emitted creqA carrying `a`/`u`/non-empty-`m`; the
+//! credential echo carrying the optional `digest`/`opaque`/`expires`/`source`;
+//! and — driving the `require_charge` (and `require_charge_xcashu`) middleware
+//! through a router with a canned [`Redeemer`] — the `Payment-Receipt` shape +
+//! `Cache-Control: private` on 200, an echoed `challenge.expires` in the past →
+//! `payment-expired` `application/problem+json`, each [`ChargeError`] mapping
+//! to its ABSOLUTE spec problem-type URI + status, and both in-crate hosts
+//! emitting identical mappings. The money core is NOT exercised here (it is
+//! unchanged); the canned redeemer stands in so the test isolates the WIRE.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -366,7 +368,10 @@ async fn expired_echoed_challenge_returns_payment_expired_problem() {
     assert!(resp.headers().get(http::header::WWW_AUTHENTICATE).is_some());
     let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
     let problem = body_json(&body);
-    assert_eq!(problem["type"], "cashu/payment-expired");
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/payment-expired"
+    );
     assert_eq!(problem["status"], 402);
 }
 
@@ -395,7 +400,8 @@ async fn unexpired_echoed_challenge_passes_through() {
 
 // ─────────────── each ChargeError → its problem-type + status ────────────────
 
-/// Drive the middleware with a canned error and return (status, problem json).
+/// Drive the `Payment` middleware with a canned error and return
+/// (status, problem json).
 async fn problem_for(make: fn() -> ChargeError) -> (StatusCode, serde_json::Value) {
     let app = router(Outcome::Err(make));
     let resp = app
@@ -423,9 +429,100 @@ async fn problem_for(make: fn() -> ChargeError) -> (StatusCode, serde_json::Valu
     (status, body_json(&body))
 }
 
+/// Drive the NUT-24 `X-Cashu` middleware with the same canned error and return
+/// (status, problem json) — the cross-surface comparison arm.
+async fn xcashu_problem_for(make: fn() -> ChargeError) -> (StatusCode, serde_json::Value) {
+    use pops_core_verify::middleware_xcashu::require_charge_xcashu;
+    async fn echo(Extension(redeemed): Extension<Redeemed>) -> String {
+        format!("ok:{}", redeemed.amount)
+    }
+    let state = Arc::new(ChargeMiddlewareState::new(
+        requirement(),
+        CannedRedeemer {
+            outcome: Outcome::Err(make),
+        },
+    ));
+    let app = Router::new().route("/gated", get(echo)).layer(from_fn_with_state(
+        state,
+        require_charge_xcashu::<CannedRedeemer>,
+    ));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/gated")
+                .header("x-cashu", "cashuBany")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert_eq!(
+        resp.headers()
+            .get(http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/problem+json",
+        "X-Cashu error body must be problem+json (status {status})"
+    );
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    (status, body_json(&body))
+}
+
+/// Every wire-distinct [`ChargeError`] case (the canned constructors the
+/// surface-equality tests iterate).
+fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
+    vec![
+        || ChargeError::MintUnreachable {
+            mint_url: "https://mint.example".into(),
+            transport_detail: "timeout".into(),
+            indeterminate: false,
+        },
+        || ChargeError::AmountMismatch {
+            required: 100,
+            presented: 90,
+            amount: 100,
+            expected_swap_fee: 0,
+        },
+        || ChargeError::WrongUnit {
+            expected: "pop_1782668279".into(),
+            got: "sat".into(),
+        },
+        || ChargeError::MintNotAllowed {
+            got: "https://evil.example".into(),
+            allowed: vec!["https://mint.example".into()],
+        },
+        || ChargeError::MultiMintOrUnit,
+        || ChargeError::LockedToken,
+        || ChargeError::FeeTooHigh {
+            keyset_id: "009a1f293253e41e".into(),
+            input_fee_ppk: 100,
+        },
+        || ChargeError::DleqInvalid,
+        || ChargeError::ShortKeysetIdUnresolved {
+            short_id: "00aabbccddeeff00".into(),
+        },
+        || ChargeError::DoubleSpend,
+        || ChargeError::Expired,
+        || ChargeError::ChallengeExpired,
+        || ChargeError::InvalidChallenge,
+        || ChargeError::MalformedCredential("bad".into()),
+        || ChargeError::TooManyProofs { got: 99, max: 8 },
+        || ChargeError::MethodUnsupported {
+            method: "tempo".into(),
+        },
+        || ChargeError::MalformedRequest("bad config".into()),
+    ]
+}
+
 #[tokio::test]
 async fn charge_errors_map_to_spec_problem_types_and_statuses() {
-    // (problem-type, HTTP status) per draft-cashu-charge-01 §Errors.
+    // (ABSOLUTE problem-type URI, HTTP status) per draft-cashu-charge-01
+    // §Errors + the framework's status table. Only amount-mismatch and
+    // mint-unavailable live under the cashu/ namespace; MalformedRequest is a
+    // 400 with NO registered type (about:blank), never the invalid-challenge
+    // slug; a non-"cashu" method is the framework's method-unsupported 400.
     type ErrorCase = (fn() -> ChargeError, &'static str, u16);
     let cases: Vec<ErrorCase> = vec![
         (
@@ -434,7 +531,7 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 transport_detail: "timeout".into(),
                 indeterminate: false,
             },
-            "cashu/mint-unavailable",
+            "https://paymentauth.org/problems/cashu/mint-unavailable",
             503,
         ),
         (
@@ -444,7 +541,7 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 amount: 100,
                 expected_swap_fee: 0,
             },
-            "cashu/amount-mismatch",
+            "https://paymentauth.org/problems/cashu/amount-mismatch",
             402,
         ),
         (
@@ -452,7 +549,7 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 expected: "pop_1782668279".into(),
                 got: "sat".into(),
             },
-            "cashu/verification-failed",
+            "https://paymentauth.org/problems/verification-failed",
             402,
         ),
         (
@@ -460,37 +557,79 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 got: "https://evil.example".into(),
                 allowed: vec!["https://mint.example".into()],
             },
-            "cashu/verification-failed",
+            "https://paymentauth.org/problems/verification-failed",
             402,
         ),
-        (|| ChargeError::MultiMintOrUnit, "cashu/verification-failed", 402),
-        (|| ChargeError::LockedToken, "cashu/verification-failed", 402),
+        (
+            || ChargeError::MultiMintOrUnit,
+            "https://paymentauth.org/problems/verification-failed",
+            402,
+        ),
+        (
+            || ChargeError::LockedToken,
+            "https://paymentauth.org/problems/verification-failed",
+            402,
+        ),
+        (
+            || ChargeError::FeeTooHigh {
+                keyset_id: "009a1f293253e41e".into(),
+                input_fee_ppk: 100,
+            },
+            "https://paymentauth.org/problems/verification-failed",
+            402,
+        ),
         (
             || ChargeError::DleqInvalid,
-            "cashu/verification-failed",
+            "https://paymentauth.org/problems/verification-failed",
             402,
         ),
-        (|| ChargeError::DoubleSpend, "cashu/verification-failed", 402),
-        (|| ChargeError::Expired, "cashu/payment-expired", 402),
-        (|| ChargeError::ChallengeExpired, "cashu/payment-expired", 402),
+        (
+            || ChargeError::ShortKeysetIdUnresolved {
+                short_id: "00aabbccddeeff00".into(),
+            },
+            "https://paymentauth.org/problems/verification-failed",
+            402,
+        ),
+        (
+            || ChargeError::DoubleSpend,
+            "https://paymentauth.org/problems/verification-failed",
+            402,
+        ),
+        (
+            || ChargeError::Expired,
+            "https://paymentauth.org/problems/payment-expired",
+            402,
+        ),
+        (
+            || ChargeError::ChallengeExpired,
+            "https://paymentauth.org/problems/payment-expired",
+            402,
+        ),
         (
             || ChargeError::InvalidChallenge,
-            "cashu/invalid-challenge",
+            "https://paymentauth.org/problems/invalid-challenge",
             402,
         ),
         (
             || ChargeError::MalformedCredential("bad".into()),
-            "cashu/malformed-credential",
+            "https://paymentauth.org/problems/malformed-credential",
             402,
         ),
         (
             || ChargeError::TooManyProofs { got: 99, max: 8 },
-            "cashu/malformed-credential",
+            "https://paymentauth.org/problems/malformed-credential",
             402,
         ),
         (
+            || ChargeError::MethodUnsupported {
+                method: "tempo".into(),
+            },
+            "https://paymentauth.org/problems/method-unsupported",
+            400,
+        ),
+        (
             || ChargeError::MalformedRequest("bad config".into()),
-            "cashu/invalid-challenge",
+            "about:blank",
             400,
         ),
     ];
@@ -516,6 +655,35 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
 }
 
 #[tokio::test]
+async fn payment_and_xcashu_surfaces_emit_identical_mappings() {
+    // The single-source guarantee, observed END-TO-END: for every ChargeError,
+    // both in-crate hosts answer with the same (status, type, title, status
+    // member) — and both equal the shared problem_mapping table the gateway
+    // and wasm surfaces also consume.
+    use pops_core_verify::problem::problem_mapping;
+    for make in all_charge_error_cases() {
+        let mapping = problem_mapping(&make());
+        let (payment_status, payment_problem) = problem_for(make).await;
+        let (xcashu_status, xcashu_problem) = xcashu_problem_for(make).await;
+
+        assert_eq!(
+            payment_status, xcashu_status,
+            "status drift between Payment and X-Cashu hosts for {}",
+            make()
+        );
+        assert_eq!(
+            payment_problem, xcashu_problem,
+            "problem-body drift between Payment and X-Cashu hosts for {}",
+            make()
+        );
+        assert_eq!(payment_status.as_u16(), mapping.status, "{}", make());
+        assert_eq!(payment_problem["type"], mapping.type_uri, "{}", make());
+        assert_eq!(payment_problem["title"], mapping.title, "{}", make());
+        assert_eq!(payment_problem["status"], mapping.status, "{}", make());
+    }
+}
+
+#[tokio::test]
 async fn mint_unreachable_is_503_with_no_store_never_a_402() {
     // The load-bearing invariant: a transport failure is a 503 (token NOT
     // consumed), NEVER collapsed into a 402.
@@ -526,7 +694,10 @@ async fn mint_unreachable_is_503_with_no_store_never_a_402() {
     })
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(problem["type"], "cashu/mint-unavailable");
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/cashu/mint-unavailable"
+    );
 }
 
 // ─────────────────── bare 402 (no attempt) has no problem body ───────────────

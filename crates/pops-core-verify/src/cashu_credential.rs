@@ -103,6 +103,21 @@ pub enum ValidationError {
     #[error("mint rejected swap: {0}")]
     MintRejectedSwap(String),
 
+    /// The keyset charges an `input_fee_ppk` the fee-free profile disallows —
+    /// a policy reject raised before the swap (token NOT consumed), kept
+    /// distinct from [`Self::MintRejectedSwap`] so it never reads as a
+    /// double-spend.
+    #[error(
+        "fee-bearing keyset {keyset_id} disallowed: input_fee_ppk {input_fee_ppk} \
+         exceeds the fee-free profile"
+    )]
+    FeeTooHigh {
+        /// Keyset whose fee exceeded the profile (hex id).
+        keyset_id: String,
+        /// The disallowed `input_fee_ppk`.
+        input_fee_ppk: u64,
+    },
+
     /// Swap-output blind signatures whose NUT-12 DLEQ is missing or invalid:
     /// unsigned / wrong-key outputs that MUST NOT be redeemed. Kept distinct
     /// from [`Self::MintRejectedSwap`] so it maps to `DleqInvalid`, not a
@@ -233,13 +248,20 @@ impl<M: MintClient> ChargeValidator<M> {
             .await
             .map_err(|e| match e {
                 MintClientError::Unreachable(msg) => ValidationError::MintUnreachable(msg),
-                // `keysets()` submits no inputs and does no DLEQ work, so these
-                // two arms are unreachable here; map defensively (determinate
-                // unreachable / swap-rejection) to keep the match total.
+                // `keysets()` submits no inputs and does no DLEQ/fee work, so
+                // the remaining arms are unreachable here; map defensively
+                // (each onto its honest counterpart) to keep the match total.
                 MintClientError::UnreachableIndeterminate(msg) => {
                     ValidationError::MintUnreachable(msg)
                 }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
+                MintClientError::FeeTooHigh {
+                    keyset_id,
+                    input_fee_ppk,
+                } => ValidationError::FeeTooHigh {
+                    keyset_id,
+                    input_fee_ppk,
+                },
                 MintClientError::SwapOutputDleqInvalid(msg) => {
                     ValidationError::MintRejectedSwap(msg)
                 }
@@ -299,6 +321,15 @@ impl<M: MintClient> ChargeValidator<M> {
                     ValidationError::MintUnreachableIndeterminate(msg)
                 }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
+                // A fee-policy reject (raised pre-submit inside the ceremony)
+                // keeps its own arm so it never reads as a double-spend.
+                MintClientError::FeeTooHigh {
+                    keyset_id,
+                    input_fee_ppk,
+                } => ValidationError::FeeTooHigh {
+                    keyset_id,
+                    input_fee_ppk,
+                },
                 // Money-safety: a bad swap-output DLEQ is its own outcome, NEVER
                 // collapsed into MintRejectedSwap (which would 402 as a
                 // DoubleSpend and hide the mint-trust signal).
@@ -414,6 +445,13 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
         // currently surface as DoubleSpend=402. Splitting out an Expired arm
         // needs the mint's NUT-03 error-body parse, which is not yet done.
         ValidationError::MintRejectedSwap(_) => ChargeError::DoubleSpend,
+        ValidationError::FeeTooHigh {
+            keyset_id,
+            input_fee_ppk,
+        } => ChargeError::FeeTooHigh {
+            keyset_id,
+            input_fee_ppk,
+        },
         // Money-safety: a missing/invalid swap-output DLEQ is verification-
         // failed — a 402 (gateway serves nothing), distinct from a double-spend
         // so the operator sees the mint-trust signal. NEVER serve the resource
@@ -556,6 +594,8 @@ mod tests {
         UnreachableIndeterminate,
         RejectedSwap,
         DleqInvalid,
+        /// The ceremony's pre-submit fee-policy reject (fee-bearing keyset).
+        FeeTooHigh,
     }
 
     /// Canned outcome for the mock [`MintClient::keysets`] call.
@@ -643,6 +683,10 @@ mod tests {
                 SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
                     "mock swap-output DLEQ invalid".into(),
                 )),
+                SwapResponse::FeeTooHigh => Err(MintClientError::FeeTooHigh {
+                    keyset_id: "009a1f293253e41e".into(),
+                    input_fee_ppk: 100,
+                }),
             }
         }
     }
@@ -1412,6 +1456,32 @@ mod tests {
             matches!(err, ChargeError::DoubleSpend),
             "expected DoubleSpend, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_maps_fee_reject_to_fee_too_high_not_double_spend() {
+        // A fee-bearing keyset is a POLICY reject with an honest detail —
+        // never collapsed into DoubleSpend.
+        let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::FeeTooHigh);
+        let cred = CashuCredential::new(mock);
+
+        let err = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect_err("a fee-policy reject must map to FeeTooHigh");
+        match err {
+            ChargeError::FeeTooHigh {
+                keyset_id,
+                input_fee_ppk,
+            } => {
+                assert_eq!(keyset_id, "009a1f293253e41e");
+                assert_eq!(input_fee_ppk, 100);
+            }
+            other => panic!("expected FeeTooHigh (not DoubleSpend), got {other:?}"),
+        }
     }
 
     #[tokio::test]

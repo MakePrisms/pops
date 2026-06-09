@@ -12,15 +12,17 @@
 //!    the NUT-03 swap, with HTTP performed by the injected-`fetch`
 //!    [`WasmMintClient`][crate::wasm_mint_client::WasmMintClient]. It is async
 //!    (returns a `Promise`) and resolves to a structured JS object on success
-//!    or REJECTS with a structured `{ ok:false, code, message }` so the JS
-//!    route can map the [`ChargeError`] discriminant to an HTTP status
-//!    (402 / 503 / 400).
+//!    or REJECTS with a structured
+//!    `{ ok:false, code, message, status, problem_type, problem_slug }` — the
+//!    fine-grained [`ChargeError`] discriminant plus the single-sourced
+//!    [`crate::problem`] mapping (spec status + absolute problem-type URI).
 
 use crate::charge::ChargeError;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::cashu_credential::CashuCredential;
+use crate::problem::problem_mapping;
 use crate::redeemer::{ChargeRequirement, Redeemer};
 use crate::envelope::{
     decode_request_object as core_decode_request_object, encode_payment_credentials,
@@ -95,9 +97,12 @@ pub fn build_payment_credential(credentials_json: &str) -> Result<String, JsValu
 }
 
 /// Stable, machine-readable discriminant for a [`ChargeError`], carried as the
-/// `code` field of the rejection object so the JS route can pick an HTTP status
-/// without parsing prose. Values mirror the `draft-cashu-charge-01` problem-types:
-/// transport → 503, verification → 402, malformed → 400/402.
+/// `code` field of the rejection object. The codes are FINER-GRAINED than the
+/// `draft-cashu-charge-01` problem types — e.g. `wrong-unit`, `mint-not-allowed`,
+/// and `double-spend` all map to the single `verification-failed` problem type —
+/// so a JS route uses `code` for diagnostics and the mapped `status` /
+/// `problem_type` / `problem_slug` fields (the shared [`crate::problem`] map)
+/// for the HTTP answer.
 fn charge_error_code(e: &ChargeError) -> &'static str {
     match e {
         ChargeError::MintUnreachable { .. } => "mint-unreachable",
@@ -106,6 +111,7 @@ fn charge_error_code(e: &ChargeError) -> &'static str {
         ChargeError::MintNotAllowed { .. } => "mint-not-allowed",
         ChargeError::MultiMintOrUnit => "multi-mint-or-unit",
         ChargeError::LockedToken => "locked-token",
+        ChargeError::FeeTooHigh { .. } => "fee-too-high",
         ChargeError::DleqInvalid => "dleq-invalid",
         ChargeError::ShortKeysetIdUnresolved { .. } => "short-keyset-id-unresolved",
         ChargeError::DoubleSpend => "double-spend",
@@ -113,19 +119,36 @@ fn charge_error_code(e: &ChargeError) -> &'static str {
         ChargeError::ChallengeExpired => "challenge-expired",
         ChargeError::InvalidChallenge => "invalid-challenge",
         ChargeError::MalformedCredential(_) => "malformed-credential",
+        ChargeError::MethodUnsupported { .. } => "method-unsupported",
         ChargeError::MalformedRequest(_) => "malformed-request",
         ChargeError::TooManyProofs { .. } => "too-many-proofs",
     }
 }
 
-/// Build the structured rejection value `{ ok:false, code, message }` for a
-/// [`ChargeError`]. `code` is the stable discriminant; `message` is the
-/// human-readable `Display`.
+/// Build the structured rejection value
+/// `{ ok:false, code, message, status, problem_type, problem_slug }` for a
+/// [`ChargeError`]. `code` is the fine-grained discriminant and `message` the
+/// human-readable `Display`; `status` (number), `problem_type` (absolute URI),
+/// and `problem_slug` (string or null) come from the single-sourced
+/// [`crate::problem`] map, so a JS route emits the same wire as the native
+/// hosts without re-deriving the mapping.
 fn charge_error_to_js(e: &ChargeError) -> JsValue {
+    let mapping = problem_mapping(e);
     let obj = js_sys::Object::new();
     let _ = js_sys::Reflect::set(&obj, &"ok".into(), &JsValue::FALSE);
     let _ = js_sys::Reflect::set(&obj, &"code".into(), &JsValue::from_str(charge_error_code(e)));
     let _ = js_sys::Reflect::set(&obj, &"message".into(), &JsValue::from_str(&e.to_string()));
+    let _ = js_sys::Reflect::set(&obj, &"status".into(), &JsValue::from_f64(mapping.status.into()));
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &"problem_type".into(),
+        &JsValue::from_str(mapping.type_uri),
+    );
+    let _ = js_sys::Reflect::set(
+        &obj,
+        &"problem_slug".into(),
+        &mapping.slug.map(JsValue::from_str).unwrap_or(JsValue::NULL),
+    );
     obj.into()
 }
 
@@ -140,8 +163,11 @@ fn charge_error_to_js(e: &ChargeError) -> JsValue {
 ///
 /// Returns a `Promise` that RESOLVES to
 /// `{ ok:true, fresh_proofs, amount, unit, active_keyset_id, token_hash }` on
-/// success, or REJECTS with `{ ok:false, code, message }` carrying the
-/// [`ChargeError`] discriminant so the JS route maps 402 / 503 / 400.
+/// success, or REJECTS with
+/// `{ ok:false, code, message, status, problem_type, problem_slug }` — the
+/// fine-grained [`ChargeError`] discriminant plus the mapped spec status and
+/// absolute problem-type URI, so the JS route answers 402 / 503 / 400 with the
+/// same problem body the native hosts emit.
 ///
 /// A malformed `requirement_json` (server-side config error, never the holder's fault)
 /// rejects with `code = "malformed-request"`.

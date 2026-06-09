@@ -4,9 +4,9 @@
 //! ([`CashuCredential::verify_and_redeem`]): it decides whether a path is gated,
 //! runs the gate, **persists `fresh_proofs` durably BEFORE forwarding**, then
 //! proxies the ORIGINAL request to `upstream_url` and streams back. The
-//! `ChargeError` → HTTP status mapping (503/400/402) is the single-sourced
-//! [`charge_error_status`],
-//! shared with `middleware.rs`.
+//! `ChargeError` → status/problem-type mapping (503/400/402 + RFC-9457 body) is
+//! the single-sourced [`pops_core_verify::problem`] map, shared with the core
+//! middlewares.
 
 use std::sync::Arc;
 
@@ -20,6 +20,7 @@ use pops_core_verify::cashu_credential::{charge_requirement_from_cashu, CashuCre
 use pops_core_verify::cdk_mint_client::CdkMintClient;
 use pops_core_verify::challenge::{encode_charge_request, CashuRequirement};
 use pops_core_verify::http_status::charge_error_status;
+use pops_core_verify::problem::{Problem, PROBLEM_JSON};
 use pops_core_verify::redeemer::Redeemer;
 use pops_core_verify::envelope::{
     parse_payment_authorization, AuthParseError, PAYMENT_SCHEME,
@@ -140,12 +141,12 @@ where
 {
     let (parts, body) = req.into_parts();
 
-    // Extract the credential first (a bare/malformed request 402s without
+    // Extract the credential first (a bare/malformed request errors without
     // buffering its body).
     let token = match extract_token(&parts.headers) {
         Ok(t) => t,
         Err(TokenExtract::NoAttempt) => return challenge_402(&state, None),
-        Err(TokenExtract::Malformed(reason)) => return challenge_402(&state, Some(&reason)),
+        Err(TokenExtract::Failed(e)) => return charge_error_to_response(&state, e),
     };
 
     // Buffer the body (capped) before the swap, while the pop is still unspent.
@@ -393,38 +394,68 @@ fn is_hop_by_hop(name: &str) -> bool {
 enum TokenExtract {
     /// No header, or a non-`Payment` scheme — identical to "no payment attempt".
     NoAttempt,
-    /// A `Payment` attempt that failed to parse — surfaced as a 402 + reason.
-    Malformed(String),
+    /// A `Payment` attempt that failed — the [`ChargeError`] picks the
+    /// status/problem-type via the shared map (malformed credential → 402,
+    /// non-"cashu" method → 400 method-unsupported, >1 credential → 400).
+    Failed(ChargeError),
 }
 
 /// Extract the `cashuB…` token from `Authorization: Payment <blob>`. A non-Payment
-/// scheme is treated as no attempt.
+/// scheme is treated as no attempt; more than one Payment credential is a
+/// malformed request frame per the framework.
 fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
+    let payment_values = headers
+        .get_all(header::AUTHORIZATION)
+        .iter()
+        .filter(|v| {
+            v.to_str().is_ok_and(|s| {
+                s.trim()
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PAYMENT_SCHEME))
+            })
+        })
+        .count();
+    if payment_values > 1 {
+        return Err(TokenExtract::Failed(ChargeError::MalformedRequest(
+            "request bears more than one Authorization: Payment credential".to_string(),
+        )));
+    }
+
     let Some(raw) = headers.get(header::AUTHORIZATION) else {
         return Err(TokenExtract::NoAttempt);
     };
-    let value = raw
-        .to_str()
-        .map_err(|_| TokenExtract::Malformed("invalid Authorization header encoding".into()))?;
+    let value = raw.to_str().map_err(|_| {
+        TokenExtract::Failed(ChargeError::MalformedCredential(
+            "invalid Authorization header encoding".into(),
+        ))
+    })?;
     match parse_payment_authorization(value) {
         Ok(creds) => Ok(creds.payload.cashu_token),
         Err(AuthParseError::UnknownScheme) => Err(TokenExtract::NoAttempt),
-        Err(e) => Err(TokenExtract::Malformed(e.to_string())),
+        Err(AuthParseError::WrongMethod(method)) => {
+            Err(TokenExtract::Failed(ChargeError::MethodUnsupported {
+                method,
+            }))
+        }
+        Err(e) => Err(TokenExtract::Failed(ChargeError::MalformedCredential(
+            e.to_string(),
+        ))),
     }
 }
 
-/// Build a 402 carrying the prebuilt challenge + a JSON body (always
-/// `Cache-Control: no-store`).
-fn challenge_402<C>(state: &AppState<C>, failure: Option<&str>) -> Response
+/// Build a 402 carrying the prebuilt challenge (always `Cache-Control:
+/// no-store`). The body is RFC-9457 `application/problem+json` from the shared
+/// [`pops_core_verify::problem`] map: the supplied failure problem, or the
+/// framework's `payment-required` type on a bare "no attempt yet" challenge.
+fn challenge_402<C>(state: &AppState<C>, problem: Option<&Problem>) -> Response
 where
     C: Redeemer,
 {
-    let body = match failure {
-        Some(detail) => format!(
-            r#"{{"error":"payment_required","detail":{},"realm":"{REALM}"}}"#,
-            json_string(detail)
-        ),
-        None => format!(r#"{{"error":"payment_required","realm":"{REALM}"}}"#),
+    let body = match problem {
+        Some(p) => p.to_json(),
+        None => Problem::payment_required(format!("payment required for realm {REALM:?}"))
+            .to_json(),
     };
     (
         StatusCode::PAYMENT_REQUIRED,
@@ -432,7 +463,7 @@ where
             (header::WWW_AUTHENTICATE, state.www_authenticate.clone()),
             (
                 header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
+                HeaderValue::from_static(PROBLEM_JSON),
             ),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
@@ -441,71 +472,45 @@ where
         .into_response()
 }
 
-/// Map a [`ChargeError`] to an HTTP response. The status is the single-sourced
-/// [`charge_error_status`] trichotomy (shared with `middleware.rs` so the two
+/// Map a [`ChargeError`] to an HTTP response from the single-sourced
+/// [`pops_core_verify::problem`] map (shared with the core middlewares so the
 /// hosts cannot drift): [`ChargeError::MintUnreachable`] → `503` + `Retry-After`
-/// (token NOT consumed; NEVER a 402), [`ChargeError::MalformedRequest`] → `400`,
-/// everything else (verification / malformed-credential) → `402` + a fresh
-/// challenge. Only the JSON *body* is gateway-specific (a flat advisory frame,
-/// not the middleware's RFC-9457 `problem+json`).
+/// (token NOT consumed; NEVER a 402), [`ChargeError::MalformedRequest`] /
+/// [`ChargeError::MethodUnsupported`] → `400`, everything else (verification /
+/// malformed-credential) → `402` + a fresh challenge. Every body is RFC-9457
+/// `application/problem+json` with the absolute problem-type URI.
 fn charge_error_to_response<C>(state: &AppState<C>, e: ChargeError) -> Response
 where
     C: Redeemer,
 {
-    match charge_error_status(&e) {
+    let problem = Problem::for_error(&e);
+    let status = charge_error_status(&e);
+    match status {
+        StatusCode::PAYMENT_REQUIRED => challenge_402(state, Some(&problem)),
         StatusCode::SERVICE_UNAVAILABLE => (
-            StatusCode::SERVICE_UNAVAILABLE,
+            status,
             [
                 (header::RETRY_AFTER, HeaderValue::from_static("2")),
                 (
                     header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
+                    HeaderValue::from_static(PROBLEM_JSON),
                 ),
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
             ],
-            format!(
-                r#"{{"error":"mint_unavailable","detail":{}}}"#,
-                json_string(&e.to_string())
-            ),
+            problem.to_json(),
         )
             .into_response(),
-
-        StatusCode::BAD_REQUEST => (
-            StatusCode::BAD_REQUEST,
+        _ => (
+            status,
             [
                 (
                     header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
+                    HeaderValue::from_static(PROBLEM_JSON),
                 ),
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
             ],
-            format!(
-                r#"{{"error":"bad_request","detail":{}}}"#,
-                json_string(&e.to_string())
-            ),
+            problem.to_json(),
         )
             .into_response(),
-
-        _ => challenge_402(state, Some(&e.to_string())),
     }
-}
-
-/// Minimal JSON string escaper for a hand-built JSON body (advisory bodies; keeps
-/// the dep surface small).
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }

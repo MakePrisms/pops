@@ -35,6 +35,10 @@ pub mod unit;
 // compiled: the crypto is shared by the native cdk client and the wasm
 // injected-fetch client, and `cashu` itself compiles to wasm.
 pub mod swap_ceremony;
+// The single-sourced ChargeError → RFC-9457 problem mapping (absolute type
+// URI, slug, status, shared body). Plain serde — always compiled, wasm-clean —
+// so every host (middleware, xcashu, gateway, wasm) emits from ONE table.
+pub mod problem;
 // The NUT-24 `X-Cashu` transport codec. Cashu-free string handling over the
 // shared verify core, so it is always compiled and wasm-compiles like `envelope`.
 pub mod xcashu;
