@@ -26,9 +26,9 @@ use crate::mint_client::{MintClientError, SwapOutcome};
 /// to proving it signed the outputs with its advertised key.
 ///
 /// The verdict is a FLAG, not a gate (`draft-cashu-charge-01` verification
-/// step 9 + §security-dleq): by the time these signatures exist the swap
-/// SUCCEEDED — the presented inputs are consumed and cannot be restored — so a
-/// failure here is a mint-trust incident the caller reports (WARN + the
+/// step 8): by the time these signatures exist the swap SUCCEEDED — the
+/// presented inputs are consumed and cannot be restored — so a failure here is
+/// a mint-trust incident the caller reports (WARN + the
 /// [`SwapOutcome::dleq_ok`] flag), never a payment failure. Failing the request
 /// instead would both destroy the redeemed value (outputs discarded, inputs
 /// spent) and 402 a client whose payment settled, violating the spec's
@@ -299,10 +299,10 @@ mod tests {
     //! Money-safety tests for the swap-output DLEQ verdict. A mock [`MintHttp`]
     //! signs the blinded outputs as a real mint would, then attaches VALID,
     //! MISSING, or PRESENT-BUT-INVALID DLEQ. Invariants under test
-    //! (`draft-cashu-charge-01` step 9 + §security-dleq): the redeemed value is
-    //! returned in EVERY DLEQ mode (the swap consumed the inputs; discarding
-    //! outputs would destroy value), `dleq_ok` is `true` iff every signature's
-    //! DLEQ verified, and a failed verdict WARNs naming the mint.
+    //! (`draft-cashu-charge-01` step 8): the redeemed value is returned in EVERY
+    //! DLEQ mode (the swap consumed the inputs; discarding outputs would destroy
+    //! value), `dleq_ok` is `true` iff every signature's DLEQ verified, and a
+    //! failed verdict WARNs naming the mint.
 
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};

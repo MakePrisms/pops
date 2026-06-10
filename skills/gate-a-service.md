@@ -78,7 +78,7 @@ feature):
   non-empty** — the challenge's `creqA` requires a non-empty `m`, so a Payment
   host cannot emit a challenge from an empty set and the middleware answers a
   bare request with `500` if misconfigured that way), `amount` (exact), and
-  optional `payment_id` / `description` / `single_use`. This is the config you
+  optional `external_id` / `description`. This is the config you
   build the challenge from. (Defined in
   [`challenge.rs`](../crates/pops-core-verify/src/challenge.rs).)
 - **`require_charge_state(requirement) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>>`**
@@ -148,7 +148,7 @@ const credsJson = wasm.parse_payment_credential(authorization);   // extract the
 const cashuToken = JSON.parse(credsJson).payload.token;
 const redeemed = await wasm.verify_and_redeem(                      // full verify + NUT-03 swap
   cashuToken,
-  JSON.stringify(requirement),                                     // { amount, unit, mints, payment_id, description, single_use }
+  JSON.stringify(requirement),                                     // { amount, unit, mints, external_id, description }
 );     // resolves { ok, fresh_proofs, amount, unit, active_keyset_id, token_hash, dleq_ok }
 ```
 

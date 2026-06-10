@@ -160,8 +160,8 @@ fn charge_error_to_js(e: &ChargeError) -> JsValue {
 /// Full verify + redeem over an injected `fetch`.
 ///
 /// `presented_token` is the holder's `cashuB…` token string; `requirement_json` is the
-/// JSON form of a [`ChargeRequirement`] (`{ amount, unit, mints, payment_id,
-/// description, single_use }`). Constructs a
+/// JSON form of a [`ChargeRequirement`] (`{ amount, unit, mints, external_id,
+/// description }`). Constructs a
 /// [`CashuCredential<WasmMintClient>`] and runs the same decode → structural
 /// checks → NUT-03 swap pipeline the native path runs, with all HTTP issued
 /// via `globalThis.fetch` against the token's mint.

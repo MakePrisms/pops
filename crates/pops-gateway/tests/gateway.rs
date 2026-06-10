@@ -215,9 +215,8 @@ fn requirement() -> CashuRequirement {
         unit: pop_unit(),
         mints: vec![mint_a()],
         amount: Amount::from(10),
-        payment_id: None,
+        external_id: None,
         description: Some("gateway test".into()),
-        single_use: true,
     }
 }
 

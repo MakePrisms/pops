@@ -183,9 +183,8 @@ fn challenge_header(mint_url: &str) -> String {
         unit: pop_unit(),
         mints: vec![MintUrl::from_str(mint_url).expect("mint url")],
         amount: Amount::from(CHARGE_AMOUNT),
-        payment_id: Some("ch-recovery".to_string()),
+        external_id: Some("ch-recovery".to_string()),
         description: None,
-        single_use: true,
     };
     let request = encode_charge_request(&req).expect("requirement encodes");
     format!(

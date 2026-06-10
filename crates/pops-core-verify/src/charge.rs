@@ -38,7 +38,7 @@ pub enum ChargeError {
     },
 
     // (B) VERIFICATION — 402 + fresh re-challenge, terminal for this token.
-    /// Presented value < `amount + expected_swap_fee` (spec verification step 8).
+    /// Presented value < `amount + expected_swap_fee` (spec verification step 7).
     /// UNDER-funded only: value above the requirement is accepted and retained
     /// by the server (the spec's Errors § has no over-payment counterpart).
     ///
@@ -110,8 +110,10 @@ pub enum ChargeError {
     #[error("token references multiple mints or units")]
     MultiMintOrUnit,
 
-    /// A proof carries a NUT-10 (P2PK/HTLC) spending condition. This intent is
-    /// BEARER-only, so a locked proof fails verification (rejected before swap).
+    /// A proof carries a NUT-10 (P2PK/HTLC) spending condition. The spec permits
+    /// conditions only when the challenge advertised them; this implementation
+    /// advertises none, so a locked proof is unsatisfiable and rejected before
+    /// the swap as a fast-path (same verification-failed the swap would yield).
     ///
     /// HTTP 402 · `verification-failed` · terminal.
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
@@ -143,16 +145,18 @@ pub enum ChargeError {
     SwapRejected(String),
 
     /// Swap rejected because the keyset retired or its `final_expiry` (NUT-02)
-    /// passed — distinct from double-spend. For `pop_<ts>` this is where the CLTV
-    /// time-lock surfaces (enforced by the mint at swap).
+    /// passed — a swap-rejection cause alongside double-spend. For `pop_<ts>`
+    /// this is where the CLTV time-lock surfaces (enforced by the mint at swap).
+    /// The `detail` names the cause; the type is the generic swap-rejection one.
     ///
-    /// HTTP 402 · `payment-expired` · terminal.
+    /// HTTP 402 · `verification-failed` · terminal.
     #[error("payment expired: keyset retired or final_expiry passed")]
     Expired,
 
     /// The echoed `challenge.expires` is in the past — the framework challenge
-    /// clock, caught BEFORE any swap. Distinct from `Expired` (mint-side keyset /
-    /// `final_expiry`, caught AT swap).
+    /// clock, caught BEFORE any swap. The sole `payment-expired` cause, distinct
+    /// from `Expired` (mint-side keyset / `final_expiry`, caught AT swap, which
+    /// is `verification-failed`).
     ///
     /// HTTP 402 · `payment-expired` · terminal.
     #[error("challenge expired (echoed `expires` is in the past)")]

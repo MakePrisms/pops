@@ -136,9 +136,8 @@ fn requirement(unit: CurrencyUnit, mints: Vec<MintUrl>, amount: u64) -> CashuReq
         unit,
         mints,
         amount: Amount::from(amount),
-        payment_id: None,
+        external_id: None,
         description: None,
-        single_use: true,
     }
 }
 
@@ -239,7 +238,7 @@ async fn valid_cashub_returns_200_and_serves_resource() {
 #[tokio::test]
 async fn overpay_is_accepted_and_excess_retained() {
     // 20 against a required 10: value above the requirement is accepted and
-    // retained (spec step 8) — the whole token swaps and the resource serves.
+    // retained (spec step 7) — the whole token swaps and the resource serves.
     let token = make_token(mint_a(), pop_unit(), vec![make_proof(16, 0), make_proof(4, 1)]);
     let (app, swaps) = router_for(SwapResponse::Echo);
     let response = app
@@ -306,7 +305,7 @@ async fn wrong_mint_is_rejected_and_resource_not_served() {
     );
 }
 
-// ---- DLEQ failure → serve-and-flag (spec step 9 + §security-dleq) ----
+// ---- DLEQ failure → serve-and-flag (spec step 8) ----
 
 #[tokio::test]
 async fn dleq_failure_serves_resource_and_flags_redeemed_extension() {

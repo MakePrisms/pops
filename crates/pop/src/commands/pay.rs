@@ -952,9 +952,8 @@ mod tests {
             unit: pop_unit(),
             mints: vec![mint_a()],
             amount: cdk_common::Amount::from(amount),
-            payment_id: Some("ch-1".to_string()),
+            external_id: Some("ch-1".to_string()),
             description: None,
-            single_use: true,
         };
         let request = encode_charge_request(&req).expect("requirement encodes");
         let header = format!(
@@ -1017,9 +1016,8 @@ mod tests {
             unit: pop_unit(),
             mints: vec![mint_a()],
             amount: cdk_common::Amount::from(1234),
-            payment_id: Some("ch-42".to_string()),
+            external_id: Some("ch-42".to_string()),
             description: None,
-            single_use: true,
         };
         let request = encode_charge_request(&req).expect("requirement encodes");
         let header = format!(

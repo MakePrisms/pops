@@ -37,15 +37,14 @@ pub struct ChargeRequirement {
     /// "any mint".
     #[serde(default)]
     pub mints: Vec<String>,
-    /// Optional payment correlation id.
+    /// Optional merchant reference echoed as the request object's top-level
+    /// `externalId` and in the receipt. It is NOT the creqA payment id (`i`),
+    /// which the charge method omits.
     #[serde(default)]
-    pub payment_id: Option<String>,
+    pub external_id: Option<String>,
     /// Optional human-readable description.
     #[serde(default)]
     pub description: Option<String>,
-    /// Whether the challenge is one-shot.
-    #[serde(default)]
-    pub single_use: bool,
 }
 
 /// The result of a successful [`Redeemer::verify_and_redeem`].

@@ -81,7 +81,7 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
         },
 
         // The framework's payment-insufficient: the token's total value is
-        // less than `amount + swap_fee` (spec step 8). There is no
+        // less than `amount + swap_fee` (spec step 7). There is no
         // over-payment counterpart — excess is accepted and retained.
         ChargeError::PaymentInsufficient { .. } => framework(
             "payment-insufficient",
@@ -90,14 +90,14 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
             "Payment Insufficient",
         ),
 
-        // Non-amount, non-expiry verification failures, per the spec's Errors §
-        // list: unit mismatch (declared OR resolved-keyset, step 7), disallowed
-        // mint, a userinfo-bearing mint URL (mint-trust §), NUT-10 lock,
-        // unresolvable short keyset id, swap rejection (typed already-spent or
-        // the neutral else-branch, step 9), and the policy-disallowed
-        // fee-bearing keyset ("unit otherwise disallowed by server policy"). A
-        // swap-output DLEQ failure is deliberately NOT here — see the map
-        // tests: it is no ChargeError at all.
+        // Non-amount verification failures, per the spec's Errors § list: unit
+        // mismatch (declared OR resolved-keyset, step 6), disallowed mint, a
+        // userinfo-bearing mint URL (mint-trust §), NUT-10 lock, unresolvable
+        // short keyset id, swap rejection (typed already-spent, the neutral
+        // else-branch, or a retired keyset / passed `final_expiry`, step 8), and
+        // the policy-disallowed fee-bearing keyset ("unit otherwise disallowed
+        // by server policy"). A swap-output DLEQ failure is deliberately NOT
+        // here — see the map tests: it is no ChargeError at all.
         ChargeError::WrongUnit { .. }
         | ChargeError::MintNotAllowed { .. }
         | ChargeError::MintUrlUserinfo { .. }
@@ -105,6 +105,7 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
         | ChargeError::ShortKeysetIdUnresolved { .. }
         | ChargeError::DoubleSpend
         | ChargeError::SwapRejected(_)
+        | ChargeError::Expired
         | ChargeError::FeeTooHigh { .. } => framework(
             "verification-failed",
             "https://paymentauth.org/problems/verification-failed",
@@ -112,9 +113,10 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
             "Verification Failed",
         ),
 
-        // Both expiry causes share one type per the spec (the client needs no
-        // discriminator: re-present once, then abandon the token).
-        ChargeError::Expired | ChargeError::ChallengeExpired => framework(
+        // payment-expired is single-cause: a stale challenge `expires` echo,
+        // caught before any swap. A swap rejected for a retired keyset / passed
+        // `final_expiry` is verification-failed (above).
+        ChargeError::ChallengeExpired => framework(
             "payment-expired",
             "https://paymentauth.org/problems/payment-expired",
             402,
@@ -242,7 +244,7 @@ mod tests {
 
     #[test]
     fn payment_insufficient_is_the_framework_type_402() {
-        // Spec step 8 + Errors §: an under-funded token is the framework's
+        // Spec step 7 + Errors §: an under-funded token is the framework's
         // payment-insufficient. Over-funding has no counterpart (accepted).
         let m = problem_mapping(&ChargeError::PaymentInsufficient {
             required: 10,
@@ -260,11 +262,13 @@ mod tests {
 
     #[test]
     fn verification_failures_share_the_framework_type_402() {
-        // Spec Errors §: every non-amount, non-expiry verification check —
-        // including the fee-policy reject ("unit otherwise disallowed by
-        // server policy") and a swap-rejected double-spend (step 9).
+        // Spec Errors §: every non-amount verification check — including the
+        // fee-policy reject ("unit otherwise disallowed by server policy"), a
+        // swap-rejected double-spend, AND a swap rejected for a retired keyset /
+        // passed `final_expiry` (`Expired`), all of which are step-8 swap
+        // rejections.
         //
-        // DELIBERATELY ABSENT: a swap-output DLEQ failure. Spec step 9 +
+        // DELIBERATELY ABSENT: a swap-output DLEQ failure. Spec step 8 +
         // §security-dleq make it a mint-trust incident, not a payment failure
         // ("The server MUST NOT fail the payment for it: it SHOULD serve the
         // resource, alert the operator, and quarantine the mint") — so the old
@@ -290,6 +294,7 @@ mod tests {
             },
             ChargeError::DoubleSpend,
             ChargeError::SwapRejected("mint said no".into()),
+            ChargeError::Expired,
             ChargeError::FeeTooHigh {
                 keyset_id: "009a1f293253e41e".into(),
                 input_fee_ppk: 100,
@@ -328,15 +333,21 @@ mod tests {
     }
 
     #[test]
-    fn both_expiry_causes_share_payment_expired_402() {
-        // Spec: stale challenge echo AND keyset retirement/final_expiry both
-        // map to payment-expired (the client needs no discriminator).
-        for e in [ChargeError::Expired, ChargeError::ChallengeExpired] {
-            let m = problem_mapping(&e);
-            assert_eq!(m.slug, Some("payment-expired"), "{e}");
-            assert_eq!(m.type_uri, "https://paymentauth.org/problems/payment-expired");
-            assert_eq!(m.status, 402, "{e}");
-        }
+    fn payment_expired_is_single_cause_stale_challenge_echo() {
+        // Spec Errors §: payment-expired is ONLY a stale challenge `expires`
+        // echo. A swap rejected for keyset retirement / passed `final_expiry`
+        // (`Expired`) is verification-failed, not payment-expired.
+        let m = problem_mapping(&ChargeError::ChallengeExpired);
+        assert_eq!(m.slug, Some("payment-expired"));
+        assert_eq!(m.type_uri, "https://paymentauth.org/problems/payment-expired");
+        assert_eq!(m.status, 402);
+
+        let expired = problem_mapping(&ChargeError::Expired);
+        assert_eq!(
+            expired.slug,
+            Some("verification-failed"),
+            "a retired-keyset swap rejection is verification-failed, not payment-expired"
+        );
     }
 
     #[test]

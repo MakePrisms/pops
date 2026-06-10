@@ -61,7 +61,7 @@ pub enum ValidationError {
     },
 
     /// A RESOLVED keyset's unit differs from the requirement's (spec
-    /// verification step 7): the token's declared unit is client-supplied data,
+    /// verification step 6): the token's declared unit is client-supplied data,
     /// the mint's published keyset is the authority. Raised BEFORE the swap, so
     /// a foreign-unit proof smuggled under a matching declared unit never
     /// reaches the mint.
@@ -78,9 +78,11 @@ pub enum ValidationError {
         got: CurrencyUnit,
     },
 
-    /// A proof carries a NUT-10 spending-condition secret (P2PK / HTLC). This
-    /// intent is BEARER-only; a locked proof is rejected before the swap, which
-    /// the bearer ceremony could not satisfy anyway.
+    /// A proof carries a NUT-10 spending-condition secret (P2PK / HTLC). The
+    /// spec permits conditions only when the challenge advertised them; this
+    /// implementation advertises none, so a condition is unsatisfiable and the
+    /// swap would reject it. Rejected early as a fast-path (same
+    /// verification-failed outcome, no mint round-trip).
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
 
@@ -127,7 +129,7 @@ pub enum ValidationError {
     },
 
     /// Total proof amount is LESS than the requirement (spec verification
-    /// step 8: value must be at least `amount + expected_swap_fee`). The
+    /// step 7: value must be at least `amount + expected_swap_fee`). The
     /// verifier makes no change; value ABOVE the requirement is accepted and
     /// retained, so only an under-funded token is rejected.
     #[error("token amount {got} is less than required {required}")]
@@ -150,9 +152,9 @@ pub enum ValidationError {
     AlreadySpent(String),
 
     /// Mint rejected the call with a keyset-class error: the keyset has
-    /// retired or its `final_expiry` has passed (spec verification step 9 —
-    /// a `payment-expired` condition, never `verification-failed`). The token
-    /// was NOT consumed.
+    /// retired or its `final_expiry` has passed (spec verification step 8 — a
+    /// swap rejection, so `verification-failed`, with the cause named in the
+    /// problem `detail`). The token was NOT consumed.
     #[error("mint rejected swap (keyset retired or final_expiry passed): {0}")]
     KeysetRetiredOrExpired(String),
 
@@ -281,9 +283,13 @@ impl<M: MintClient> ChargeValidator<M> {
             }
         }
 
-        // A plain 32-byte hex secret does NOT parse as NUT-10, so this fires
-        // only on a genuinely locked (P2PK/HTLC) proof — which the bearer
-        // ceremony could not spend.
+        // Fast-path, not a spec-mandated step: spec f3183d2 permits spending
+        // conditions only when the challenge's payment request advertised them
+        // (step 8 supplies the witness); this implementation advertises none, so
+        // any condition is unsatisfiable here and the swap would reject it. A
+        // plain 32-byte hex secret does NOT parse as NUT-10, so this fires only
+        // on a genuinely locked (P2PK/HTLC) proof; rejecting it early yields the
+        // same verification-failed the swap would, without the mint round-trip.
         if secrets
             .iter()
             .any(|s| cashu::nuts::nut10::Secret::try_from(*s).is_ok())
@@ -359,7 +365,7 @@ impl<M: MintClient> ChargeValidator<M> {
             return Err(ValidationError::MultiMintOrUnit);
         }
 
-        // Spec verification step 7, BEFORE the step-8 value check and the swap:
+        // Spec verification step 6, BEFORE the step-7 value check and the swap:
         // the resolved keyset's unit must equal the requirement's. The token's
         // declared unit (checked above) is client-supplied data; the mint's
         // published keyset is the authority — without this, a sat-keyset proof
@@ -420,9 +426,9 @@ impl<M: MintClient> ChargeValidator<M> {
                 // The mint-typed already-spent rejection keeps the honest
                 // double-spend detail.
                 MintClientError::AlreadySpent(msg) => ValidationError::AlreadySpent(msg),
-                // Spec step 9 split: a keyset-retirement/final_expiry rejection
-                // is payment-expired, kept apart from the verification-failed
-                // catch-all above.
+                // Spec step 8: a keyset-retirement/final_expiry rejection is a
+                // swap rejection (verification-failed), kept in its own arm so
+                // the cause can be named in the problem `detail`.
                 MintClientError::KeysetRetiredOrExpired(msg) => {
                     ValidationError::KeysetRetiredOrExpired(msg)
                 }
@@ -475,9 +481,8 @@ pub fn charge_requirement_from_cashu(req: &CashuRequirement) -> ChargeRequiremen
         amount: u64::from(req.amount),
         unit: req.unit.to_string(),
         mints: req.mints.iter().map(|m| m.to_string()).collect(),
-        payment_id: req.payment_id.clone(),
+        external_id: req.external_id.clone(),
         description: req.description.clone(),
-        single_use: req.single_use,
     }
 }
 
@@ -506,9 +511,8 @@ fn cashu_requirement_from_charge(req: &ChargeRequirement) -> Result<CashuRequire
         unit,
         mints,
         amount: Amount::from(req.amount),
-        payment_id: req.payment_id.clone(),
+        external_id: req.external_id.clone(),
         description: req.description.clone(),
-        single_use: req.single_use,
     })
 }
 
@@ -555,7 +559,7 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
             expected: expected.to_string(),
             got: got.to_string(),
         },
-        // Spec step 7: a resolved-keyset unit mismatch is the same
+        // Spec step 6: a resolved-keyset unit mismatch is the same
         // verification-failed condition as a declared-unit mismatch (the
         // keyset-id context stays in the validation-layer log).
         ValidationError::ResolvedKeysetUnitMismatch { expected, got, .. } => {
@@ -578,12 +582,11 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
         ValidationError::MalformedToken(msg) => {
             ChargeError::MalformedCredential(format!("malformed token: {msg}"))
         }
-        // Spec step 9: a swap rejected for keyset retirement or passed
+        // Spec step 8: a swap rejected for keyset retirement or passed
         // `final_expiry` (the mint's NUT keyset-error codes, classified by the
-        // mint client) is payment-expired; every OTHER rejection is the
-        // else-branch verification-failed condition — split into the
-        // mint-typed already-spent (the honest double-spend detail) and the
-        // neutral catch-all.
+        // mint client) is verification-failed, like every other swap rejection.
+        // The arm stays distinct from the already-spent (honest double-spend
+        // detail) and neutral catch-all only so the cause is named in `detail`.
         ValidationError::KeysetRetiredOrExpired(_) => ChargeError::Expired,
         ValidationError::AlreadySpent(_) => ChargeError::DoubleSpend,
         ValidationError::MintRejectedSwap(detail) => ChargeError::SwapRejected(detail),
@@ -924,9 +927,8 @@ mod tests {
             unit,
             mints,
             amount: Amount::from(amount),
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: true,
         }
     }
 
@@ -1048,7 +1050,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_accepts_overfunded_amount_and_retains_excess() {
-        // Spec step 8: value ABOVE `amount + expected_swap_fee` is accepted and
+        // Spec step 7: value ABOVE `amount + expected_swap_fee` is accepted and
         // retained — the whole 20 is swapped against a 10 requirement.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(16, 0), make_proof(4, 1)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
@@ -1163,7 +1165,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_propagates_keyset_retired_swap_rejection_distinctly() {
-        // Spec step 9: a swap rejected for keyset retirement / final_expiry
+        // Spec step 8: a swap rejected for keyset retirement / final_expiry
         // surfaces as its own arm, never collapsed into MintRejectedSwap.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
@@ -1189,10 +1191,10 @@ mod tests {
 
     #[tokio::test]
     async fn validate_succeeds_with_dleq_flag_false_on_swap_output_dleq_failure() {
-        // Spec step 9: "a failed or missing DLEQ proof after a successful swap
-        // is a mint-trust incident, not a payment failure" — validation
-        // SUCCEEDS, the redeemed value is kept, and `dleq_ok` carries the
-        // verdict for the operator.
+        // Spec step 8: a failed or missing DLEQ proof on the swap-returned
+        // signatures indicates a misbehaving mint, not a payment failure, and
+        // the payment stands — validation SUCCEEDS, the redeemed value is kept,
+        // and `dleq_ok` carries the verdict for the operator.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1218,7 +1220,7 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_resolved_keyset_unit_mismatch_before_swap() {
-        // Spec step 7: the published keyset is the unit authority. A token
+        // Spec step 6: the published keyset is the unit authority. A token
         // DECLARING the required unit whose proofs sit on a keyset the mint
         // publishes under a DIFFERENT unit is rejected pre-swap — with ZERO
         // swap calls, so the foreign-unit proofs are never consumed.
@@ -1251,7 +1253,7 @@ mod tests {
         assert_eq!(
             counters.swap.load(Ordering::SeqCst),
             0,
-            "step 7 must reject BEFORE the swap (zero swap calls)"
+            "step 6 must reject BEFORE the swap (zero swap calls)"
         );
     }
 
@@ -1446,7 +1448,8 @@ mod tests {
 
     #[tokio::test]
     async fn validate_rejects_locked_p2pk_proof_before_swap() {
-        // Bearer-only: a locked proof is rejected before any network call.
+        // Fast-path: this implementation advertises no condition, so a locked
+        // proof is unsatisfiable and rejected before any network call.
         let token = make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
@@ -1651,9 +1654,8 @@ mod tests {
             amount,
             unit: unit.to_string(),
             mints: mints.iter().map(|m| m.to_string()).collect(),
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: true,
         }
     }
 
@@ -1872,9 +1874,8 @@ mod tests {
             amount: 10,
             unit: "pop_1700000000".to_string(),
             mints: vec!["https://user@mint-a.example.com".to_string()],
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: true,
         };
 
         let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
@@ -1897,9 +1898,10 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_keyset_retired_rejection_to_expired() {
-        // Spec step 9 + Keyset Rotation §: a swap rejected because the keyset
-        // retired or its final_expiry passed maps to Expired → payment-expired
-        // 402, distinct from the double-spend verification-failed family.
+        // Spec step 8 + Keyset Rotation §: a swap rejected because the keyset
+        // retired or its final_expiry passed maps to Expired, which is now a
+        // verification-failed swap rejection (kept distinct only so the cause is
+        // named in the problem detail).
         let presented =
             make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
@@ -1913,7 +1915,7 @@ mod tests {
             .expect_err("a keyset-class rejection must map to Expired");
         assert!(
             matches!(err, ChargeError::Expired),
-            "expected Expired (payment-expired), got {err:?}"
+            "expected Expired (verification-failed), got {err:?}"
         );
     }
 
@@ -1945,10 +1947,10 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_succeeds_with_dleq_flag_false_on_swap_output_dleq_failure() {
-        // Spec step 9 + §security-dleq: a missing/invalid DLEQ on the
-        // swap-RETURNED signatures is a mint-trust incident, NOT a payment
-        // failure — the redeem SUCCEEDS, the value is kept, and `Redeemed`
-        // carries `dleq_ok: false` for the operator surface.
+        // Spec step 8: a missing/invalid DLEQ on the swap-RETURNED signatures
+        // is a mint-trust incident, NOT a payment failure — the redeem
+        // SUCCEEDS, the value is kept, and `Redeemed` carries `dleq_ok: false`
+        // for the operator surface.
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
 

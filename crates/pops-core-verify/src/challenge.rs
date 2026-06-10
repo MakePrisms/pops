@@ -5,10 +5,12 @@
 //! (`methodDetails.paymentRequest`, the authoritative artifact), and
 //! [`decode_charge_request`] reads that object back, enforcing the spec's
 //! creqA requirements (`a`/`u`/non-empty-`m` present, top-level
-//! `amount`/`currency` matching them, empty transports, no `nut10`);
-//! [`decode_token`] parses the `cashuB…` token the client returns on retry.
+//! `amount`/`currency` matching them, empty transports, single-use true, no
+//! `nut10`); [`decode_token`] parses the `cashuB…` token the client returns on
+//! retry.
 //!
-//! Transports are left empty (the challenge is in-band) and `nut10` is `None` (a
+//! The emitted creqA carries `single_use: true` and no payment id (`i`); its
+//! transports are empty (the challenge is in-band) and `nut10` is `None` (a
 //! bearer charge has no spend lock). This module does NOT enforce the `pop_<ts>`
 //! unit prefix — it round-trips whatever the caller supplies.
 
@@ -23,8 +25,7 @@ use crate::envelope::{
 };
 use crate::error::Error;
 
-/// What the verifier requires from a holder (cashu-typed). `single_use` is
-/// forwarded as-is — enforcing replay is the verifier's job, not this module's.
+/// What the verifier requires from a holder (cashu-typed).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashuRequirement {
     /// Currency unit the proofs must carry (`pop_<unix_ts>` for PoP).
@@ -36,12 +37,12 @@ pub struct CashuRequirement {
     pub mints: Vec<MintUrl>,
     /// Exact amount of proofs required.
     pub amount: Amount,
-    /// Optional payment correlation id.
-    pub payment_id: Option<String>,
+    /// Optional merchant reference echoed as the request object's top-level
+    /// `externalId` and in the receipt. It is NOT the creqA payment id (`i`),
+    /// which the charge method omits.
+    pub external_id: Option<String>,
     /// Optional human-readable description.
     pub description: Option<String>,
-    /// Whether the challenge is one-shot.
-    pub single_use: bool,
 }
 
 impl CashuRequirement {
@@ -49,10 +50,14 @@ impl CashuRequirement {
     /// challenge is in-band) and no spending conditions (bearer charge).
     fn to_payment_request(&self) -> PaymentRequest {
         PaymentRequest {
-            payment_id: self.payment_id.clone(),
+            // The challenge `id` identifies the payment, so the creqA carries no
+            // `i`; under stateless binding `id` is over the request bytes, which
+            // no embedded value can equal.
+            payment_id: None,
             amount: Some(self.amount),
             unit: Some(self.unit.clone()),
-            single_use: Some(self.single_use),
+            // A challenge identifies one payment.
+            single_use: Some(true),
             mints: self.mints.clone(),
             description: self.description.clone(),
             transports: vec![],
@@ -112,7 +117,7 @@ pub fn encode_charge_request(req: &CashuRequirement) -> Result<String, Error> {
         amount: u64::from(req.amount).to_string(),
         currency: req.unit.to_string(),
         description: req.description.clone(),
-        external_id: req.payment_id.clone(),
+        external_id: req.external_id.clone(),
         method_details: MethodDetails {
             payment_request: encode_challenge(req),
         },
@@ -128,6 +133,8 @@ pub fn encode_charge_request(req: &CashuRequirement) -> Result<String, Error> {
 /// - the top-level `amount`/`currency` MUST equal the creqA's `a`/`u`
 ///   (amounts compared as integers);
 /// - the creqA's transport set MUST be empty (the credential is in-band);
+/// - the creqA's single-use flag MUST be true (a challenge identifies one
+///   payment);
 /// - the creqA MUST carry no `nut10` spending condition (bearer-only profile —
 ///   rejecting here is what lets a future locked profile degrade closed).
 ///
@@ -174,6 +181,13 @@ pub fn decode_charge_request(b64: &str) -> Result<DecodedChargeRequest, Error> {
         return Err(Error::DecodeFailed(
             "payment request names a transport; the charge credential is in-band \
              (the transport set must be empty)"
+                .to_string(),
+        ));
+    }
+    if creq.single_use != Some(true) {
+        return Err(Error::DecodeFailed(
+            "payment request single-use flag is not true; a charge challenge \
+             identifies one payment"
                 .to_string(),
         ));
     }
@@ -244,9 +258,8 @@ mod tests {
                 MintUrl::from_str("https://mint2.example.com").expect("valid mint url"),
             ],
             amount: Amount::from(42),
-            payment_id: Some("pop-test-id".to_string()),
+            external_id: Some("inv-7".to_string()),
             description: Some("test challenge".to_string()),
-            single_use: true,
         }
     }
 
@@ -288,10 +301,10 @@ mod tests {
 
         let parsed = PaymentRequest::from_str(&encoded).expect("decodes as PaymentRequest");
 
-        assert_eq!(parsed.payment_id, req.payment_id);
+        assert_eq!(parsed.payment_id, None, "creqA omits the payment id `i`");
         assert_eq!(parsed.amount, Some(req.amount));
         assert_eq!(parsed.unit, Some(req.unit.clone()));
-        assert_eq!(parsed.single_use, Some(req.single_use));
+        assert_eq!(parsed.single_use, Some(true), "single-use is pinned true");
         assert_eq!(parsed.mints, req.mints);
         assert_eq!(parsed.description, req.description);
         assert!(
@@ -308,9 +321,8 @@ mod tests {
             unit: CurrencyUnit::Custom("pop_1700000000".to_string()),
             mints: vec![],
             amount: Amount::from(1),
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: false,
         };
         let parsed = PaymentRequest::from_str(&encode_challenge(&req)).unwrap();
         assert_eq!(
@@ -404,7 +416,7 @@ mod tests {
         assert_eq!(decoded.unit, req.unit);
         assert_eq!(decoded.mints, req.mints);
         assert_eq!(decoded.description, req.description);
-        assert_eq!(decoded.external_id, req.payment_id);
+        assert_eq!(decoded.external_id, req.external_id);
         assert!(decoded.creq_a.starts_with("creqA"));
     }
 
@@ -436,9 +448,8 @@ mod tests {
             unit: CurrencyUnit::Custom("pop_1700000000".to_string()),
             mints: vec![],
             amount: Amount::from(5),
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: false,
         };
         let err = encode_charge_request(&req).expect_err("no-mints requirement must not encode");
         assert!(matches!(err, Error::EncodeFailed(_)), "got {err:?}");
@@ -501,6 +512,20 @@ mod tests {
         let err = decode_charge_request(&object_for(&creq, "42", "pop_1700000000"))
             .expect_err("a creqA naming a transport must be rejected (in-band only)");
         assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_charge_request_rejects_non_single_use_challenge() {
+        // Spec Method Details: a client MUST reject a challenge whose single-use
+        // flag is not true, the same family as the amount/currency mismatch and
+        // nut10 rejections.
+        for flag in [None, Some(false)] {
+            let mut creq = conformant_creq();
+            creq.single_use = flag;
+            let err = decode_charge_request(&object_for(&creq, "42", "pop_1700000000"))
+                .expect_err("a non-single-use challenge must be rejected");
+            assert!(matches!(err, Error::DecodeFailed(_)), "got {err:?}");
+        }
     }
 
     #[test]

@@ -98,9 +98,8 @@ const requirement = {
   amount: AMOUNT,
   unit: UNIT,
   mints: [MINT_URL],
-  payment_id: CHALLENGE_ID,
+  external_id: CHALLENGE_ID,
   description: DESCRIPTION,
-  single_use: true,
 };
 
 // A pre-encoded NUT-18 `creqA` matching the DEFAULT requirement above

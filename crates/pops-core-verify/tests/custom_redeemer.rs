@@ -158,9 +158,8 @@ fn sample_requirement() -> ChargeRequirement {
         amount: 10,
         unit: "pop_1700000000".to_string(),
         mints: vec!["https://mint-a.example.com".to_string()],
-        payment_id: None,
+        external_id: None,
         description: None,
-        single_use: true,
     }
 }
 

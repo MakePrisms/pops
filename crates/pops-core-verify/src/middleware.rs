@@ -211,7 +211,7 @@ where
     let receipt_header = payment_receipt_header(
         &redeemed,
         &credentials.challenge.id,
-        ctx.requirement.payment_id.as_deref(),
+        ctx.requirement.external_id.as_deref(),
     );
 
     // Downstream reads this via `Extension<Redeemed>`.
@@ -563,9 +563,8 @@ mod tests {
             unit,
             mints,
             amount: Amount::from(amount),
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: true,
         }
     }
 
@@ -1257,11 +1256,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keyset_retired_swap_rejection_returns_402_payment_expired() {
-        // Spec step 9 + Keyset Rotation §: a swap rejected for keyset
-        // retirement or passed final_expiry answers payment-expired (with a
-        // fresh challenge), NOT verification-failed — the client re-presents
-        // the same token once against the fresh challenge.
+    async fn keyset_retired_swap_rejection_returns_402_verification_failed() {
+        // Spec step 8 + Keyset Rotation §: a swap rejected for keyset
+        // retirement or passed final_expiry answers verification-failed (with a
+        // fresh challenge), NOT payment-expired — that type is now the sole
+        // stale-challenge-echo cause. The cause is named in the problem detail.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -1279,22 +1278,26 @@ mod tests {
             .expect("collect body");
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
         assert!(
-            body.contains("https://paymentauth.org/problems/payment-expired"),
-            "a keyset-class rejection answers with the payment-expired type, got: {body}"
+            body.contains("https://paymentauth.org/problems/verification-failed"),
+            "a keyset-class rejection answers with the verification-failed type, got: {body}"
         );
         assert!(
-            !body.contains("verification-failed"),
-            "must not collapse into verification-failed, got: {body}"
+            !body.contains("payment-expired"),
+            "must not map to payment-expired (single-cause: stale challenge), got: {body}"
+        );
+        assert!(
+            body.contains("keyset retired or final_expiry passed"),
+            "the problem detail must name the cause, got: {body}"
         );
     }
 
     #[tokio::test]
     async fn swap_output_dleq_failure_serves_resource_with_flag_in_extension() {
-        // Spec step 9: "a failed or missing DLEQ proof after a successful swap
-        // is a mint-trust incident, not a payment failure" — the HTTP response
-        // is the NORMAL success path (200 + receipt), the gated handler runs,
-        // and the false verdict rides `Extension<Redeemed>.dleq_ok` for the
-        // operator surface.
+        // Spec step 8: a failed or missing DLEQ proof on the swap-returned
+        // signatures indicates a misbehaving mint, not a payment failure — the
+        // HTTP response is the NORMAL success path (200 + receipt), the gated
+        // handler runs, and the false verdict rides `Extension<Redeemed>.dleq_ok`
+        // for the operator surface.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -1644,7 +1647,7 @@ mod tests {
 
     #[tokio::test]
     async fn overfunded_presentation_is_accepted_and_excess_retained() {
-        // Spec step 8: value above `amount + swap_fee` is accepted and
+        // Spec step 7: value above `amount + swap_fee` is accepted and
         // retained — a 20-against-10 token redeems whole and serves the
         // resource; the handler sees the full redeemed value.
         let token = make_token(

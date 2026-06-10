@@ -115,12 +115,12 @@ impl CdkMintClient {
 /// (keyset-not-known) → [`cdk::Error::UnknownKeySet`] and 12002
 /// (keyset-inactive) → [`cdk::Error::InactiveKeyset`];
 /// [`cdk::Error::KeysetUnknown`] is cdk's wallet-local twin of 12001. All
-/// three mean the keyset has retired or its `final_expiry` has passed —
-/// `payment-expired` per `draft-cashu-charge-01` step 9. No registered NUT
-/// error code names `final_expiry` itself, so these keyset codes are the
-/// entire wire signal; a mint rejecting an expired keyset under any other
-/// code stays in the rejected catch-all (the spec's else-branch:
-/// `verification-failed`).
+/// three mean the keyset has retired or its `final_expiry` has passed — a
+/// `verification-failed` swap rejection per `draft-cashu-charge-01` step 8,
+/// kept in its own arm so the cause is named in the problem `detail`. No
+/// registered NUT error code names `final_expiry` itself, so these keyset
+/// codes are the entire wire signal; a mint rejecting an expired keyset under
+/// any other code stays in the rejected catch-all, also `verification-failed`.
 ///
 /// The already-spent rejection (NUT code 11001 → [`cdk::Error::TokenAlreadySpent`])
 /// keeps its own arm so the spent case carries the honest double-spend detail;
