@@ -156,9 +156,9 @@ export async function GET(req: NextRequest): Promise<Response> {
   try {
     const credsJson = wasm.parse_payment_credential(authorization);
     const creds = JSON.parse(credsJson);
-    cashuToken = creds?.payload?.cashu_token;
+    cashuToken = creds?.payload?.token;
     if (typeof cashuToken !== "string" || cashuToken.length === 0) {
-      throw new Error("credential payload missing cashu_token");
+      throw new Error("credential payload missing token");
     }
   } catch (e) {
     return challenge402(wasm, { code: "malformed-credential", message: String(e) });

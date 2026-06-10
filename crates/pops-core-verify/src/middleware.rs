@@ -156,7 +156,7 @@ where
     let charge_req = charge_requirement_from_cashu(&ctx.requirement);
     let redeemed = match ctx
         .credential
-        .verify_and_redeem(&credentials.payload.cashu_token, &charge_req)
+        .verify_and_redeem(&credentials.payload.token, &charge_req)
         .await
     {
         Ok(r) => r,
@@ -571,7 +571,7 @@ mod tests {
                 expires: None,
             },
             payload: CashuPayload {
-                cashu_token: token.into(),
+                token: token.into(),
             },
             source: None,
         };
@@ -753,7 +753,7 @@ mod tests {
                 expires: None,
             },
             payload: CashuPayload {
-                cashu_token: encoded,
+                token: encoded,
             },
             source: None,
         };
@@ -1062,7 +1062,7 @@ mod tests {
     async fn json_missing_challenge_field_returns_402() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"cashu_token":"cashuBabc"}}"#);
+        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"token":"cashuBabc"}}"#);
         let header = format!("Payment {blob}");
 
         let app = router_with(state_with(SwapResponse::Echo));
@@ -1106,7 +1106,7 @@ mod tests {
                 expires: None,
             },
             payload: CashuPayload {
-                cashu_token: "cashuBabc".into(),
+                token: "cashuBabc".into(),
             },
             source: None,
         };

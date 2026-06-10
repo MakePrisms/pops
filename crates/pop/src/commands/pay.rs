@@ -590,7 +590,7 @@ fn build_premint(
 /// parsed challenge params, plus the exact-amount token as the cashu payload. The
 /// 402 carries no `digest`/`opaque`/`expires` (binding is server-deferred), so
 /// those echo fields and the optional `source` are `None`.
-pub fn build_credentials(params: &PaymentParams, cashu_token: &str) -> PaymentCredentials {
+pub fn build_credentials(params: &PaymentParams, token: &str) -> PaymentCredentials {
     PaymentCredentials {
         challenge: EchoedChallenge {
             id: params.id.clone(),
@@ -603,7 +603,7 @@ pub fn build_credentials(params: &PaymentParams, cashu_token: &str) -> PaymentCr
             expires: None,
         },
         payload: CashuPayload {
-            cashu_token: cashu_token.to_string(),
+            token: token.to_string(),
         },
         source: None,
     }
@@ -938,7 +938,7 @@ mod tests {
         assert_eq!(creds.challenge.method, "cashu");
         assert_eq!(creds.challenge.intent, "charge");
         assert_eq!(creds.challenge.request, request, "request echoed verbatim");
-        assert_eq!(creds.payload.cashu_token, "cashuBexampletoken");
+        assert_eq!(creds.payload.token, "cashuBexampletoken");
 
         // Parse the blob as the GATEWAY would (proves the wire round-trips
         // through the real verifier codec).
@@ -946,6 +946,6 @@ mod tests {
         let auth = format!("Payment {blob}");
         let parsed = parse_payment_authorization(&auth).expect("gateway parses our credentials");
         assert_eq!(parsed.challenge.id, "ch-42");
-        assert_eq!(parsed.payload.cashu_token, "cashuBexampletoken");
+        assert_eq!(parsed.payload.token, "cashuBexampletoken");
     }
 }

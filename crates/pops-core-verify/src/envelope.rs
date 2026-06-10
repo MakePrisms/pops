@@ -13,12 +13,12 @@
 //!     "intent":  "<echo of intent, e.g. \"charge\">",
 //!     "request": "<echo of request param>"
 //!   },
-//!   "payload": { "cashu_token": "cashuB..." }
+//!   "payload": { "token": "cashuB..." }
 //! }
 //! ```
 //!
 //! The credential blob is JCS-canonical (RFC 8785); the inner `request` echo and
-//! `cashu_token` strings are opaque (not re-canonicalized). The echoed
+//! `token` strings are opaque (not re-canonicalized). The echoed
 //! `challenge` carries optional `digest`/`opaque`/`expires` (present iff the 402
 //! carried them) and an optional top-level `source`; the parser tolerates these
 //! and any further unknown fields.
@@ -76,8 +76,9 @@ pub struct EchoedChallenge {
 /// JSON; its structural validation is the validator's job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashuPayload {
-    /// The `cashuB…` token, forwarded as-is to [`crate::challenge::decode_token`].
-    pub cashu_token: String,
+    /// The `cashuB…` token (the spec's `payload.token`), forwarded as-is to
+    /// [`crate::challenge::decode_token`].
+    pub token: String,
 }
 
 /// Full `draft-cashu-charge-01` credentials object. The top-level `source` is
@@ -87,7 +88,7 @@ pub struct CashuPayload {
 pub struct PaymentCredentials {
     /// Echo of the WWW-Authenticate auth-params.
     pub challenge: EchoedChallenge,
-    /// Method-specific payload (cashu = `{ "cashu_token": "..." }`).
+    /// Method-specific payload (cashu = `{ "token": "..." }`).
     pub payload: CashuPayload,
     /// Optional client-supplied source identifier; absent on the wire when
     /// `None`.
@@ -127,7 +128,7 @@ pub enum AuthParseError {
 
 /// Parse an `Authorization: Payment <base64url-nopad-blob>` header into the
 /// structured credentials. `WrongMethod` is surfaced here for a non-`cashu`
-/// method; the caller still decodes `payload.cashu_token` via
+/// method; the caller still decodes `payload.token` via
 /// [`crate::challenge::decode_token`].
 pub fn parse_payment_authorization(
     header_value: &str,
@@ -351,7 +352,7 @@ mod tests {
                 expires: None,
             },
             payload: CashuPayload {
-                cashu_token: token.into(),
+                token: token.into(),
             },
             source: None,
         }
@@ -370,7 +371,7 @@ mod tests {
         assert_eq!(parsed.challenge.realm, "pops-core-verify");
         assert_eq!(parsed.challenge.method, "cashu");
         assert_eq!(parsed.challenge.intent, "charge");
-        assert_eq!(parsed.payload.cashu_token, "cashuBabc");
+        assert_eq!(parsed.payload.token, "cashuBabc");
     }
 
     #[test]
@@ -461,7 +462,7 @@ mod tests {
 
     #[test]
     fn json_missing_challenge_returns_json_parse() {
-        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"cashu_token":"x"}}"#);
+        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"token":"x"}}"#);
         let header = format!("Payment {blob}");
         let err = parse_payment_authorization(&header).expect_err("no challenge");
         assert!(
@@ -484,12 +485,28 @@ mod tests {
     }
 
     #[test]
-    fn payload_missing_cashu_token_returns_json_parse() {
+    fn payload_missing_token_returns_json_parse() {
         let blob = URL_SAFE_NO_PAD.encode(
             br#"{"challenge":{"id":"a","realm":"b","method":"cashu","intent":"charge","request":"r"},"payload":{}}"#,
         );
         let header = format!("Payment {blob}");
-        let err = parse_payment_authorization(&header).expect_err("no cashu_token");
+        let err = parse_payment_authorization(&header).expect_err("no token");
+        assert!(
+            matches!(err, AuthParseError::JsonParse(_)),
+            "expected JsonParse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn payload_with_only_legacy_cashu_token_field_returns_json_parse() {
+        // The spec names the payload field `token`; the pre-spec `cashu_token`
+        // spelling no longer satisfies the required field.
+        let blob = URL_SAFE_NO_PAD.encode(
+            br#"{"challenge":{"id":"a","realm":"b","method":"cashu","intent":"charge","request":"r"},"payload":{"cashu_token":"cashuBabc"}}"#,
+        );
+        let header = format!("Payment {blob}");
+        let err = parse_payment_authorization(&header)
+            .expect_err("legacy cashu_token field must not satisfy payload.token");
         assert!(
             matches!(err, AuthParseError::JsonParse(_)),
             "expected JsonParse, got {err:?}"
@@ -521,14 +538,14 @@ mod tests {
             },
             "source": "did:example:123",
             "payload": {
-                "cashu_token": "cashuBxyz",
+                "token": "cashuBxyz",
                 "extra": "ignored"
             }
         });
         let blob = URL_SAFE_NO_PAD.encode(json.to_string().as_bytes());
         let header = format!("Payment {blob}");
         let parsed = parse_payment_authorization(&header).expect("optional fields ok");
-        assert_eq!(parsed.payload.cashu_token, "cashuBxyz");
+        assert_eq!(parsed.payload.token, "cashuBxyz");
     }
 
     #[test]
@@ -766,14 +783,15 @@ mod tests {
     fn credential_blob_bytes_are_jcs_canonical() {
         // The credential blob is JCS-canonical (challenge < payload < source;
         // within challenge: id < intent < method < realm < request, plus the
-        // optional digest/opaque/expires when present).
+        // optional digest/opaque/expires when present). The payload field is
+        // the spec's `token` (Credential Schema).
         let creds = make_credentials("cashu", "cashuBabc");
         let blob = encode_payment_credentials(&creds);
         let bytes = URL_SAFE_NO_PAD.decode(&blob).expect("decodes");
         let json = std::str::from_utf8(&bytes).expect("utf8");
         assert_eq!(
             json,
-            r#"{"challenge":{"id":"challenge-1","intent":"charge","method":"cashu","realm":"pops-core-verify","request":"ZHVtbXkK"},"payload":{"cashu_token":"cashuBabc"}}"#
+            r#"{"challenge":{"id":"challenge-1","intent":"charge","method":"cashu","realm":"pops-core-verify","request":"ZHVtbXkK"},"payload":{"token":"cashuBabc"}}"#
         );
     }
 
@@ -814,7 +832,7 @@ mod tests {
                 expires: Some("2999-01-01T00:00:00Z".into()),
             },
             payload: CashuPayload {
-                cashu_token: "cashuBz".into(),
+                token: "cashuBz".into(),
             },
             source: Some("did:example:1".into()),
         };

@@ -431,7 +431,7 @@ fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
         ))
     })?;
     match parse_payment_authorization(value) {
-        Ok(creds) => Ok(creds.payload.cashu_token),
+        Ok(creds) => Ok(creds.payload.token),
         Err(AuthParseError::UnknownScheme) => Err(TokenExtract::NoAttempt),
         Err(AuthParseError::WrongMethod(method)) => {
             Err(TokenExtract::Failed(ChargeError::MethodUnsupported {

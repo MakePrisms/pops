@@ -130,7 +130,7 @@ fn auth_header(token: &str, expires: Option<&str>) -> String {
             expires: expires.map(str::to_string),
         },
         payload: CashuPayload {
-            cashu_token: token.into(),
+            token: token.into(),
         },
         source: None,
     };
@@ -253,7 +253,7 @@ fn credential_echo_round_trips_optional_fields() {
             expires: Some("2999-01-01T00:00:00Z".into()),
         },
         payload: CashuPayload {
-            cashu_token: "cashuBtok".into(),
+            token: "cashuBtok".into(),
         },
         source: Some("did:example:abc".into()),
     };
@@ -266,7 +266,7 @@ fn credential_echo_round_trips_optional_fields() {
         Some("2999-01-01T00:00:00Z")
     );
     assert_eq!(parsed.source.as_deref(), Some("did:example:abc"));
-    assert_eq!(parsed.payload.cashu_token, "cashuBtok");
+    assert_eq!(parsed.payload.token, "cashuBtok");
 }
 
 // ──────────────────────── Payment-Receipt (D-5) ──────────────────────────────

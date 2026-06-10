@@ -134,7 +134,7 @@ fn payment_header(token: &str) -> String {
             expires: None,
         },
         payload: CashuPayload {
-            cashu_token: token.into(),
+            token: token.into(),
         },
         source: None,
     };
@@ -755,7 +755,7 @@ async fn gateway_non_cashu_method_returns_400_method_unsupported() {
             expires: None,
         },
         payload: CashuPayload {
-            cashu_token: "cashuBabc".into(),
+            token: "cashuBabc".into(),
         },
         source: None,
     };

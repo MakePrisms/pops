@@ -155,8 +155,8 @@ pub enum ChargeError {
 
     // (C) MALFORMED — 400 for a bad request frame, 402 for a bad credential.
     /// The credential could not be decoded/parsed: bad base64url or JSON, a
-    /// required field absent/wrong-typed, `cashu_token` not a Cashu token, or a
-    /// `cashuA…` (TokenV3 — this intent is cashuB/TokenV4 only).
+    /// required field absent/wrong-typed, `payload.token` not a Cashu token, or
+    /// a `cashuA…` (TokenV3 — this intent is cashuB/TokenV4 only).
     ///
     /// HTTP 402 · `malformed-credential` (a bad credential is 402, not 400 — it
     /// is still a re-makeable attempt).
@@ -218,8 +218,9 @@ pub struct RedeemedProofs {
     /// keyset, which MAY differ from the input proofs' keyset. For spending
     /// without re-fetching keysets, and for audit.
     pub active_keyset_id: String,
-    /// SHA-256 (lowercase hex) of the EXACT presented `cashu_token` — the receipt
-    /// `reference`: a stable, shareable settlement id that exposes no secret.
+    /// SHA-256 (lowercase hex) of the EXACT presented `payload.token` string —
+    /// the receipt `reference`: a stable, shareable settlement id that exposes
+    /// no secret.
     pub token_hash: String,
 }
 
