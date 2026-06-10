@@ -61,9 +61,8 @@ mod tests {
             unit: CurrencyUnit::Custom("pop_1700000000".to_string()),
             mints: vec![MintUrl::from_str("https://mint-a.example.com").expect("valid mint url")],
             amount: Amount::from(10),
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: true,
         }
     }
 

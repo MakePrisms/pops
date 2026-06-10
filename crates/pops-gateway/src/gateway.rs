@@ -228,7 +228,7 @@ where
     let receipt_header = payment_receipt_header(
         &redeemed,
         &credentials.challenge.id,
-        state.config.requirement.payment_id.as_deref(),
+        state.config.requirement.external_id.as_deref(),
     );
 
     // Forward the already-buffered body (no read can fail after the charge).

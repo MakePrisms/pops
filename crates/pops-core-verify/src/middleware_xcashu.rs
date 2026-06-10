@@ -306,9 +306,8 @@ mod tests {
             unit,
             mints,
             amount: Amount::from(amount),
-            payment_id: None,
+            external_id: None,
             description: None,
-            single_use: true,
         }
     }
 
@@ -505,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn dleq_failure_serves_resource_with_flag_in_extension() {
-        // Spec step 9: a failed/missing DLEQ on the swap-RETURNED signatures
+        // Spec step 8: a failed/missing DLEQ on the swap-RETURNED signatures
         // is a mint-trust incident, not a payment failure — the X-Cashu host
         // serves the resource too, with the verdict on `Extension<Redeemed>`.
         async fn echo_flag(Extension(redeemed): Extension<Redeemed>) -> String {

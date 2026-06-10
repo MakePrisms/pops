@@ -331,9 +331,8 @@ impl Config {
             unit,
             mints,
             amount: Amount::from(self.charge.amount),
-            payment_id: None,
+            external_id: None,
             description: self.charge.description.clone(),
-            single_use: true,
         };
 
         Ok(ValidatedConfig {

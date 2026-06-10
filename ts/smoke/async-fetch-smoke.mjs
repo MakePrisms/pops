@@ -30,7 +30,6 @@ const requirement = {
   amount: 1,
   unit: UNIT,
   mints: [MINT],
-  single_use: true,
 };
 
 function classify(label, value, isReject) {

@@ -109,11 +109,11 @@ pub enum MintClientError {
 
     /// The mint refused the call with a KEYSET-class error (NUT error codes
     /// 12001 keyset-not-known / 12002 keyset-inactive): the keyset has retired
-    /// or its `final_expiry` has passed. `draft-cashu-charge-01` step 9 makes
-    /// this a `payment-expired` condition, distinct from the double-spend /
-    /// other-rejection family that is `verification-failed`. The token was NOT
-    /// consumed; the client re-presents the SAME token against a fresh
-    /// challenge once, then abandons it.
+    /// or its `final_expiry` has passed. `draft-cashu-charge-01` step 8 makes
+    /// this a `verification-failed` swap rejection, alongside the double-spend
+    /// and other-rejection causes. Kept as its own arm so the cause can be named
+    /// in the problem `detail`. The token was NOT consumed; the client needs
+    /// proofs from an active keyset.
     #[error("mint rejected swap (keyset retired or final_expiry passed): {0}")]
     KeysetRetiredOrExpired(String),
 

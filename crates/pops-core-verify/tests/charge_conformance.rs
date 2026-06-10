@@ -54,9 +54,8 @@ fn requirement() -> CashuRequirement {
         unit: pop_unit(),
         mints: vec![mint_a()],
         amount: Amount::from(100),
-        payment_id: Some("inv-42".to_string()),
+        external_id: Some("inv-42".to_string()),
         description: Some("read access".to_string()),
-        single_use: true,
     }
 }
 
@@ -707,7 +706,7 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
         ),
         (
             || ChargeError::Expired,
-            "https://paymentauth.org/problems/payment-expired",
+            "https://paymentauth.org/problems/verification-failed",
             402,
         ),
         (
