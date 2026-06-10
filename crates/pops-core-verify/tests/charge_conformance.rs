@@ -94,6 +94,7 @@ impl Redeemer for CannedRedeemer {
                     // A stable, recognizable settlement reference for the receipt.
                     token_hash: format!("hash-of-{}", presented.len()),
                 },
+                dleq_ok: true,
             }),
             Outcome::Err(make) => Err(make()),
         }
@@ -544,7 +545,6 @@ fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
             keyset_id: "009a1f293253e41e".into(),
             input_fee_ppk: 100,
         },
-        || ChargeError::DleqInvalid,
         || ChargeError::ShortKeysetIdUnresolved {
             short_id: "00aabbccddeeff00".into(),
         },
@@ -622,11 +622,6 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 keyset_id: "009a1f293253e41e".into(),
                 input_fee_ppk: 100,
             },
-            "https://paymentauth.org/problems/verification-failed",
-            402,
-        ),
-        (
-            || ChargeError::DleqInvalid,
             "https://paymentauth.org/problems/verification-failed",
             402,
         ),

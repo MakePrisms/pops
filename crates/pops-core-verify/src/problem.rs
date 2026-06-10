@@ -91,14 +91,15 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
         ),
 
         // Non-amount, non-expiry verification failures, per the spec's Errors §
-        // list: unit mismatch, disallowed mint, NUT-10 lock, DLEQ failure,
-        // unresolvable short keyset id, swap rejection (double-spend, step 9),
-        // and the policy-disallowed fee-bearing keyset ("unit otherwise
-        // disallowed by server policy").
+        // list: unit mismatch (declared OR resolved-keyset, step 7), disallowed
+        // mint, NUT-10 lock, unresolvable short keyset id, swap rejection
+        // (double-spend, step 9), and the policy-disallowed fee-bearing keyset
+        // ("unit otherwise disallowed by server policy"). A swap-output DLEQ
+        // failure is deliberately NOT here — see the map tests: it is no
+        // ChargeError at all.
         ChargeError::WrongUnit { .. }
         | ChargeError::MintNotAllowed { .. }
         | ChargeError::LockedToken
-        | ChargeError::DleqInvalid
         | ChargeError::ShortKeysetIdUnresolved { .. }
         | ChargeError::DoubleSpend
         | ChargeError::FeeTooHigh { .. } => framework(
@@ -259,6 +260,15 @@ mod tests {
         // Spec Errors §: every non-amount, non-expiry verification check —
         // including the fee-policy reject ("unit otherwise disallowed by
         // server policy") and a swap-rejected double-spend (step 9).
+        //
+        // DELIBERATELY ABSENT: a swap-output DLEQ failure. Spec step 9 +
+        // §security-dleq make it a mint-trust incident, not a payment failure
+        // ("The server MUST NOT fail the payment for it: it SHOULD serve the
+        // resource, alert the operator, and quarantine the mint") — so the old
+        // `ChargeError::DleqInvalid` variant was DELETED rather than kept as a
+        // dead discriminant: no code path can produce a client-facing error
+        // from that condition anymore. The verdict travels as
+        // `Redeemed::dleq_ok` on the SUCCESS path instead.
         for e in [
             ChargeError::WrongUnit {
                 expected: "pop_1".into(),
@@ -269,7 +279,6 @@ mod tests {
                 allowed: vec!["https://m.example".into()],
             },
             ChargeError::LockedToken,
-            ChargeError::DleqInvalid,
             ChargeError::ShortKeysetIdUnresolved {
                 short_id: "00aabbccddeeff00".into(),
             },

@@ -31,6 +31,12 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 /// whose pop was already redeemed isn't stranded, and makes the `504` reachable.
 pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 30;
 
+/// Default per-call mint HTTP timeout (10s). Bounds a hung mint so the request
+/// surfaces as the 503 mint-unavailable path (token-consumption contract
+/// unchanged: a pre-swap timeout is determinate, a swap-POST timeout is
+/// indeterminate) instead of hanging forever.
+pub const DEFAULT_MINT_HTTP_TIMEOUT_SECS: u64 = 10;
+
 /// Default cap on proofs per credential. An exact-amount token needs only a
 /// handful (power-of-two split), so 64 is generous headroom while bounding a
 /// swap-DoS by a token stuffed with tiny proofs. Over → a pre-swap 402.
@@ -71,6 +77,12 @@ pub struct Config {
     /// upstream then strands a request whose pop is already spent).
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
+
+    /// Per-call mint HTTP timeout (s); must be > 0 — an unbounded mint call
+    /// would hang the request while a possibly-consumed token's fate stays
+    /// unresolved.
+    #[serde(default = "default_mint_http_timeout_secs")]
+    pub mint_http_timeout_secs: u64,
 
     /// Hex-encoded server secret for the stateless challenge binding (the
     /// HMAC-SHA256 challenge `id`; 32 bytes / 64 hex chars RECOMMENDED, ≥ 16
@@ -142,6 +154,10 @@ fn default_upstream_timeout_secs() -> u64 {
     DEFAULT_UPSTREAM_TIMEOUT_SECS
 }
 
+fn default_mint_http_timeout_secs() -> u64 {
+    DEFAULT_MINT_HTTP_TIMEOUT_SECS
+}
+
 fn default_max_proofs() -> usize {
     DEFAULT_MAX_PROOFS
 }
@@ -195,6 +211,8 @@ pub struct ValidatedConfig {
     pub max_body_bytes: usize,
     /// Upstream request timeout (`None` ⇒ no timeout, from `0`).
     pub upstream_timeout: Option<std::time::Duration>,
+    /// Per-call mint HTTP timeout (always bounded; `0` is a config error).
+    pub mint_http_timeout: std::time::Duration,
     /// The cashu requirement advertised on the 402 + enforced on retry.
     pub requirement: CashuRequirement,
     /// Per-token max proof count (pre-swap DoS guard; over → 402).
@@ -264,6 +282,16 @@ impl Config {
             Some(std::time::Duration::from_secs(self.upstream_timeout_secs))
         };
 
+        // Unlike the upstream timeout, the mint call may have CONSUMED the
+        // token — it must always be bounded so the 503 path is reachable.
+        if self.mint_http_timeout_secs == 0 {
+            return Err(ConfigError::new(
+                "mint_http_timeout_secs",
+                "must be greater than 0 (an unbounded mint call would hang the request)",
+            ));
+        }
+        let mint_http_timeout = std::time::Duration::from_secs(self.mint_http_timeout_secs);
+
         // A 0-TTL challenge is born expired — every payment would 402.
         if self.challenge_ttl_secs == 0 {
             return Err(ConfigError::new(
@@ -315,6 +343,7 @@ impl Config {
             listen: self.listen,
             max_body_bytes: self.max_body_bytes,
             upstream_timeout,
+            mint_http_timeout,
             requirement,
             max_proofs: self.charge.max_proofs,
             routes: self.routes,
@@ -708,6 +737,53 @@ amount = 1
         let cfg = Config::from_toml_str(toml).expect("parses");
         let err = cfg.validate().expect_err("max_body_bytes=0 must fail");
         assert_eq!(err.field, "max_body_bytes");
+    }
+
+    #[test]
+    fn mint_http_timeout_defaults_to_10s() {
+        let cfg = Config::from_toml_str(&valid_toml("/tmp/pops-proofs.jsonl")).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(
+            v.mint_http_timeout,
+            std::time::Duration::from_secs(DEFAULT_MINT_HTTP_TIMEOUT_SECS)
+        );
+        assert_eq!(DEFAULT_MINT_HTTP_TIMEOUT_SECS, 10);
+    }
+
+    #[test]
+    fn custom_mint_http_timeout_round_trips() {
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+mint_http_timeout_secs = 3
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(v.mint_http_timeout, std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn zero_mint_http_timeout_is_named_field_error() {
+        // Unlike upstream_timeout_secs, 0 here is NOT "disabled": an unbounded
+        // mint call hangs a request whose token may already be consumed.
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+mint_http_timeout_secs = 0
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let err = cfg.validate().expect_err("mint_http_timeout_secs=0 must fail");
+        assert_eq!(err.field, "mint_http_timeout_secs");
     }
 
     #[test]

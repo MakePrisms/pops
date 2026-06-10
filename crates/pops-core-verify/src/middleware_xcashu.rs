@@ -214,7 +214,7 @@ mod tests {
     use crate::cashu_credential::CashuCredential;
     use crate::challenge::CashuRequirement;
     use crate::middleware::ChargeMiddlewareState;
-    use crate::mint_client::{MintClient, MintClientError};
+    use crate::mint_client::{MintClient, MintClientError, SwapOutcome};
     use crate::redeemer::Redeemed;
     use crate::xcashu::X_CASHU;
 
@@ -225,8 +225,8 @@ mod tests {
         Unreachable,
         UnreachableIndeterminate,
         RejectedSwap,
-        /// Swap-output DLEQ gate rejected the mint's blind signatures →
-        /// money-safety path: 402 + re-challenge, resource NOT served.
+        /// Swap-output DLEQ verdict failed → serve-and-flag path: the swap
+        /// SUCCEEDED, the response is the success path, `dleq_ok` is false.
         DleqInvalid,
     }
 
@@ -250,9 +250,12 @@ mod tests {
             &self,
             _mint_url: &MintUrl,
             proofs: Proofs,
-        ) -> Result<Proofs, MintClientError> {
+        ) -> Result<SwapOutcome, MintClientError> {
             match self.swap_response {
-                SwapResponse::Echo => Ok(proofs),
+                SwapResponse::Echo => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: true,
+                }),
                 SwapResponse::Unreachable => {
                     Err(MintClientError::Unreachable("mock unreachable".into()))
                 }
@@ -262,9 +265,10 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
-                SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
-                    "mock swap-output DLEQ invalid".into(),
-                )),
+                SwapResponse::DleqInvalid => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: false,
+                }),
             }
         }
     }
@@ -495,22 +499,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dleq_invalid_returns_402_and_does_not_serve_resource() {
-        // Money-safety: a missing/invalid swap-output DLEQ → 402 re-challenge,
-        // and the gated handler MUST NOT run.
+    async fn dleq_failure_serves_resource_with_flag_in_extension() {
+        // Spec step 9: a failed/missing DLEQ on the swap-RETURNED signatures
+        // is a mint-trust incident, not a payment failure — the X-Cashu host
+        // serves the resource too, with the verdict on `Extension<Redeemed>`.
+        async fn echo_flag(Extension(redeemed): Extension<Redeemed>) -> String {
+            format!("ok:{}:dleq_ok={}", redeemed.amount, redeemed.dleq_ok)
+        }
+        let app = Router::new()
+            .route("/gated", get(echo_flag))
+            .layer(from_fn_with_state(
+                state_with(SwapResponse::DleqInvalid),
+                require_charge_xcashu::<TestCredential>,
+            ));
+
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
-        let app = router_with(state_with(SwapResponse::DleqInvalid));
         let response = app
             .oneshot(request_with_xcashu(&token.to_string()))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(response.headers().get(super::x_cashu_header()).is_some());
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a settled payment must not be answered with a payment failure"
+        );
         let body = body_string(response).await;
-        assert!(!body.starts_with("ok:"), "resource must NOT be served on a DLEQ failure");
-        assert!(
-            body.to_ascii_lowercase().contains("dleq"),
-            "expected a DLEQ failure body, got: {body}"
+        assert_eq!(
+            body, "ok:10:dleq_ok=false",
+            "resource served; extension carries the false verdict"
         );
     }
 

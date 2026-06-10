@@ -107,14 +107,6 @@ pub enum ChargeError {
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
 
-    /// A blind signature the swap RETURNED failed NUT-12 DLEQ — invalid or
-    /// omitted by the mint (a malicious mint reporting outputs it never validly
-    /// signed, which the server then could not spend). Security-critical.
-    ///
-    /// HTTP 402 · `verification-failed` · terminal.
-    #[error("swap-output DLEQ verification failed")]
-    DleqInvalid,
-
     /// A proof's short (v1) keyset id does not resolve, or resolves ambiguously,
     /// against the mint's published keysets.
     ///
@@ -229,12 +221,6 @@ pub struct RedeemedProofs {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dleq_invalid_displays() {
-        let err = ChargeError::DleqInvalid;
-        assert_eq!(err.to_string(), "swap-output DLEQ verification failed");
-    }
 
     #[test]
     fn payment_insufficient_display() {

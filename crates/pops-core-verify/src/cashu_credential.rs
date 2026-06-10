@@ -37,13 +37,18 @@ pub struct ValidatedCharge {
     pub unit: CurrencyUnit,
     /// Total amount of the swapped proofs.
     pub amount: Amount,
+    /// NUT-12 verdict on the swap-RETURNED blind signatures. `false` is a
+    /// mint-trust incident (`draft-cashu-charge-01` §security-dleq), already
+    /// WARN-logged by the swap ceremony — the charge itself SUCCEEDED and the
+    /// resource is served; the flag rides along so hosts can alert/quarantine.
+    pub dleq_ok: bool,
 }
 
 /// Errors a [`ChargeValidator`] can return. The pre-swap arms (`UnitMismatch`,
-/// `MintNotAllowed`, `PaymentInsufficient`, `TokenEmpty`, `LockedToken`,
-/// `MultiMintOrUnit`, `TooManyProofs`) are raised BEFORE the swap is ever
-/// attempted; the rest are raised at/after it. [`CashuCredential`] maps these
-/// onto [`crate::charge::ChargeError`].
+/// `ResolvedKeysetUnitMismatch`, `MintNotAllowed`, `PaymentInsufficient`,
+/// `TokenEmpty`, `LockedToken`, `MultiMintOrUnit`, `TooManyProofs`) are raised
+/// BEFORE the swap is ever attempted; the rest are raised at/after it.
+/// [`CashuCredential`] maps these onto [`crate::charge::ChargeError`].
 #[derive(Debug, Error)]
 pub enum ValidationError {
     /// Token unit does not match the requirement's unit.
@@ -52,6 +57,24 @@ pub enum ValidationError {
         /// Unit the verifier advertised.
         expected: CurrencyUnit,
         /// Unit found on the token.
+        got: CurrencyUnit,
+    },
+
+    /// A RESOLVED keyset's unit differs from the requirement's (spec
+    /// verification step 7): the token's declared unit is client-supplied data,
+    /// the mint's published keyset is the authority. Raised BEFORE the swap, so
+    /// a foreign-unit proof smuggled under a matching declared unit never
+    /// reaches the mint.
+    #[error(
+        "resolved keyset {keyset_id} has unit {got:?}, requirement unit is {expected:?} \
+         (the published keyset, not the token's declared unit, is authoritative)"
+    )]
+    ResolvedKeysetUnitMismatch {
+        /// The offending keyset (full hex id).
+        keyset_id: String,
+        /// Unit the requirement demands.
+        expected: CurrencyUnit,
+        /// Unit the mint publishes for this keyset.
         got: CurrencyUnit,
     },
 
@@ -117,13 +140,6 @@ pub enum ValidationError {
         /// The disallowed `input_fee_ppk`.
         input_fee_ppk: u64,
     },
-
-    /// Swap-output blind signatures whose NUT-12 DLEQ is missing or invalid:
-    /// unsigned / wrong-key outputs that MUST NOT be redeemed. Kept distinct
-    /// from [`Self::MintRejectedSwap`] so it maps to `DleqInvalid`, not a
-    /// double-spend — collapsing the two would hide the mint-trust signal.
-    #[error("swap-output DLEQ verification failed: {0}")]
-    SwapOutputDleqInvalid(String),
 
     /// DETERMINATE unreachable: a pre-swap GET or a connect failure that never
     /// submitted the inputs. The token was NOT consumed; retry is authoritative.
@@ -262,9 +278,6 @@ impl<M: MintClient> ChargeValidator<M> {
                     keyset_id,
                     input_fee_ppk,
                 },
-                MintClientError::SwapOutputDleqInvalid(msg) => {
-                    ValidationError::MintRejectedSwap(msg)
-                }
             })?;
 
         // Resolves V1 short IDs against the list (V0 do not consult it). A V1 ID
@@ -282,6 +295,23 @@ impl<M: MintClient> ChargeValidator<M> {
         let first_keyset = proofs[0].keyset_id;
         if proofs.iter().any(|p| p.keyset_id != first_keyset) {
             return Err(ValidationError::MultiMintOrUnit);
+        }
+
+        // Spec verification step 7, BEFORE the step-8 value check and the swap:
+        // the resolved keyset's unit must equal the requirement's. The token's
+        // declared unit (checked above) is client-supplied data; the mint's
+        // published keyset is the authority — without this, a sat-keyset proof
+        // under a token DECLARING the pop unit would reach the swap. A keyset
+        // id absent from the published list resolves nothing (no unit to
+        // assert); the swap rejects unknown keysets.
+        if let Some(resolved) = keysets.iter().find(|k| k.id == first_keyset) {
+            if resolved.unit != requirement.unit {
+                return Err(ValidationError::ResolvedKeysetUnitMismatch {
+                    keyset_id: first_keyset.to_string(),
+                    expected: requirement.unit.clone(),
+                    got: resolved.unit.clone(),
+                });
+            }
         }
 
         // Value check (see `PaymentInsufficient`): at least the requirement
@@ -312,8 +342,10 @@ impl<M: MintClient> ChargeValidator<M> {
             self.check_and_extract(token, requirement).await?;
 
         // A successful swap atomically proves both unspentness (nullifier check)
-        // and unexpired credential (`final_expiry` check).
-        let new_proofs = self
+        // and unexpired credential (`final_expiry` check). Its `dleq_ok` is the
+        // swap-output NUT-12 verdict — a FLAG, never a failure (the ceremony
+        // already WARN-logged a false one; see `ValidatedCharge::dleq_ok`).
+        let outcome = self
             .mint_client
             .swap(&token_mint, proofs)
             .await
@@ -332,23 +364,19 @@ impl<M: MintClient> ChargeValidator<M> {
                     keyset_id,
                     input_fee_ppk,
                 },
-                // Money-safety: a bad swap-output DLEQ is its own outcome, NEVER
-                // collapsed into MintRejectedSwap (which would 402 as a
-                // DoubleSpend and hide the mint-trust signal).
-                MintClientError::SwapOutputDleqInvalid(msg) => {
-                    ValidationError::SwapOutputDleqInvalid(msg)
-                }
             })?;
 
-        let new_amount = new_proofs
+        let new_amount = outcome
+            .proofs
             .total_amount()
             .map_err(|e| ValidationError::MalformedToken(e.to_string()))?;
 
         Ok(ValidatedCharge {
-            new_proofs,
+            new_proofs: outcome.proofs,
             mint_url: token_mint,
             unit: token_unit,
             amount: new_amount,
+            dleq_ok: outcome.dleq_ok,
         })
     }
 }
@@ -407,7 +435,7 @@ fn token_hash_hex(presented: &str) -> String {
 
 /// Map a cashu-typed [`ValidationError`] onto the cross-slice [`ChargeError`].
 /// `mint_url` supplies the transport context the cashu arm does not carry. The
-/// two money-safety arms (DoubleSpend, DLEQ) are noted inline.
+/// money-safety DoubleSpend arm is noted inline.
 fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
     match e {
         ValidationError::MintUnreachable(detail) => ChargeError::MintUnreachable {
@@ -435,6 +463,15 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
             expected: expected.to_string(),
             got: got.to_string(),
         },
+        // Spec step 7: a resolved-keyset unit mismatch is the same
+        // verification-failed condition as a declared-unit mismatch (the
+        // keyset-id context stays in the validation-layer log).
+        ValidationError::ResolvedKeysetUnitMismatch { expected, got, .. } => {
+            ChargeError::WrongUnit {
+                expected: expected.to_string(),
+                got: got.to_string(),
+            }
+        }
         ValidationError::MintNotAllowed { got, allowed } => ChargeError::MintNotAllowed {
             got: got.to_string(),
             allowed: allowed.iter().map(|m| m.to_string()).collect(),
@@ -456,11 +493,6 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
             keyset_id,
             input_fee_ppk,
         },
-        // Money-safety: a missing/invalid swap-output DLEQ is verification-
-        // failed — a 402 (gateway serves nothing), distinct from a double-spend
-        // so the operator sees the mint-trust signal. NEVER serve the resource
-        // on this path.
-        ValidationError::SwapOutputDleqInvalid(_) => ChargeError::DleqInvalid,
     }
 }
 
@@ -568,6 +600,7 @@ impl<M: MintClient> Redeemer for CashuCredential<M> {
             unit,
             amount,
             proofs,
+            dleq_ok: validated.dleq_ok,
         })
     }
 }
@@ -587,7 +620,7 @@ mod tests {
 
     use super::{ChargeValidator, ValidatedCharge, ValidationError};
     use crate::challenge::CashuRequirement;
-    use crate::mint_client::{MintClient, MintClientError};
+    use crate::mint_client::{MintClient, MintClientError, SwapOutcome};
 
     /// Canned outcome for the mock [`MintClient::swap`] call.
     enum SwapResponse {
@@ -671,10 +704,13 @@ mod tests {
             &self,
             _mint_url: &MintUrl,
             proofs: Proofs,
-        ) -> Result<Proofs, MintClientError> {
+        ) -> Result<SwapOutcome, MintClientError> {
             self.swap_calls.fetch_add(1, Ordering::SeqCst);
             match self.swap_response {
-                SwapResponse::Echo => Ok(proofs),
+                SwapResponse::Echo => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: true,
+                }),
                 SwapResponse::Unreachable => {
                     Err(MintClientError::Unreachable("mock unreachable".into()))
                 }
@@ -684,9 +720,12 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
-                SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
-                    "mock swap-output DLEQ invalid".into(),
-                )),
+                // The ceremony's serve-and-flag contract: a DLEQ failure on the
+                // swap-returned signatures still redeems (spec §security-dleq).
+                SwapResponse::DleqInvalid => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: false,
+                }),
                 SwapResponse::FeeTooHigh => Err(MintClientError::FeeTooHigh {
                     keyset_id: "009a1f293253e41e".into(),
                     input_fee_ppk: 100,
@@ -793,6 +832,7 @@ mod tests {
             mint_url,
             unit,
             amount,
+            dleq_ok,
         } = validator
             .validate(&token, &req)
             .await
@@ -812,6 +852,7 @@ mod tests {
         assert_eq!(unit, pop_unit());
         assert_eq!(amount, Amount::from(10));
         assert_eq!(new_proofs.len(), 2);
+        assert!(dleq_ok, "a clean swap reports a clean DLEQ verdict");
     }
 
     #[tokio::test]
@@ -1009,28 +1050,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_propagates_swap_output_dleq_invalid() {
-        // Money-safety: a swap-output DLEQ failure must surface as its OWN arm,
-        // never collapsed into MintRejectedSwap.
+    async fn validate_succeeds_with_dleq_flag_false_on_swap_output_dleq_failure() {
+        // Spec step 9: "a failed or missing DLEQ proof after a successful swap
+        // is a mint-trust incident, not a payment failure" — validation
+        // SUCCEEDS, the redeemed value is kept, and `dleq_ok` carries the
+        // verdict for the operator.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
         let (mock, counters) = MockMintClient::with_swap(SwapResponse::DleqInvalid);
         let validator = ChargeValidator::new(mock);
 
-        let err = validator
+        let validated = validator
             .validate(&token, &req)
             .await
-            .expect_err("swap-output DLEQ failure must fail validation");
-        assert!(
-            matches!(err, ValidationError::SwapOutputDleqInvalid(_)),
-            "expected SwapOutputDleqInvalid (distinct from MintRejectedSwap), got {err:?}"
+            .expect("a swap-output DLEQ failure must NOT fail validation");
+        assert!(!validated.dleq_ok, "the verdict flag must carry the failure");
+        assert_eq!(
+            u64::from(validated.amount),
+            10,
+            "the consumed inputs' value must be redeemed"
         );
         assert_eq!(
             counters.swap.load(Ordering::SeqCst),
             1,
-            "swap must be called once before the DLEQ failure surfaces"
+            "the swap ran once and succeeded"
         );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_resolved_keyset_unit_mismatch_before_swap() {
+        // Spec step 7: the published keyset is the unit authority. A token
+        // DECLARING the required unit whose proofs sit on a keyset the mint
+        // publishes under a DIFFERENT unit is rejected pre-swap — with ZERO
+        // swap calls, so the foreign-unit proofs are never consumed.
+        let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::new(
+            SwapResponse::Echo,
+            KeysetsResponse::Ok(vec![keyset_info(keyset_id, CurrencyUnit::Sat)]),
+        );
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("a sat-keyset proof under a pop-declared token must be rejected");
+        match err {
+            ValidationError::ResolvedKeysetUnitMismatch {
+                keyset_id: id,
+                expected,
+                got,
+            } => {
+                assert_eq!(id, "009a1f293253e41e");
+                assert_eq!(expected, pop_unit());
+                assert_eq!(got, CurrencyUnit::Sat);
+            }
+            other => panic!("expected ResolvedKeysetUnitMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            0,
+            "step 7 must reject BEFORE the swap (zero swap calls)"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_resolved_keyset_with_matching_unit() {
+        // The positive half of the step-7 assertion: a published keyset whose
+        // unit equals the requirement's passes through to the swap.
+        let keyset_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::new(
+            SwapResponse::Echo,
+            KeysetsResponse::Ok(vec![keyset_info(keyset_id, pop_unit())]),
+        );
+        let validator = ChargeValidator::new(mock);
+
+        validator
+            .validate(&token, &req)
+            .await
+            .expect("a matching resolved-keyset unit must validate");
+        assert_eq!(counters.swap.load(Ordering::SeqCst), 1, "swap proceeds");
     }
 
     #[tokio::test]
@@ -1390,6 +1495,10 @@ mod tests {
             !redeemed.proofs.active_keyset_id.is_empty(),
             "active_keyset_id must be populated"
         );
+        assert!(
+            redeemed.dleq_ok,
+            "a clean swap-output DLEQ verdict rides the success"
+        );
     }
 
     #[tokio::test]
@@ -1510,22 +1619,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_and_redeem_maps_swap_output_dleq_to_dleq_invalid() {
-        // Money-safety: a swap-output DLEQ failure maps to DleqInvalid, NOT
-        // DoubleSpend — the gateway serves nothing and no proofs are produced.
+    async fn verify_and_redeem_succeeds_with_dleq_flag_false_on_swap_output_dleq_failure() {
+        // Spec step 9 + §security-dleq: a missing/invalid DLEQ on the
+        // swap-RETURNED signatures is a mint-trust incident, NOT a payment
+        // failure — the redeem SUCCEEDS, the value is kept, and `Redeemed`
+        // carries `dleq_ok: false` for the operator surface.
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
 
         let (mock, _c) = MockMintClient::with_swap(SwapResponse::DleqInvalid);
         let cred = CashuCredential::new(mock);
 
-        let err = cred
+        let redeemed = cred
             .verify_and_redeem(&presented, &req)
             .await
-            .expect_err("swap-output DLEQ failure must map to DleqInvalid");
+            .expect("a swap-output DLEQ failure must NOT fail the redeem");
+        assert!(!redeemed.dleq_ok, "Redeemed must carry the false verdict");
+        assert_eq!(redeemed.amount, 10, "the redeemed value is kept");
         assert!(
-            matches!(err, ChargeError::DleqInvalid),
-            "swap-output DLEQ failure must map to DleqInvalid, got {err:?}"
+            redeemed.proofs.fresh_proofs.starts_with("cashuB"),
+            "fresh proofs are still produced (the value was redeemed)"
         );
     }
 

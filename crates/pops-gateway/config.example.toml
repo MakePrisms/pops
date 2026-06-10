@@ -39,6 +39,12 @@ proofs_sink = "/data/proofs.jsonl"
 # the 504 response reachable. Default: 30. Set to 0 to disable (NOT recommended).
 # upstream_timeout_secs = 30
 
+# Per-call MINT HTTP timeout in SECONDS (keysets / keys / swap). Bounds a hung
+# mint so the request surfaces as 503 mint-unavailable instead of hanging.
+# Default: 10. Must be > 0 (0 is a config error — a mint call can consume the
+# token, so it must always be bounded).
+# mint_http_timeout_secs = 10
+
 [charge]
 # The pop_<unix_ts> currency unit you accept.
 #

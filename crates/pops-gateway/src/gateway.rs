@@ -87,11 +87,14 @@ fn build_upstream_client(timeout: Option<std::time::Duration>) -> reqwest::Clien
 }
 
 impl AppState<CashuCredential<CdkMintClient>> {
-    /// Production wiring: the real cdk-backed credential, with the configured
-    /// per-token `max_proofs` DoS cap enforced pre-swap.
+    /// Production wiring: the real cdk-backed credential with the configured
+    /// per-call mint HTTP timeout, and the per-token `max_proofs` DoS cap
+    /// enforced pre-swap.
     pub fn production(config: ValidatedConfig, sink: ProofsSink) -> Self {
-        let credential =
-            CashuCredential::with_max_proofs(CdkMintClient::new(), config.max_proofs);
+        let credential = CashuCredential::with_max_proofs(
+            CdkMintClient::with_timeout(config.mint_http_timeout),
+            config.max_proofs,
+        );
         Self::new(config, credential, sink)
     }
 }
@@ -206,11 +209,14 @@ where
             .into_response();
     }
 
+    // `dleq_ok: false` was already WARN-logged (mint named) by the swap
+    // ceremony; carried here for settle-line correlation.
     tracing::info!(
         token_hash = %redeemed.proofs.token_hash,
         amount = redeemed.proofs.amount,
         unit = %redeemed.proofs.unit,
         active_keyset_id = %redeemed.proofs.active_keyset_id,
+        dleq_ok = redeemed.dleq_ok,
         "charge settled and persisted; forwarding upstream"
     );
 

@@ -107,11 +107,25 @@ impl<C: Redeemer> ChargeMiddlewareState<C> {
 }
 
 /// Build a native [`ChargeMiddlewareState`] for the default
-/// `CashuCredential<CdkMintClient>`.
+/// `CashuCredential<CdkMintClient>` (mint HTTP bounded by
+/// [`crate::cdk_mint_client::DEFAULT_MINT_HTTP_TIMEOUT`]).
 pub fn require_charge_state(
     requirement: CashuRequirement,
 ) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>> {
     ChargeMiddlewareState::new(requirement, CashuCredential::new(CdkMintClient::new()))
+}
+
+/// As [`require_charge_state`] with an explicit per-call mint HTTP timeout. A
+/// mint that stops answering then surfaces as the 503 mint-unavailable path
+/// within the bound instead of hanging the request.
+pub fn require_charge_state_with_mint_timeout(
+    requirement: CashuRequirement,
+    mint_http_timeout: Duration,
+) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>> {
+    ChargeMiddlewareState::new(
+        requirement,
+        CashuCredential::new(CdkMintClient::with_timeout(mint_http_timeout)),
+    )
 }
 
 /// Axum middleware entry point enforcing the Payment Authentication envelope.
@@ -424,7 +438,7 @@ mod tests {
     use crate::challenge::CashuRequirement;
     use crate::redeemer::Redeemed;
     use crate::envelope::{encode_payment_credentials, CashuPayload, PaymentCredentials};
-    use crate::mint_client::{MintClient, MintClientError};
+    use crate::mint_client::{MintClient, MintClientError, SwapOutcome};
 
     // ---- Mock MintClient (mirrors the validator's test helper) -------
 
@@ -434,8 +448,8 @@ mod tests {
         /// Post-submit (indeterminate) failure → exercises the 503 mapping.
         UnreachableIndeterminate,
         RejectedSwap,
-        /// Swap-output DLEQ gate rejected the mint's blind signatures →
-        /// money-safety path: 402 + re-challenge, resource NOT served.
+        /// Swap-output DLEQ verdict failed → serve-and-flag path: the swap
+        /// SUCCEEDED, the response is the success path, `dleq_ok` is false.
         DleqInvalid,
     }
 
@@ -462,9 +476,12 @@ mod tests {
             &self,
             _mint_url: &MintUrl,
             proofs: Proofs,
-        ) -> Result<Proofs, MintClientError> {
+        ) -> Result<SwapOutcome, MintClientError> {
             match self.swap_response {
-                SwapResponse::Echo => Ok(proofs),
+                SwapResponse::Echo => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: true,
+                }),
                 SwapResponse::Unreachable => Err(MintClientError::Unreachable(
                     "mock unreachable".into(),
                 )),
@@ -474,9 +491,10 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
-                SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
-                    "mock swap-output DLEQ invalid".into(),
-                )),
+                SwapResponse::DleqInvalid => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: false,
+                }),
             }
         }
     }
@@ -1099,6 +1117,70 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hung_mint_returns_503_mint_unavailable_within_timeout() {
+        // END-TO-END through the REAL CdkMintClient: a mint that accepts TCP
+        // but never answers must produce the 503 mint-unavailable path within
+        // the configured mint HTTP timeout plus margin — never hang the
+        // request. (The token is NOT consumed: the hang is on the pre-swap
+        // keysets GET, the determinate arm.)
+        use crate::cdk_mint_client::CdkMintClient;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hung mint");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _held_open = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let hung_mint =
+            MintUrl::from_str(&format!("http://127.0.0.1:{port}")).expect("local mint url");
+        let token = make_token(hung_mint.clone(), pop_unit(), vec![make_proof(10, 0)]);
+
+        type CdkCredential = CashuCredential<CdkMintClient>;
+        let state: Arc<ChargeMiddlewareState<CdkCredential>> =
+            Arc::new(ChargeMiddlewareState::new(
+                requirement(pop_unit(), vec![hung_mint], 10),
+                CashuCredential::new(CdkMintClient::with_timeout(
+                    std::time::Duration::from_millis(250),
+                )),
+            ));
+        async fn echo(Extension(redeemed): Extension<Redeemed>) -> String {
+            format!("ok:{}", redeemed.amount)
+        }
+        let app = Router::new()
+            .route("/gated", get(echo))
+            .layer(from_fn_with_state(state, require_charge::<CdkCredential>));
+
+        let request = request_with_token(&app, &token.to_string()).await;
+        let started = std::time::Instant::now();
+        let response = app.oneshot(request).await.expect("oneshot");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a hung mint is the mint-unavailable path"
+        );
+        assert!(
+            response.headers().get(http::header::RETRY_AFTER).is_some(),
+            "the 503 carries Retry-After"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must answer within the 250ms mint timeout plus margin, took {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn mint_rejected_returns_402() {
         // A rejected swap is a verification failure → 402 + re-challenge.
@@ -1120,35 +1202,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn swap_output_dleq_invalid_returns_402_and_does_not_serve_resource() {
-        // Money-safety end-to-end: a missing/invalid swap-output DLEQ maps to
-        // ChargeError::DleqInvalid → 402 + re-challenge, and the gated handler
-        // MUST NOT run, so a malicious/buggy mint never gets the resource served
-        // against unsigned ecash.
+    async fn swap_output_dleq_failure_serves_resource_with_flag_in_extension() {
+        // Spec step 9: "a failed or missing DLEQ proof after a successful swap
+        // is a mint-trust incident, not a payment failure" — the HTTP response
+        // is the NORMAL success path (200 + receipt), the gated handler runs,
+        // and the false verdict rides `Extension<Redeemed>.dleq_ok` for the
+        // operator surface.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
-        let app = router_with(state_with(SwapResponse::DleqInvalid));
+        async fn echo_flag(Extension(redeemed): Extension<Redeemed>) -> String {
+            format!("ok:{}:dleq_ok={}", redeemed.amount, redeemed.dleq_ok)
+        }
+        let app = Router::new()
+            .route("/gated", get(echo_flag))
+            .layer(from_fn_with_state(
+                state_with(SwapResponse::DleqInvalid),
+                require_charge::<TestCredential>,
+            ));
+
         let request = request_with_token(&app, &encoded).await;
         let response = app.oneshot(request).await.expect("oneshot");
 
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(response
-            .headers()
-            .get(http::header::WWW_AUTHENTICATE)
-            .is_some());
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the payment settled; §security-dleq forbids failing it (MUST NOT \
+             respond with a payment-failure status after a successful swap)"
+        );
+        assert!(
+            response.headers().get("payment-receipt").is_some(),
+            "a settled payment carries its receipt"
+        );
 
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        assert!(
-            !body.starts_with("ok:"),
-            "gated resource must NOT be served on a DLEQ failure, got: {body}"
-        );
-        assert!(
-            body.to_ascii_lowercase().contains("dleq"),
-            "expected a DLEQ failure message, got: {body}"
+        assert_eq!(
+            body, "ok:10:dleq_ok=false",
+            "the resource is served and the extension carries the false verdict"
         );
     }
 

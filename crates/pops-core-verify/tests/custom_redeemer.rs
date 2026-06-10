@@ -117,6 +117,9 @@ impl Redeemer for VoucherRedeemer {
             unit: voucher.unit.clone(),
             amount: voucher.amount,
             proofs,
+            // The ledger has no output-integrity check (contract 2): an impl
+            // without one reports a clean verdict.
+            dleq_ok: true,
         })
     }
 }

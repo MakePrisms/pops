@@ -36,6 +36,11 @@ getrandom = "0.2"
 # ECMAScript number formatting, over serde_json. Pure-Rust + wasm-clean (ryu-js
 # for the number serialization), so the envelope codec stays wasm-targetable.
 serde_jcs = "0.1"
+# Operator-facing diagnostics from the shared swap ceremony — the WARN on a
+# missing/invalid swap-output DLEQ (`draft-cashu-charge-01` §security-dleq:
+# alert + quarantine, never fail the payment). Core-only, wasm-clean; hosts
+# bring their own subscriber.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 # ── native feature deps (off on wasm) ───────────────────────────────────────
 # cdk supplies wallet::{HttpClient, MintConnector} for the real MintClient.
@@ -44,8 +49,14 @@ cdk = { version = "0.16", default-features = false, features = ["wallet"], optio
 axum = { version = "0.7", optional = true }
 # http types (StatusCode / HeaderValue) used directly by the middleware.
 http = { version = "1", optional = true }
-# uuid v4 generates the per-request challenge `id`.
+# uuid is NOT used by this crate's code anymore (the HMAC challenge binding
+# replaced the old uuid-v4 challenge `id`); it stays declared only so the
+# `wasm` feature can flip `uuid/js` on the uuid that cashu pulls transitively
+# (see the `[features]` note).
 uuid = { version = "1", features = ["v4"], optional = true }
+# tokio::time::timeout bounds every mint HTTP call in `cdk_mint_client` (a hung
+# mint must surface as the 503 mint-unavailable path, not hang the request).
+tokio = { version = "1", features = ["time"], optional = true }
 # RFC 3339 parsing + the wall clock for the middleware's `challenge.expires`
 # enforcement and the `Payment-Receipt` timestamp. Native-only: the wasm surface
 # decodes but does not enforce expiry.
@@ -62,7 +73,7 @@ js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = ["Response"] }
 [features]
 default = ["native"]
-native = ["dep:cdk", "dep:axum", "dep:http", "dep:uuid", "dep:chrono"]
+native = ["dep:cdk", "dep:axum", "dep:http", "dep:uuid", "dep:chrono", "dep:tokio"]
 # `uuid/js` selects uuid's wasm randomness backend. uuid is pulled
 # TRANSITIVELY by cashu (not just our native dep), and uuid 1.23+ refuses to
 # compile on wasm32 without an explicit randomness feature; `getrandom/js`
@@ -71,7 +82,8 @@ native = ["dep:cdk", "dep:axum", "dep:http", "dep:uuid", "dep:chrono"]
 wasm = ["dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:js-sys", "dep:web-sys", "getrandom/js", "uuid/js"]
 
 [dev-dependencies]
-# async test runtime for the folded validator/middleware tests.
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+# async test runtime for the folded validator/middleware tests; `net` serves
+# the hung-mint listeners the mint-HTTP-timeout tests bind on 127.0.0.1.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net"] }
 # tower::ServiceExt::oneshot drives the axum router in the middleware tests.
 tower = "0.5"

@@ -103,6 +103,10 @@ pub fn build_payment_credential(credentials_json: &str) -> Result<String, JsValu
 /// so a JS route uses `code` for diagnostics and the mapped `status` /
 /// `problem_type` / `problem_slug` fields (the shared [`crate::problem`] map)
 /// for the HTTP answer.
+///
+/// There is NO `dleq-invalid` code: a swap-output DLEQ failure is not an error
+/// (spec §security-dleq) — it surfaces as `dleq_ok: false` on the SUCCESS
+/// object instead.
 fn charge_error_code(e: &ChargeError) -> &'static str {
     match e {
         ChargeError::MintUnreachable { .. } => "mint-unreachable",
@@ -112,7 +116,6 @@ fn charge_error_code(e: &ChargeError) -> &'static str {
         ChargeError::MultiMintOrUnit => "multi-mint-or-unit",
         ChargeError::LockedToken => "locked-token",
         ChargeError::FeeTooHigh { .. } => "fee-too-high",
-        ChargeError::DleqInvalid => "dleq-invalid",
         ChargeError::ShortKeysetIdUnresolved { .. } => "short-keyset-id-unresolved",
         ChargeError::DoubleSpend => "double-spend",
         ChargeError::Expired => "expired",
@@ -162,8 +165,11 @@ fn charge_error_to_js(e: &ChargeError) -> JsValue {
 /// via `globalThis.fetch` against the token's mint.
 ///
 /// Returns a `Promise` that RESOLVES to
-/// `{ ok:true, fresh_proofs, amount, unit, active_keyset_id, token_hash }` on
-/// success, or REJECTS with
+/// `{ ok:true, fresh_proofs, amount, unit, active_keyset_id, token_hash,
+/// dleq_ok }` on success — `dleq_ok: false` means the swap-returned
+/// signatures' NUT-12 DLEQ was missing/invalid, a mint-trust incident the
+/// route should alert on while STILL serving (spec §security-dleq) — or
+/// REJECTS with
 /// `{ ok:false, code, message, status, problem_type, problem_slug }` — the
 /// fine-grained [`ChargeError`] discriminant plus the mapped spec status and
 /// absolute problem-type URI, so the JS route answers 402 / 503 / 400 with the
@@ -207,6 +213,7 @@ pub fn verify_and_redeem(presented_token: &str, requirement_json: &str) -> js_sy
                     &JsValue::from_str(&redeemed.proofs.active_keyset_id),
                 );
                 set("token_hash", &JsValue::from_str(&redeemed.proofs.token_hash));
+                set("dleq_ok", &JsValue::from_bool(redeemed.dleq_ok));
                 Ok(obj.into())
             }
             Err(e) => Err(charge_error_to_js(&e)),

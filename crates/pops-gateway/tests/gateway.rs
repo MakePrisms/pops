@@ -35,7 +35,7 @@ use pops_core_verify::challenge::CashuRequirement;
 use pops_core_verify::envelope::{
     encode_payment_credentials, CashuPayload, EchoedChallenge, PaymentCredentials,
 };
-use pops_core_verify::mint_client::{MintClient, MintClientError};
+use pops_core_verify::mint_client::{MintClient, MintClientError, SwapOutcome};
 
 use pops_core_verify::binding::BindingKey;
 use pops_core_verify::envelope::{parse_payment_params, PaymentParams};
@@ -79,10 +79,17 @@ impl MintClient for MockMintClient {
         Ok(Vec::new())
     }
 
-    async fn swap(&self, _mint_url: &MintUrl, proofs: Proofs) -> Result<Proofs, MintClientError> {
+    async fn swap(
+        &self,
+        _mint_url: &MintUrl,
+        proofs: Proofs,
+    ) -> Result<SwapOutcome, MintClientError> {
         self.swap_calls.fetch_add(1, Ordering::SeqCst);
         match self.swap_response {
-            SwapResponse::Echo => Ok(proofs),
+            SwapResponse::Echo => Ok(SwapOutcome {
+                proofs,
+                dleq_ok: true,
+            }),
             SwapResponse::Unreachable => {
                 Err(MintClientError::Unreachable("mock unreachable".into()))
             }
@@ -223,6 +230,9 @@ fn validated_config(
         upstream_timeout: Some(std::time::Duration::from_secs(
             pops_gateway::config::DEFAULT_UPSTREAM_TIMEOUT_SECS,
         )),
+        mint_http_timeout: std::time::Duration::from_secs(
+            pops_gateway::config::DEFAULT_MINT_HTTP_TIMEOUT_SECS,
+        ),
         requirement: requirement(),
         max_proofs: pops_gateway::config::DEFAULT_MAX_PROOFS,
         routes,
@@ -732,7 +742,6 @@ async fn gateway_emits_the_shared_problem_mapping_for_every_charge_error() {
             keyset_id: "009a1f293253e41e".into(),
             input_fee_ppk: 100,
         },
-        || ChargeError::DleqInvalid,
         || ChargeError::ShortKeysetIdUnresolved {
             short_id: "00aabbccddeeff00".into(),
         },

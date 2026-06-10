@@ -29,7 +29,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-use crate::mint_client::{MintClient, MintClientError};
+use crate::mint_client::{MintClient, MintClientError, SwapOutcome};
 use crate::swap_ceremony::{swap_to_redeem, MintHttp};
 
 /// `fetch`-backed [`MintClient`] for wasm32.
@@ -221,7 +221,7 @@ impl MintClient for WasmMintClient {
         &self,
         mint_url: &MintUrl,
         proofs: Proofs,
-    ) -> Result<Proofs, MintClientError> {
+    ) -> Result<SwapOutcome, MintClientError> {
         // Same shared ceremony as the native client — only the transport below
         // it differs.
         swap_to_redeem(self, mint_url, proofs).await
