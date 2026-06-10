@@ -5,8 +5,11 @@
 a CLTV-locked Bitcoin UTXO. This wallet is the funder's single tool to:
 
 - **`init`** — create a seed (the only secret),
+- **`quote`** — create + verify a funding quote, persist it, and exit (no
+  funding poll; resume later with `mint --resume`),
 - **`mint`** — lock BTC in a CLTV-backed P2TR, wait for funding, and get a
   `cashuB` credential token,
+- **`pay`** — spend a held pop at an HTTP-402 gated endpoint,
 - **`recover`** — reclaim the locked BTC after the timelock matures,
 - **`list` / `status`** — track deposits, and
 - **`balance`** — an aggregated ledger summary (total locked, per-state
@@ -45,7 +48,8 @@ cargo build --release          # from the repo root, or: cargo build -p pop
 ```
 
 The binary is `target/release/pop`. Install with
-`cargo install --path .` (installs a single `pop` binary).
+`cargo install --path crates/pop` from the repo root (the root `Cargo.toml` is
+a virtual workspace manifest, so `--path .` does not install).
 
 ## Wallet directory
 
@@ -89,13 +93,28 @@ pubkey) and the on-chain recovery key (x-only pubkey).
 ### init
 
 ```
-pop init [--words 12|24] [--network mainnet|testnet|signet|regtest] [--esplora-url URL] [--force]
+pop init [--words 12|24] [--mnemonic "<words>"] [--show-mnemonic]
+         [--network mainnet|testnet|signet|regtest] [--esplora-url URL] [--force]
 ```
 
-Generates a BIP-39 mnemonic, writes the derived seed in plaintext (file `seed`,
-perms `0600`), writes `config.toml` and an empty db, and prints the mnemonic
-**once**. Write it down — it is the only secret and the only backup. There is no
-passphrase. Default network is **mainnet**.
+Generates a BIP-39 mnemonic (or imports an existing one via `--mnemonic`),
+writes the derived seed in plaintext (file `seed`, perms `0600`), writes
+`config.toml` and an empty db, and prints the mnemonic **once** — to stderr by
+default; `--show-mnemonic` additionally includes it in the stdout JSON. Write
+it down — it is the only secret and the only backup. There is no passphrase.
+Default network is **mainnet**.
+
+### quote
+
+```
+pop quote --mint-url URL --amount SATS --mint-pubkey HEX33
+          [--duration 30d | --unit pop_<ts>] [--label TEXT]
+```
+
+The non-blocking first half of `mint`: creates the funding quote,
+**independently re-verifies** the returned address, persists the deposit +
+recovery file, prints the funding address, and **exits** without polling. Fund
+it on your own schedule, then continue with `pop mint --resume <deposit_id>`.
 
 ### mint
 
@@ -142,12 +161,15 @@ machine contract).
 ### recover
 
 ```
-pop recover (--deposit ID | --all) --dest ADDRESS [--fee 200] [--no-broadcast]
+pop recover (--deposit ID | --all) --dest ADDRESS
+            [--fee SATS | --target BLOCKS] [--no-broadcast]
 ```
 
-Refuses (with an ETA) any deposit whose CLTV has not matured — maturity is
-evaluated against the chain tip's **median-time-past** (BIP-113), not
-wall-clock. For matured deposits it rebuilds the construction from stored
+The fee is sized from the esplora mempool feerate estimate at `--target`
+confirmation blocks (default 6); an explicit `--fee <sats>` (absolute)
+overrides the estimate. Refuses (with an ETA) any deposit whose CLTV has not
+matured — maturity is evaluated against the chain tip's **median-time-past**
+(BIP-113), not wall-clock. For matured deposits it rebuilds the construction from stored
 params, derives the funder privkey, fetches the funding UTXO, asserts the
 on-chain scriptPubKey matches, builds the `nLockTime = ts_expiry` script-path
 spend, schnorr-signs, and broadcasts. `--no-broadcast` prints the raw tx hex

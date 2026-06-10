@@ -39,6 +39,10 @@ docker run -p 8080:8080 \
   ghcr.io/makeprisms/pops-gateway:latest
 ```
 
+The gateway reads its config from the path in the **`POPS_GATEWAY_CONFIG`**
+env var, defaulting to **`/etc/pops-gateway/config.toml`** (which is why the
+mount above lands there).
+
 Prefer to build from source? See [Building the image
 yourself](#building-the-image-yourself) — the run command is identical, just
 swap the local tag for the `ghcr.io/...` one.
@@ -148,6 +152,9 @@ value — it is the payment for the gated request.
    - request body over **`max_body_bytes`** (default 1 MiB) → `413 Payload Too
      Large`. On a gated path this is checked **before the charge**, so the pop
      is **not** consumed.
+   - credential carrying more than **`[charge].max_proofs`** proofs (default
+     64) → `402` BEFORE any swap (a pre-swap DoS guard; the pop is **not**
+     consumed).
    - malformed request frame (>1 credential) / non-`cashu` method → `400`.
    - tampered or unissued challenge echo → `402 invalid-challenge`; stale
      `expires` or a keyset retired at the mint → `402 payment-expired`.

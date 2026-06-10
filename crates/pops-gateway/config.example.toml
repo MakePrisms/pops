@@ -1,9 +1,11 @@
 # pops-gateway — example config.
 #
 # Copy this to `config.toml`, fill in the five REQUIRED facts below, then run
-# the gateway pointing at it (see the README quickstart). This file is parsed
-# by the gateway's `Config` (serde, `deny_unknown_fields`) — keep field names
-# and table nesting exactly as shown; an unknown key is a fail-fast error.
+# the gateway pointing at it (see the README quickstart). The gateway reads the
+# path in the POPS_GATEWAY_CONFIG env var, defaulting to
+# /etc/pops-gateway/config.toml. This file is parsed by the gateway's `Config`
+# (serde, `deny_unknown_fields`) — keep field names and table nesting exactly
+# as shown; an unknown key is a fail-fast error.
 
 # ── REQUIRED — the five facts ────────────────────────────────────────────────
 
@@ -82,6 +84,12 @@ amount = 1
 
 # Human-readable description shown in the 402 challenge.
 # description = "my API"
+
+# Max proofs accepted per credential — a pre-swap DoS guard (a token stuffed
+# with tiny proofs inflates swap cost). Over the cap → 402 BEFORE any swap (the
+# pop is not consumed). Default: 64 (generous; an exact-amount token needs only
+# a handful). Must be > 0.
+# max_proofs = 64
 
 # OPTIONAL per-path gating rules. Absent ⇒ gate EVERY path. When present, only
 # paths matching a non-`public` rule are gated; `public = true` paths forward

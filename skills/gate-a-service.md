@@ -74,9 +74,12 @@ re-exported from
 feature):
 
 - **`CashuRequirement`** — what a holder must present: `unit` (a
-  `CurrencyUnit::Custom("pop_<ts>")`), `mints` (accepted mint set; empty means
-  "any"), `amount` (exact), and optional `payment_id` / `description` /
-  `single_use`. This is the config you build the challenge from. (Defined in
+  `CurrencyUnit::Custom("pop_<ts>")`), `mints` (accepted mint set; **must be
+  non-empty** — the challenge's `creqA` requires a non-empty `m`, so a Payment
+  host cannot emit a challenge from an empty set and the middleware answers a
+  bare request with `500` if misconfigured that way), `amount` (exact), and
+  optional `payment_id` / `description` / `single_use`. This is the config you
+  build the challenge from. (Defined in
   [`challenge.rs`](../crates/pops-core-verify/src/challenge.rs).)
 - **`require_charge_state(requirement) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>>`**
   — the convenience constructor that wires the default cdk-backed mint client
@@ -128,6 +131,14 @@ in-process over an injected `globalThis.fetch` — no proxy, no Rust at runtime.
 
 **Pick this when** your service is a JS/TS serverless function (Vercel/Node) and
 you want the gate inside the function.
+
+**Scope this mode honestly: it is an advisory demo surface.** The wasm package
+exports the credential codec + `verify_and_redeem` only — **no challenge
+issuance or binding API** (a wasm issuance API is recorded backlog). So the
+challenge-side MUSTs the two Rust hosts enforce (HMAC-bound `id`, `expires`,
+echo authentication, the `Payment-Receipt` on the 200) are YOUR route's job in
+JS; the vercel demo issues a fixed `id` with no `expires` and emits no receipt
+— fine for a demo, not the full Payment wire.
 
 Minimal shape — the route loads the WASM, 402s a bare request, and on retry
 calls `parse_payment_credential` then `verify_and_redeem`:
@@ -184,12 +195,15 @@ These hold no matter which mode you pick:
   given unit eventually goes **inactive**. Use your mint's currently-active
   unit: `GET <mint_url>/v1/keysets` and pick a keyset with `active: true`. A
   stale unit in your config silently stops accepting valid current pops.
-- **Challenges are bound and they expire.** Every challenge carries an
-  HMAC-bound `id` (under `binding_key` / the middleware's `BindingKey`) and an
-  `expires` (default TTL 300s). A credential must echo every issued param
+- **Challenges are bound and they expire — in the two Rust hosts.** Every
+  challenge the gateway (mode 1) and the axum middleware (mode 2) issue carries
+  an HMAC-bound `id` (under `binding_key` / the middleware's `BindingKey`) and
+  an `expires` (default TTL 300s). A credential must echo every issued param
   byte-for-byte or it is rejected as `invalid-challenge`; a stale echo is
   `payment-expired`. Configure a stable `binding_key` if challenges must
-  survive a restart.
+  survive a restart. Mode 3 has no issuance API, so binding/expiry are
+  whatever your JS route implements (the demo implements neither — see the
+  mode-3 scope note).
 - **DLEQ serve-and-flag.** A missing/invalid NUT-12 DLEQ on the signatures the
   mint returns from the redeeming swap is a mint-trust incident, NOT a payment
   failure: the request still succeeds (the client's payment settled) and the

@@ -445,10 +445,11 @@ print as a readable totals-plus-per-state table.
 
 Append one JSON object per line to `~/.pop-wallet/agent-activity.jsonl` for
 **every** wallet action you take. This is your memory of *when* and *why*; the
-wallet's `pop list --json` is the source of truth for current *state*. (Note: the
-wallet's `list/status --json` exposes `ts_expiry` and `recover_after_utc` but NOT
-the deposit's creation time — so your log's `at` timestamp is what lets you
-answer "the bitcoin I locked last Tuesday".)
+wallet's `pop list --json` is the source of truth for current *state*. (The
+deposit JSON exposes the creation time too — `created_at` (unix seconds) and
+`created_at_utc` — alongside `ts_expiry` / `recover_after_utc`, so "the bitcoin
+I locked last Tuesday" is answerable from `list` alone; your log's `at` adds
+the *why* and the human context.)
 
 **Line format** (compact JSON, one per line):
 
@@ -575,7 +576,7 @@ from them.
 | `amount_exceeds_cap` | false | needs_input | `{amount, cap}` REQ | (`pay`) the charge exceeds `--max-amount`; raise the cap only if you trust the charge — SENT NOTHING |
 | `swap_failed` | false | terminal | `{reason}` REQ | (`pay`) the NUT-03 swap-to-exact failed; the token may be unspent (verify) — nothing presented to the gateway |
 | `exact_amount_assertion_failed` | false | terminal | `{required, got}` REQ | (`pay`) INTERNAL money-safety abort — the send set didn't equal the charge; SENT NOTHING. Must never happen — report it |
-| `gateway_rejected_payment` | false | terminal | `{status, body, send_token, change_token?}` REQ(status, body, send_token) | (`pay`) the gateway answered non-2xx after a valid payment; surface `body`. The gateway did NOT redeem, so **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH** (the pop's input was spent by the swap). `--human` mode prints both tokens to stderr |
+| `gateway_rejected_payment` | false | terminal | `{status, body, send_token, change_token?}` REQ(status, body, send_token) | (`pay`) the gateway answered non-2xx after the token was sent; surface `body`. On a **4xx** (verification rejection) the gateway did NOT redeem — `send_token` (worth the charge) AND any `change_token` are unspent ecash; RECOVER BOTH (the pop's input was spent by the swap). On a **5xx** the error can FOLLOW a successful swap, so `send_token`'s redemption state is UNKNOWN — hold it and verify before assuming it is spendable (or spent); `change_token` was never sent and stays unspent. `--human` mode prints both tokens to stderr |
 | `gateway_retry_failed` | false | terminal | `{reason, send_token, change_token?}` REQ(reason, send_token) | (`pay`) the payment-retry HTTP call failed at the transport layer AFTER the swap spent the input — the retry never reached the gateway. **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH and present `send_token` to the gateway directly; do NOT retry with the original `--token` (it is spent).** `--human` prints both to stderr |
 | `token_encode_failed` | false | terminal | `{reason, send_proofs?, change_proofs?}` REQ(reason) | (`pay`/`mint`) INTERNAL: the ecash was issued (`mint`) or swapped (`pay`) but a proof set could not be encoded to a `cashuB` string. The raw proofs are in `details.send_proofs`/`details.change_proofs` (and printed in `--human`) — they ARE your ecash; re-encode to recover. On `mint` only `send_proofs` is present (the freshly-issued token). Must never happen — report it |
 | `address_mismatch` | false | terminal (security) | `{expected, got}` REQ | mint's address ≠ our reconstruction — do NOT fund; tell the human |

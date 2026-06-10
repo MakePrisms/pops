@@ -131,8 +131,14 @@ curl -i localhost:3000/api/secret        # 402 + WWW-Authenticate: Payment chall
 `vercel-demo/package.json` also exposes `npm run build:wasm` (a passthrough to
 `../build-wasm.sh`) so the bindings can be (re)built from inside the demo.
 
-The mint the demo redeems against defaults to a local pops mint; override at
-runtime with `POPS_MINT_URL` / `POPS_UNIT` / `POPS_AMOUNT`. The gated route runs
+The mint the demo redeems against defaults to `http://localhost:3338` (a
+placeholder for a locally-run pops mint — configure it for anything real);
+override at runtime with `POPS_MINT_URL` / `POPS_UNIT` / `POPS_AMOUNT` **and**
+`POPS_CREQ_A`. The trap: the route's challenge embeds a pre-encoded NUT-18
+`creqA` whose `a`/`u`/`m` must equal the requirement, so overriding
+`POPS_MINT_URL`/`POPS_UNIT`/`POPS_AMOUNT` **without** a matching `POPS_CREQ_A`
+yields a self-contradicting challenge that conformant clients (e.g. `pop pay`)
+refuse. The gated route runs
 on the **Node** runtime (not Edge) — the wasm-pack nodejs glue reads its `.wasm`
 via `fs.readFileSync`, and `next.config.js` keeps the package un-bundled
 (`serverExternalPackages` + a webpack external) so `__dirname` stays intact for

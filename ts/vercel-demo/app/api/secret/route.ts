@@ -84,10 +84,12 @@ const REALM = "pops-vercel-demo";
 const CHALLENGE_ID = "pops-demo";
 
 // The demo charge requirement that gates verification, passed to the WASM
-// `verify_and_redeem`. Points at the local pops mint; override the mint at
-// deploy time via POPS_MINT_URL if reachable from the function (then also
-// override POPS_CREQ_A — see the header comment).
-const MINT_URL = process.env.POPS_MINT_URL || "http://100.96.251.111:3338";
+// `verify_and_redeem`. The default mint is a PLACEHOLDER for a locally-run
+// pops mint — it MUST be configured (POPS_MINT_URL) for any real deployment.
+// TRAP: overriding POPS_MINT_URL / POPS_UNIT / POPS_AMOUNT without a matching
+// POPS_CREQ_A yields a SELF-CONTRADICTING challenge that conformant clients
+// refuse (they cross-check the request object against the creqA's a/u/m).
+const MINT_URL = process.env.POPS_MINT_URL || "http://localhost:3338";
 const UNIT = process.env.POPS_UNIT || "pop_1780372941";
 const AMOUNT = Number(process.env.POPS_AMOUNT || "1");
 const DESCRIPTION = "pops Vercel-Node gating demo";
@@ -102,11 +104,12 @@ const requirement = {
 };
 
 // A pre-encoded NUT-18 `creqA` matching the DEFAULT requirement above
-// (i=pops-demo, a=1, u=pop_1780372941, m=[the default mint], empty transports,
-// no nut10). The authoritative payment artifact inside the request object.
+// (i=pops-demo, a=1, u=pop_1780372941, m=["http://localhost:3338"], empty
+// transports, no nut10). The authoritative payment artifact inside the request
+// object — any env override of the requirement needs a matching POPS_CREQ_A.
 const CREQ_A =
   process.env.POPS_CREQ_A ||
-  "creqApmFpaXBvcHMtZGVtb2FhAWF1bnBvcF8xNzgwMzcyOTQxYXP1YW2BeBpodHRwOi8vMTAwLjk2LjI1MS4xMTE6MzMzOGFkeBxwb3BzIFZlcmNlbC1Ob2RlIGdhdGluZyBkZW1v";
+  "creqApmFpaXBvcHMtZGVtb2FhAWF1bnBvcF8xNzgwMzcyOTQxYXP1YW2BdWh0dHA6Ly9sb2NhbGhvc3Q6MzMzOGFkeBxwb3BzIFZlcmNlbC1Ob2RlIGdhdGluZyBkZW1v";
 
 // Where redeemed proofs are appended, one JSON line per settlement (same line
 // shape as pops-gateway's proofs_sink). Set it to a path on durable storage

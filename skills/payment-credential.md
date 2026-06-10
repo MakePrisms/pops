@@ -15,18 +15,26 @@ runs the whole dance for you (see **[skills/pop-wallet.md](pop-wallet.md)**).
 
 ## 1. The 402 challenge (`WWW-Authenticate`)
 
-A gated resource answers a bare request with `402` and this response header
-(plus `Cache-Control: no-store` and an `application/problem+json` body):
+A gated resource answers a bare request with `402` and this response header,
+plus `Cache-Control: no-store`. A problem body on the 402 is a SHOULD, not a
+uniform fact: the gateway's bare 402 carries an `application/problem+json`
+`payment-required` body, while the in-process middleware's bare (no-attempt)
+402 has an **empty body** — spec-legal; only failed attempts get a problem
+body there:
 
 ```
 WWW-Authenticate: Payment id="…", realm="…", method="cashu", intent="charge", request="<request-object>", expires="2026-03-15T12:05:00Z"
 ```
 
 - Quoted-string auth-params. `id`, `realm`, `method`, `intent`, `request` are
-  always present; pops servers also always emit `expires` (RFC 3339) — the
-  challenge is **stateless-bound**: `id` is an HMAC-SHA256 over the issued
-  params under a server secret, and `expires` is the challenge's only expiry
-  signal. A server MAY additionally issue `digest` and/or `opaque`.
+  always present; the two RUST hosts (pops-gateway and the axum middleware)
+  also always emit `expires` (RFC 3339) — their challenge is
+  **stateless-bound**: `id` is an HMAC-SHA256 over the issued params under a
+  server secret, and `expires` is the challenge's only expiry signal. A server
+  MAY additionally issue `digest` and/or `opaque`. (The wasm surface exports
+  no issuance/binding API; the serverless demo issues a fixed `id` with no
+  `expires` — an advisory demo surface, see
+  [gate-a-service.md](gate-a-service.md) mode 3.)
 - `request` is a **base64url-nopad** (padding rejected) encoding of the
   JCS-canonical (RFC 8785) JSON **request object**:
 
@@ -80,12 +88,14 @@ encoding of the JCS-canonical JSON object of this exact shape:
   param (a decode/re-encode of `request` included) makes the credential
   `invalid-challenge`.
 - `payload.token` is the `cashuB…` (TokenV4) token you present. Its **total
-  value MUST be at least `amount + swap_fee`** — the fee the mint's keyset
-  charges on the redeeming swap, `ceil(sum_over_proofs(input_fee_ppk)/1000)`
-  (0 on the fee-free `pop_<ts>` keysets, so exactly `amount` there). The
-  server makes **no change**: value above the requirement is accepted and
-  **retained by the server**, so present the exact total (split your token
-  locally first; `pop pay` automates this).
+  value MUST be at least `amount + swap_fee`**. In THIS implementation
+  `swap_fee` is always 0: the verifier runs a **fee-free profile** and
+  **rejects fee-bearing keysets outright** (`input_fee_ppk > 0` →
+  `verification-failed`) — a bigger token does not make a fee-charging keyset
+  payable here. So present exactly `amount`. The server makes **no change**:
+  value above the requirement is accepted and **retained by the server**, so
+  present the exact total (split your token locally first; `pop pay`
+  automates this).
 
 Then: `header value = "Payment " + base64url_nopad(JCS(that object))`.
 
@@ -104,10 +114,12 @@ From `envelope.rs` (`parse_payment_authorization`) and the verify core:
    tolerated.
 4. **`method` must equal `cashu`** — exact, lowercase. Any other value is
    `method-unsupported` (HTTP **400**, not 402).
-5. **The echo must authenticate:** the server recomputes the `id`-HMAC over
-   the echoed params — any mismatch is `invalid-challenge` (402). A
-   past `expires` is `payment-expired` (402): re-fetch and pay the fresh
-   challenge.
+5. **The echo must authenticate (the two Rust hosts):** the gateway and the
+   axum middleware recompute the `id`-HMAC over the echoed params — any
+   mismatch is `invalid-challenge` (402). A past `expires` is
+   `payment-expired` (402): re-fetch and pay the fresh challenge. (The
+   serverless demo performs neither check — mode-3 scope note in
+   [gate-a-service.md](gate-a-service.md).)
 6. **The token must be a `cashuB` (TokenV4)** carrying ≥ 1 proof —
    `cashuA…`/TokenV3 and over-the-proof-cap tokens are `malformed-credential`.
    Bearer proofs only: a NUT-10 (P2PK/HTLC) locked proof is
@@ -129,7 +141,7 @@ From `envelope.rs` (`parse_payment_authorization`) and the verify core:
 
 | Status | Body `type` | Meaning |
 |---|---|---|
-| `200` | — | Paid. Carries `Payment-Receipt` (base64url JSON: `method`, `challengeId`, `reference` = SHA-256 hex of your exact token string, `status`, `timestamp`) + `Cache-Control: private`. |
+| `200` | — | Paid. Both Rust hosts carry `Payment-Receipt` (base64url-nopad over JCS-canonical JSON: `method`, `challengeId`, `reference` = SHA-256 hex of your exact token string, `status`, `timestamp`, plus the optional `externalId` echoing the request's correlation id when one was issued) + `Cache-Control: private`, which overrides any upstream Cache-Control at the gateway. Mode-3 exception: the serverless demo emits neither (advisory demo surface). |
 | `402` | `https://paymentauth.org/problems/<slug>` | A payment-verification failure + a **fresh challenge** in `WWW-Authenticate`. Slugs: `payment-required` (no attempt yet), `malformed-credential`, `invalid-challenge`, `payment-expired`, `payment-insufficient`, `verification-failed`. On `payment-expired`, re-present the **same token** against the fresh challenge once; a second consecutive `payment-expired` means the token's keyset expired — abandon it. |
 | `400` | `https://paymentauth.org/problems/method-unsupported`, or `about:blank` | A malformed *request frame* (non-`cashu` method; >1 `Payment` credential), not a payment failure. |
 | `503` | `about:blank` (+ `Retry-After`) | Mint unreachable — an infrastructure failure with **no problem type**. If the swap was never transmitted your token is NOT consumed: retry the same token. If a swap's outcome is unknown, check your proofs' state (NUT-07) before reusing or writing off the token. |
