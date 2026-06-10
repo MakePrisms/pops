@@ -1202,7 +1202,7 @@ mod tests {
     #[tokio::test]
     async fn mint_rejected_returns_402_with_neutral_detail() {
         // A non-keyset swap rejection the mint did NOT type as already-spent is
-        // the spec's step-9 else-branch → verification-failed 402 with a
+        // the spec's step-8 catch-all → verification-failed 402 with a
         // neutral detail (no double-spend claim the mint never made).
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();

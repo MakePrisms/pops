@@ -157,7 +157,8 @@ value — it is the payment for the gated request.
      consumed).
    - malformed request frame (>1 credential) / non-`cashu` method → `400`.
    - tampered or unissued challenge echo → `402 invalid-challenge`; stale
-     `expires` or a keyset retired at the mint → `402 payment-expired`.
+     `expires` → `402 payment-expired`; a keyset retired at the mint →
+     `402 verification-failed`.
    - upstream hung past the timeout → `504`; upstream down → `502` (the pop, if
      gated, is already spent — see the v1 edge below).
    - any other verification failure → `402` + a fresh challenge.

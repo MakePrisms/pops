@@ -218,7 +218,7 @@ mod tests {
 
     // ---- the cdk::Error → MintClientError classification --------------------
     //
-    // What cdk 0.16 exposes for the spec's step-9 split: its transport parses
+    // What cdk 0.16 exposes for the spec's step-8 cause classification: its transport parses
     // the mint's NUT error body and surfaces the two REGISTERED keyset codes as
     // typed variants — 12001 keyset-not-known → `cdk::Error::UnknownKeySet`,
     // 12002 keyset-inactive → `cdk::Error::InactiveKeyset` (plus the
@@ -494,7 +494,8 @@ mod tests {
     async fn swap_rejected_with_keyset_inactive_code_classifies_as_expired() {
         // The whole wire path: the mint answers the swap POST with NUT error
         // code 12002 (keyset-inactive); cdk's transport parses the body into
-        // `InactiveKeyset`, and the client surfaces the payment-expired arm.
+        // `InactiveKeyset`, and the client surfaces the Expired classification
+        // (a verification-failed condition on the wire).
         let port =
             reject_swap_mint(r#"{"code":12002,"detail":"Keyset is inactive"}"#).await;
         let client = CdkMintClient::new();

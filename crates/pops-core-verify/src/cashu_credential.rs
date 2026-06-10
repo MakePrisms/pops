@@ -1788,8 +1788,8 @@ mod tests {
     #[tokio::test]
     async fn verify_and_redeem_maps_untyped_rejection_to_neutral_swap_rejected() {
         // A swap rejection the mint did NOT type as already-spent maps to the
-        // neutral SwapRejected — verification-failed (the spec's step-9
-        // else-branch) with a detail that claims no double-spend.
+        // neutral SwapRejected — verification-failed (the spec's step-8
+        // catch-all) with a detail that claims no double-spend.
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)])
             .to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
