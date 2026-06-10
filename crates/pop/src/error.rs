@@ -275,18 +275,22 @@ pub enum PopError {
         /// What it actually summed to.
         got: u64,
     },
-    /// The gateway rejected the presented payment on retry. It did NOT redeem, so
-    /// BOTH the send set (worth `amount`) AND any change are unspent ecash —
-    /// carried so no value is silently lost. (`gateway_rejected_payment`)
+    /// The gateway answered the payment retry with a non-2xx. On a 4xx
+    /// (verification rejections above all) the gateway determinately did NOT
+    /// redeem, so the send set AND any change are unspent ecash. On a 5xx the
+    /// error can FOLLOW a successful swap (e.g. the gateway's persist or
+    /// upstream failed after settlement), so the send token's redemption state
+    /// is UNKNOWN — hold it and verify before assuming either way. Both tokens
+    /// are carried so no value is silently lost. (`gateway_rejected_payment`)
     GatewayRejectedPayment {
         /// HTTP status the retry returned (typically 402).
         status: u16,
         /// The gateway's response body verbatim.
         body: String,
-        /// Worth EXACTLY the charge; unredeemed, so valid ecash that MUST be
-        /// recovered (the bigger half of the value).
+        /// Worth EXACTLY the charge — carry and recover it (on a 4xx it is
+        /// unspent; on a 5xx its state is unknown until verified).
         send_token: String,
-        /// Change token, if a swap produced one — also unspent.
+        /// Change token, if a swap produced one — unspent (it was never sent).
         change_token: Option<String>,
     },
     /// A freshly-minted proof set could not be encoded to its `cashuB` string.
@@ -762,11 +766,25 @@ impl PopError {
                     Some(_) => " plus a change token",
                     None => "",
                 };
-                format!(
-                    "the gateway rejected the payment (HTTP {status}): {body}. The gateway did \
-                     NOT redeem, so the send token{change_suffix} are unspent ecash — RECOVER them \
-                     (json: `details.send_token`/`details.change_token`; human mode prints them below)"
-                )
+                if *status >= 500 {
+                    // A 5xx can follow a successful swap (persist/upstream
+                    // failure after settlement) — the redemption state is
+                    // genuinely unknown.
+                    format!(
+                        "the server reported an error after the token was sent (HTTP {status}): \
+                         {body}. Redemption state UNKNOWN — do not assume the send token is \
+                         spendable, and do not assume it is spent; hold the send \
+                         token{change_suffix} and verify its state before reuse \
+                         (json: `details.send_token`/`details.change_token`; human mode prints \
+                         them below)"
+                    )
+                } else {
+                    format!(
+                        "the gateway rejected the payment (HTTP {status}): {body}. The gateway did \
+                         NOT redeem, so the send token{change_suffix} are unspent ecash — RECOVER them \
+                         (json: `details.send_token`/`details.change_token`; human mode prints them below)"
+                    )
+                }
             }
             PopError::GatewayRetryFailed {
                 reason,
@@ -1039,6 +1057,41 @@ mod tests {
         assert_eq!(e.details().unwrap()["send_token"], json!("cashuBsend"));
         assert!(e.details().unwrap().get("change_token").is_none());
         assert_eq!(e.recovery_tokens(), Some(("cashuBsend", None)));
+    }
+
+    /// The post-send message is truthful per status class: a 4xx (verification
+    /// rejection) determinately did NOT redeem (tokens unspent); a 5xx can
+    /// follow a successful swap, so it must claim uncertainty — never
+    /// "unspent ecash".
+    #[test]
+    fn gateway_rejected_payment_message_is_truthful_per_status_class() {
+        let rejected_402 = PopError::GatewayRejectedPayment {
+            status: 402,
+            body: "verification failed".to_string(),
+            send_token: "cashuBsend".to_string(),
+            change_token: None,
+        };
+        let msg = rejected_402.message();
+        assert!(msg.contains("did NOT redeem"), "got: {msg}");
+        assert!(msg.contains("unspent ecash"), "got: {msg}");
+
+        let failed_500 = PopError::GatewayRejectedPayment {
+            status: 500,
+            body: "failed to persist redeemed proofs".to_string(),
+            send_token: "cashuBsend".to_string(),
+            change_token: None,
+        };
+        let msg = failed_500.message();
+        assert!(
+            msg.contains("Redemption state UNKNOWN"),
+            "a 5xx must claim uncertainty, got: {msg}"
+        );
+        assert!(
+            !msg.contains("unspent ecash") && !msg.contains("did NOT redeem"),
+            "a 5xx must not claim the token is unspent, got: {msg}"
+        );
+        // The recovery surface is unchanged either way.
+        assert_eq!(failed_500.recovery_tokens(), Some(("cashuBsend", None)));
     }
 
     /// `gateway_retry_failed` is terminal (NOT retriable — the input proofs are

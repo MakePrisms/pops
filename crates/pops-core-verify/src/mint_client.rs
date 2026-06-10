@@ -94,11 +94,18 @@ pub enum MintClientError {
     #[error("mint unreachable (indeterminate swap outcome): {0}")]
     UnreachableIndeterminate(String),
 
-    /// The mint refused the swap (double-spent, bad signature, unbalanced,
-    /// etc.) — every definitive rejection EXCEPT the keyset-retirement family,
-    /// which has its own arm below. The token was NOT consumed.
+    /// The mint refused the swap WITHOUT typing the reason as already-spent or
+    /// keyset-class (bad signature, unbalanced, etc.) — the definitive-rejection
+    /// catch-all. The token was NOT consumed.
     #[error("mint rejected swap: {0}")]
     RejectedSwap(String),
+
+    /// The mint refused the swap because an input proof is ALREADY SPENT (NUT
+    /// error code 11001 / `cdk::Error::TokenAlreadySpent`). Kept apart from
+    /// [`Self::RejectedSwap`] so only a mint-typed double-spend ever reads as
+    /// one.
+    #[error("mint rejected swap: proof already spent: {0}")]
+    AlreadySpent(String),
 
     /// The mint refused the call with a KEYSET-class error (NUT error codes
     /// 12001 keyset-not-known / 12002 keyset-inactive): the keyset has retired

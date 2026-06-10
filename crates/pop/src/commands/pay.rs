@@ -309,8 +309,11 @@ async fn finish_payment(
         )?;
         Ok(())
     } else {
-        // Gateway rejected (did NOT redeem) → send set AND any change are unspent
-        // ecash; surface BOTH.
+        // Non-2xx after the token was sent. A 4xx is a determinate rejection
+        // (did NOT redeem → both tokens unspent); a 5xx can follow a
+        // SUCCESSFUL swap (persist/upstream failure after settlement), so the
+        // send token's state is unknown. The error's message branches on the
+        // status; both tokens are surfaced either way.
         Err(PopError::GatewayRejectedPayment {
             status: retry_status.as_u16(),
             body: retry_body,

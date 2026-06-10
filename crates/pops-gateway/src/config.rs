@@ -436,6 +436,14 @@ impl MintUrlFieldExt for MintUrl {
     }
     fn from_str_for_field(s: &str, field: &str) -> Result<Self, ConfigError> {
         use std::str::FromStr;
+        // Spec mint-trust §: a mint URL carrying userinfo is rejected outright
+        // — on this side as a fail-fast config error.
+        if pops_core_verify::challenge::mint_url_has_userinfo(s) {
+            return Err(ConfigError::new(
+                field,
+                "mint URL must not contain userinfo (user@host)",
+            ));
+        }
         MintUrl::from_str(s)
             .map_err(|e| ConfigError::new(field, format!("not a valid mint URL: {e}")))
     }
@@ -867,6 +875,41 @@ amount = 1
             leftovers.is_empty(),
             "probe must clean up after itself, found: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn userinfo_mint_url_is_named_field_error() {
+        // Spec mint-trust §: user@host in a mint URL is rejected outright —
+        // here, fail-fast at config validation, for both `mint_url` and each
+        // `charge.mints` entry.
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://user@mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let err = cfg.validate().expect_err("userinfo mint_url must fail");
+        assert_eq!(err.field, "mint_url");
+        assert!(err.reason.contains("userinfo"), "got: {}", err.reason);
+
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+mints = ["https://user:pw@mint-b.example.com"]
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let err = cfg.validate().expect_err("userinfo charge.mints must fail");
+        assert_eq!(err.field, "charge.mints[0]");
+        assert!(err.reason.contains("userinfo"), "got: {}", err.reason);
     }
 
     #[test]

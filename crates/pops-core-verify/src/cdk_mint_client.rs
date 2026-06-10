@@ -122,10 +122,14 @@ impl CdkMintClient {
 /// code stays in the rejected catch-all (the spec's else-branch:
 /// `verification-failed`).
 ///
-/// The rest split on `is_definitive_failure` (4xx and parse/crypto errors →
+/// The already-spent rejection (NUT code 11001 → [`cdk::Error::TokenAlreadySpent`])
+/// keeps its own arm so the spent case carries the honest double-spend detail;
+/// the rest split on `is_definitive_failure` (4xx and parse/crypto errors →
 /// rejected; 5xx/timeout/transport → unreachable).
 fn map_cdk_err(e: cdk::Error) -> MintClientError {
-    if matches!(
+    if matches!(e, cdk::Error::TokenAlreadySpent) {
+        MintClientError::AlreadySpent(e.to_string())
+    } else if matches!(
         e,
         cdk::Error::UnknownKeySet | cdk::Error::KeysetUnknown(_) | cdk::Error::InactiveKeyset
     ) {
@@ -220,10 +224,11 @@ mod tests {
     // 12002 keyset-inactive → `cdk::Error::InactiveKeyset` (plus the
     // wallet-local `KeysetUnknown(Id)` twin). There is NO registered NUT error
     // code for "final_expiry passed" specifically, so those keyset codes are
-    // the entire honest wire signal for "keyset retired or expired"; every
-    // other definitive rejection (already-spent 11001 included) stays in the
-    // `RejectedSwap` catch-all, which the validator maps to the spec's
-    // else-branch `verification-failed`.
+    // the entire honest wire signal for "keyset retired or expired".
+    // Already-spent (11001 → `TokenAlreadySpent`) is the one OTHER typed
+    // rejection, kept distinct so its detail can honestly say double-spend;
+    // every remaining definitive rejection stays in the `RejectedSwap`
+    // catch-all. Both map to the spec's else-branch `verification-failed`.
 
     #[test]
     fn keyset_class_cdk_errors_classify_as_retired_or_expired() {
@@ -243,15 +248,27 @@ mod tests {
     }
 
     #[test]
-    fn already_spent_and_other_definitive_rejections_stay_rejected_swap() {
+    fn already_spent_classifies_as_its_own_spent_arm() {
+        // 11001 is the ONE rejection cdk types as already-spent; it carries the
+        // honest double-spend detail downstream.
+        assert!(
+            matches!(
+                map_cdk_err(cdk::Error::TokenAlreadySpent),
+                MintClientError::AlreadySpent(_)
+            ),
+            "a typed already-spent rejection must classify as AlreadySpent"
+        );
+    }
+
+    #[test]
+    fn other_definitive_rejections_stay_rejected_swap() {
         for e in [
-            cdk::Error::TokenAlreadySpent,
             cdk::Error::TransactionUnbalanced(10, 8, 0),
             cdk::Error::HttpError(Some(400), "Bad Request".into()),
         ] {
             assert!(
                 matches!(map_cdk_err(e), MintClientError::RejectedSwap(_)),
-                "a non-keyset definitive rejection must stay RejectedSwap"
+                "a non-keyset, non-spent definitive rejection must stay RejectedSwap"
             );
         }
     }
@@ -501,9 +518,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn swap_rejected_with_already_spent_code_stays_rejected_swap() {
+    async fn swap_rejected_with_already_spent_code_classifies_as_spent() {
         // NUT error code 11001 (token already spent) is the spec's
-        // verification-failed family — it must NOT classify as expired.
+        // verification-failed family with the spent-specific detail — it must
+        // NOT classify as expired, nor collapse into the neutral catch-all.
         let port =
             reject_swap_mint(r#"{"code":11001,"detail":"Token is already spent"}"#).await;
         let client = CdkMintClient::new();
@@ -516,8 +534,8 @@ mod tests {
             .await
             .expect_err("an 11001-rejected swap must error");
         assert!(
-            matches!(err, MintClientError::RejectedSwap(_)),
-            "an already-spent rejection must stay RejectedSwap, got {err:?}"
+            matches!(err, MintClientError::AlreadySpent(_)),
+            "an already-spent rejection must classify as AlreadySpent, got {err:?}"
         );
     }
 }

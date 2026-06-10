@@ -469,6 +469,108 @@ async fn valid_credential_persists_then_forwards_and_returns_body() {
     assert!(v["active_keyset_id"].as_str().is_some());
 }
 
+// Spec receipt §: the paid SUCCESS response carries Payment-Receipt +
+// Cache-Control: private, the latter OVERRIDING the upstream's own
+// Cache-Control (a paid response must never be shared-cacheable).
+#[tokio::test]
+async fn paid_success_carries_receipt_and_private_overrides_upstream_cache_control() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+
+    // An upstream that answers 200 with a PUBLIC Cache-Control.
+    let app_upstream = Router::new().fallback(any(|| async {
+        (
+            [(http::header::CACHE_CONTROL, "public, max-age=600")],
+            "PAID-CONTENT",
+        )
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app_upstream).await;
+    });
+
+    let (app, _swaps) = gateway(&format!("http://{addr}"), &sink, SwapResponse::Echo, vec![]);
+
+    // Inline the client dance so the challenge id is in hand for the receipt
+    // echo assertion.
+    let params = fetch_challenge(&app).await;
+    let creds = PaymentCredentials {
+        challenge: EchoedChallenge {
+            id: params.id.clone(),
+            realm: params.realm.clone(),
+            method: params.method.clone(),
+            intent: params.intent.clone(),
+            request: params.request.clone(),
+            digest: params.digest.clone(),
+            opaque: params.opaque.clone(),
+            expires: params.expires.clone(),
+            description: params.description.clone(),
+        },
+        payload: CashuPayload {
+            token: valid_token_string(),
+        },
+        source: None,
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(
+                    AUTHORIZATION,
+                    format!("Payment {}", encode_payment_credentials(&creds)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get(http::header::CACHE_CONTROL)
+            .expect("Cache-Control on the paid 200")
+            .to_str()
+            .unwrap(),
+        "private",
+        "the upstream's public Cache-Control must not survive on a paid response"
+    );
+
+    let receipt_raw = resp
+        .headers()
+        .get("payment-receipt")
+        .expect("Payment-Receipt on the paid 200")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let receipt_bytes = URL_SAFE_NO_PAD
+        .decode(&receipt_raw)
+        .expect("Payment-Receipt is base64url-nopad");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_bytes).expect("receipt JSON");
+    assert_eq!(receipt["method"], "cashu");
+    assert_eq!(receipt["status"], "success");
+    assert_eq!(
+        receipt["challengeId"], params.id,
+        "the receipt echoes the issued challenge id"
+    );
+    assert_eq!(
+        receipt["reference"].as_str().unwrap().len(),
+        64,
+        "reference is the 64-hex token_hash"
+    );
+    assert!(receipt["timestamp"].is_string());
+
+    let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    assert_eq!(&body[..], b"PAID-CONTENT");
+}
+
 // (c) MintUnreachable → 503, no persist, not forwarded.
 #[tokio::test]
 async fn mint_unreachable_returns_503_no_persist_no_forward() {
@@ -530,6 +632,11 @@ async fn upstream_down_still_persists_proofs() {
         resp.status() == StatusCode::BAD_GATEWAY || resp.status() == StatusCode::GATEWAY_TIMEOUT,
         "expected 502/504 on dead upstream, got {}",
         resp.status()
+    );
+    // A paid-but-failed response is an ERROR response: no receipt rides it.
+    assert!(
+        resp.headers().get("payment-receipt").is_none(),
+        "no Payment-Receipt on a post-charge error response"
     );
     // The swap DID run (we charged) ...
     assert_eq!(swap_calls.load(Ordering::SeqCst), 1, "charge executed");
@@ -743,6 +850,9 @@ async fn gateway_emits_the_shared_problem_mapping_for_every_charge_error() {
             got: "https://evil.example".into(),
             allowed: vec!["https://mint-a.example.com".into()],
         },
+        || ChargeError::MintUrlUserinfo {
+            url: "https://user@mint-a.example.com".into(),
+        },
         || ChargeError::MultiMintOrUnit,
         || ChargeError::LockedToken,
         || ChargeError::FeeTooHigh {
@@ -753,6 +863,7 @@ async fn gateway_emits_the_shared_problem_mapping_for_every_charge_error() {
             short_id: "00aabbccddeeff00".into(),
         },
         || ChargeError::DoubleSpend,
+        || ChargeError::SwapRejected("mint said no".into()),
         || ChargeError::Expired,
         || ChargeError::ChallengeExpired,
         || ChargeError::InvalidChallenge,

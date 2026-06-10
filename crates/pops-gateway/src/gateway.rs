@@ -21,7 +21,9 @@ use pops_core_verify::cashu_credential::{charge_requirement_from_cashu, CashuCre
 use pops_core_verify::cdk_mint_client::CdkMintClient;
 use pops_core_verify::challenge::encode_charge_request;
 use pops_core_verify::http_status::charge_error_status;
-use pops_core_verify::middleware::count_payment_credentials;
+use pops_core_verify::middleware::{
+    count_payment_credentials, payment_receipt_header, PAYMENT_RECEIPT_HEADER,
+};
 use pops_core_verify::problem::{Problem, PROBLEM_JSON};
 use pops_core_verify::redeemer::Redeemer;
 use pops_core_verify::envelope::{
@@ -220,8 +222,32 @@ where
         "charge settled and persisted; forwarding upstream"
     );
 
+    // The receipt facts (shared builder with the core middleware): the
+    // redeemed token_hash + the echoed challenge id; `externalId` is the
+    // requirement's correlation id when configured.
+    let receipt_header = payment_receipt_header(
+        &redeemed,
+        &credentials.challenge.id,
+        state.config.requirement.payment_id.as_deref(),
+    );
+
     // Forward the already-buffered body (no read can fail after the charge).
-    forward_buffered(&state, parts, body_bytes).await
+    let mut response = forward_buffered(&state, parts, body_bytes).await;
+
+    // Spec receipt §: `Payment-Receipt` + `Cache-Control: private` ride the
+    // paid SUCCESS response only (never an error response), and `private`
+    // OVERRIDES whatever Cache-Control the upstream sent — a paid response
+    // must never be shared-cacheable.
+    if response.status().is_success() {
+        if let Ok(value) = HeaderValue::from_str(&receipt_header) {
+            response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, value);
+        }
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private"),
+        );
+    }
+    response
 }
 
 /// Forward a PUBLIC request (no gate, no persist). The body cap is the primary

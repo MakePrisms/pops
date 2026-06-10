@@ -57,7 +57,8 @@ pub struct ChargeRequirement {
 pub struct Redeemed {
     /// Unit of the redeemed value (echoes the requirement's `unit`).
     pub unit: String,
-    /// Net value the operator received (the requested `amount`).
+    /// Net value the operator received: at least the requirement's `amount`
+    /// (excess presented value is retained, so this MAY exceed it).
     pub amount: u64,
     /// The cross-slice redeemed-proofs payload (fresh proofs, active keyset,
     /// token hash) — `crate::charge::RedeemedProofs`.

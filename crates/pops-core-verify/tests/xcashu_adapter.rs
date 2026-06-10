@@ -40,8 +40,8 @@ enum SwapResponse {
     Echo,
     /// DETERMINATE unreachable: the token was NOT consumed.
     Unreachable,
-    /// Mint refused the swap (double-spent / expired).
-    RejectedSwap,
+    /// Mint typed the rejection as already-spent (the double-spend case).
+    AlreadySpent,
     /// Swap SUCCEEDS (consumes the token) but the returned signatures fail
     /// the NUT-12 verdict → serve-and-flag (`dleq_ok: false`).
     DleqInvalid,
@@ -89,8 +89,8 @@ impl MintClient for MockMintClient {
             SwapResponse::Unreachable => {
                 Err(MintClientError::Unreachable("mock unreachable".into()))
             }
-            SwapResponse::RejectedSwap => {
-                Err(MintClientError::RejectedSwap("mock rejected".into()))
+            SwapResponse::AlreadySpent => {
+                Err(MintClientError::AlreadySpent("mock already spent".into()))
             }
             SwapResponse::DleqInvalid => {
                 // The swap itself SUCCEEDED — the token is consumed.
@@ -356,7 +356,7 @@ async fn dleq_failure_serves_resource_and_flags_redeemed_extension() {
 #[tokio::test]
 async fn double_spend_is_rejected_and_resource_not_served() {
     let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
-    let (app, _swaps) = router_for(SwapResponse::RejectedSwap);
+    let (app, _swaps) = router_for(SwapResponse::AlreadySpent);
     let response = app
         .oneshot(request_with_xcashu(&token.to_string()))
         .await

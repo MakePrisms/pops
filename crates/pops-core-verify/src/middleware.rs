@@ -218,21 +218,25 @@ where
     req.extensions_mut().insert(redeemed);
     let mut response = next.run(req).await;
 
-    // `Payment-Receipt` + `Cache-Control: private` ride the settled response.
+    // `Payment-Receipt` + `Cache-Control: private` ride the settled SUCCESS
+    // response only — the spec's receipt § forbids the receipt on error
+    // responses (a downstream 4xx/5xx after settlement carries neither).
     // `from_str`/`from_static` are guarded: a header that won't build is dropped
     // rather than failing the served route.
-    if let Ok(value) = HeaderValue::from_str(&receipt_header) {
-        response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, value);
+    if response.status().is_success() {
+        if let Ok(value) = HeaderValue::from_str(&receipt_header) {
+            response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, value);
+        }
+        response.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("private"),
+        );
     }
-    response.headers_mut().insert(
-        http::header::CACHE_CONTROL,
-        HeaderValue::from_static("private"),
-    );
     response
 }
 
 /// The `Payment-Receipt` response-header name.
-const PAYMENT_RECEIPT_HEADER: http::header::HeaderName =
+pub const PAYMENT_RECEIPT_HEADER: http::header::HeaderName =
     http::header::HeaderName::from_static("payment-receipt");
 
 /// Count the `Authorization` values whose scheme token is `Payment` —
@@ -267,10 +271,13 @@ struct PaymentReceipt<'a> {
     external_id: Option<&'a str>,
 }
 
-/// Build the `Payment-Receipt` header value: base64url-nopad over the receipt
-/// JSON. `challenge_id` echoes the credential's challenge `id`; `external_id`
-/// rides the receipt iff the issuance carried a correlation id.
-fn payment_receipt_header(
+/// Build the `Payment-Receipt` header value: base64url-nopad over the
+/// JCS-canonical (RFC 8785) receipt JSON, per the spec's Encoding § (the same
+/// canonicalization the request object and credential blob use). `challenge_id`
+/// echoes the credential's challenge `id`; `external_id` rides the receipt iff
+/// the issuance carried a correlation id. Shared by both Rust hosts (this
+/// middleware and `pops-gateway`).
+pub fn payment_receipt_header(
     redeemed: &Redeemed,
     challenge_id: &str,
     external_id: Option<&str>,
@@ -283,7 +290,7 @@ fn payment_receipt_header(
         timestamp: Utc::now().to_rfc3339(),
         external_id,
     };
-    let json = serde_json::to_string(&receipt).expect("PaymentReceipt always serializes");
+    let json = serde_jcs::to_string(&receipt).expect("PaymentReceipt always serializes");
     URL_SAFE_NO_PAD.encode(json.as_bytes())
 }
 
@@ -448,6 +455,9 @@ mod tests {
         /// Post-submit (indeterminate) failure → exercises the 503 mapping.
         UnreachableIndeterminate,
         RejectedSwap,
+        /// The mint typed the rejection as already-spent → exercises the
+        /// double-spend detail.
+        AlreadySpent,
         /// Keyset-class rejection (retired / final_expiry passed) → exercises
         /// the payment-expired mapping.
         KeysetRetiredOrExpired,
@@ -493,6 +503,9 @@ mod tests {
                 ),
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
+                }
+                SwapResponse::AlreadySpent => {
+                    Err(MintClientError::AlreadySpent("mock already spent".into()))
                 }
                 SwapResponse::KeysetRetiredOrExpired => Err(
                     MintClientError::KeysetRetiredOrExpired("mock keyset retired".into()),
@@ -1188,13 +1201,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_rejected_returns_402() {
-        // A non-keyset swap rejection is the spec's step-9 else-branch →
-        // verification-failed 402 + re-challenge.
+    async fn mint_rejected_returns_402_with_neutral_detail() {
+        // A non-keyset swap rejection the mint did NOT type as already-spent is
+        // the spec's step-9 else-branch → verification-failed 402 with a
+        // neutral detail (no double-spend claim the mint never made).
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
         let app = router_with(state_with(SwapResponse::RejectedSwap));
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        assert!(
+            body.contains("the mint rejected the swap"),
+            "expected the neutral rejected-swap detail, got: {body}"
+        );
+        assert!(
+            !body.contains("double-spend"),
+            "an untyped rejection must not claim a double-spend, got: {body}"
+        );
+        assert!(
+            body.contains("https://paymentauth.org/problems/verification-failed"),
+            "a swap rejection answers with the verification-failed type, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_spent_rejection_returns_402_with_double_spend_detail() {
+        // The mint typed the rejection as already-spent (NUT 11001 /
+        // cdk TokenAlreadySpent) → the spent-specific detail; same
+        // verification-failed 402.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let encoded = token.to_string();
+
+        let app = router_with(state_with(SwapResponse::AlreadySpent));
         let request = request_with_token(&app, &encoded).await;
         let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
@@ -1208,7 +1252,7 @@ mod tests {
         );
         assert!(
             body.contains("https://paymentauth.org/problems/verification-failed"),
-            "a swap rejection answers with the verification-failed type, got: {body}"
+            "an already-spent rejection answers with the verification-failed type, got: {body}"
         );
     }
 
@@ -1664,5 +1708,56 @@ mod tests {
             problem["type"], "about:blank",
             "mint unreachability has no custom problem-type URI"
         );
+    }
+
+    // ---- Payment-Receipt encoding (spec Encoding §: JCS before base64url) --
+
+    #[test]
+    fn payment_receipt_bytes_are_jcs_canonical() {
+        // Hand-derived from RFC 8785: keys sort lexicographically —
+        // challengeId < externalId < method < reference < status < timestamp —
+        // matching the spec's decoded receipt example, NOT the struct's
+        // declaration order.
+        let receipt = PaymentReceipt {
+            method: CASHU_METHOD,
+            challenge_id: "kM9xPqWvT2nJrHsY4aDfEb",
+            reference: "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7",
+            status: "success",
+            timestamp: "2026-03-10T21:00:00Z".to_string(),
+            external_id: Some("order_12345"),
+        };
+        let json = serde_jcs::to_string(&receipt).expect("receipt serializes");
+        assert_eq!(
+            json,
+            r#"{"challengeId":"kM9xPqWvT2nJrHsY4aDfEb","externalId":"order_12345","method":"cashu","reference":"9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7","status":"success","timestamp":"2026-03-10T21:00:00Z"}"#
+        );
+    }
+
+    #[test]
+    fn payment_receipt_header_is_base64url_nopad_of_jcs_bytes() {
+        let redeemed = Redeemed {
+            unit: "pop_1700000000".into(),
+            amount: 10,
+            proofs: crate::charge::RedeemedProofs {
+                fresh_proofs: "cashuBfresh".into(),
+                amount: 10,
+                unit: "pop_1700000000".into(),
+                active_keyset_id: "009a1f293253e41e".into(),
+                token_hash: "ref-hash".into(),
+            },
+            dleq_ok: true,
+        };
+        let header = payment_receipt_header(&redeemed, "ch-1", Some("inv-7"));
+        let bytes = URL_SAFE_NO_PAD.decode(&header).expect("base64url-nopad");
+        let json = std::str::from_utf8(&bytes).expect("utf8");
+        // The timestamp is stamped at build time; everything around it is the
+        // pinned JCS order with the supplied facts.
+        assert!(
+            json.starts_with(
+                r#"{"challengeId":"ch-1","externalId":"inv-7","method":"cashu","reference":"ref-hash","status":"success","timestamp":""#
+            ),
+            "receipt bytes must be JCS-ordered, got: {json}"
+        );
+        assert!(json.ends_with(r#""}"#), "got: {json}");
     }
 }

@@ -92,16 +92,19 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
 
         // Non-amount, non-expiry verification failures, per the spec's Errors §
         // list: unit mismatch (declared OR resolved-keyset, step 7), disallowed
-        // mint, NUT-10 lock, unresolvable short keyset id, swap rejection
-        // (double-spend, step 9), and the policy-disallowed fee-bearing keyset
-        // ("unit otherwise disallowed by server policy"). A swap-output DLEQ
-        // failure is deliberately NOT here — see the map tests: it is no
-        // ChargeError at all.
+        // mint, a userinfo-bearing mint URL (mint-trust §), NUT-10 lock,
+        // unresolvable short keyset id, swap rejection (typed already-spent or
+        // the neutral else-branch, step 9), and the policy-disallowed
+        // fee-bearing keyset ("unit otherwise disallowed by server policy"). A
+        // swap-output DLEQ failure is deliberately NOT here — see the map
+        // tests: it is no ChargeError at all.
         ChargeError::WrongUnit { .. }
         | ChargeError::MintNotAllowed { .. }
+        | ChargeError::MintUrlUserinfo { .. }
         | ChargeError::LockedToken
         | ChargeError::ShortKeysetIdUnresolved { .. }
         | ChargeError::DoubleSpend
+        | ChargeError::SwapRejected(_)
         | ChargeError::FeeTooHigh { .. } => framework(
             "verification-failed",
             "https://paymentauth.org/problems/verification-failed",
@@ -278,11 +281,15 @@ mod tests {
                 got: "https://evil.example".into(),
                 allowed: vec!["https://m.example".into()],
             },
+            ChargeError::MintUrlUserinfo {
+                url: "https://user@mint.example".into(),
+            },
             ChargeError::LockedToken,
             ChargeError::ShortKeysetIdUnresolved {
                 short_id: "00aabbccddeeff00".into(),
             },
             ChargeError::DoubleSpend,
+            ChargeError::SwapRejected("mint said no".into()),
             ChargeError::FeeTooHigh {
                 keyset_id: "009a1f293253e41e".into(),
                 input_fee_ppk: 100,

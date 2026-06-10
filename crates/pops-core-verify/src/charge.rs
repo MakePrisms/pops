@@ -78,6 +78,16 @@ pub enum ChargeError {
         allowed: Vec<String>,
     },
 
+    /// Token's mint URL carries userinfo (`user@host`) — rejected outright per
+    /// the spec's mint-trust §, before any membership comparison.
+    ///
+    /// HTTP 402 · `verification-failed` · terminal.
+    #[error("mint URL rejected: userinfo (user@host) is not allowed in a mint URL: {url}")]
+    MintUrlUserinfo {
+        /// The offending mint URL.
+        url: String,
+    },
+
     /// The keyset charges a swap fee this server's fee-free profile disallows
     /// (`input_fee_ppk` over the supported maximum of 0). A policy-disallowed
     /// unit per the spec's Errors §, NOT a double-spend.
@@ -117,11 +127,20 @@ pub enum ChargeError {
         short_id: String,
     },
 
-    /// Swap rejected because a proof was already spent (double-spend / replay).
+    /// Swap rejected because a proof was already spent (double-spend / replay)
+    /// — only when the mint TYPED the rejection as already-spent (NUT 11001).
     ///
     /// HTTP 402 · `verification-failed` · terminal.
     #[error("double-spend: a proof in the token is already spent")]
     DoubleSpend,
+
+    /// Swap rejected by the mint for a reason it did not type as already-spent
+    /// or keyset-class (bad signature, unbalanced, …). The neutral detail never
+    /// claims a double-spend the mint never asserted.
+    ///
+    /// HTTP 402 · `verification-failed` · terminal.
+    #[error("the mint rejected the swap: {0}")]
+    SwapRejected(String),
 
     /// Swap rejected because the keyset retired or its `final_expiry` (NUT-02)
     /// passed — distinct from double-spend. For `pop_<ts>` this is where the CLTV

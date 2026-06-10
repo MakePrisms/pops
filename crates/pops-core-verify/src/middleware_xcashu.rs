@@ -225,6 +225,8 @@ mod tests {
         Unreachable,
         UnreachableIndeterminate,
         RejectedSwap,
+        /// The mint typed the rejection as already-spent.
+        AlreadySpent,
         /// Swap-output DLEQ verdict failed → serve-and-flag path: the swap
         /// SUCCEEDED, the response is the success path, `dleq_ok` is false.
         DleqInvalid,
@@ -264,6 +266,9 @@ mod tests {
                 ),
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
+                }
+                SwapResponse::AlreadySpent => {
+                    Err(MintClientError::AlreadySpent("mock already spent".into()))
                 }
                 SwapResponse::DleqInvalid => Ok(SwapOutcome {
                     proofs,
@@ -532,7 +537,24 @@ mod tests {
 
     #[tokio::test]
     async fn double_spend_returns_402_and_does_not_serve() {
-        // A rejected swap (double-spend / expired) → 402 re-challenge.
+        // A mint-typed already-spent rejection → 402 re-challenge with the
+        // spent-specific detail.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::AlreadySpent));
+        let response = app
+            .oneshot(request_with_xcashu(&token.to_string()))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = body_string(response).await;
+        assert!(!body.starts_with("ok:"), "resource must NOT be served");
+        assert!(body.contains("double-spend"), "expected double-spend body, got: {body}");
+    }
+
+    #[tokio::test]
+    async fn untyped_rejection_returns_402_with_neutral_detail() {
+        // A rejection the mint did NOT type as already-spent → the neutral
+        // rejected-swap detail; same 402 re-challenge.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let app = router_with(state_with(SwapResponse::RejectedSwap));
         let response = app
@@ -542,7 +564,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body = body_string(response).await;
         assert!(!body.starts_with("ok:"), "resource must NOT be served");
-        assert!(body.contains("double-spend"), "expected double-spend body, got: {body}");
+        assert!(
+            body.contains("the mint rejected the swap"),
+            "expected the neutral detail, got: {body}"
+        );
+        assert!(
+            !body.contains("double-spend"),
+            "must not claim a double-spend, got: {body}"
+        );
     }
 
     // ---- Mint-unreachable → 503, token NOT consumed ------------------

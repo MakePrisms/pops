@@ -195,6 +195,18 @@ pub fn decode_charge_request(b64: &str) -> Result<DecodedChargeRequest, Error> {
     })
 }
 
+/// Whether a mint URL carries RFC 3986 userinfo (`user@host`): an `@` inside
+/// the authority component (between the scheme's `://` and the first `/`, `?`,
+/// or `#`). The spec's mint-trust § rejects such a URL outright — token-side as
+/// a verification failure, operator-side as a config error.
+pub fn mint_url_has_userinfo(url: &str) -> bool {
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    after_scheme[..end].contains('@')
+}
+
 /// Decode the `cashuB…` token the client returns on retry.
 ///
 /// CONTRACT: cashuB / TokenV4 ONLY. A `cashuA…` (TokenV3) is REJECTED at the
@@ -235,6 +247,26 @@ mod tests {
             payment_id: Some("pop-test-id".to_string()),
             description: Some("test challenge".to_string()),
             single_use: true,
+        }
+    }
+
+    #[test]
+    fn mint_url_userinfo_detection_is_scoped_to_the_authority() {
+        for url in [
+            "https://user@mint.example.com",
+            "https://user:pw@mint.example.com:3338/path",
+            "http://a@b",
+        ] {
+            assert!(mint_url_has_userinfo(url), "{url} carries userinfo");
+        }
+        for url in [
+            "https://mint.example.com",
+            "https://mint.example.com:3338/path",
+            // `@` outside the authority is NOT userinfo.
+            "https://mint.example.com/path@segment",
+            "https://mint.example.com/?q=a@b",
+        ] {
+            assert!(!mint_url_has_userinfo(url), "{url} carries no userinfo");
         }
     }
 

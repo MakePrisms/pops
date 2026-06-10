@@ -373,6 +373,58 @@ async fn success_emits_payment_receipt_and_cache_control_private() {
     assert_eq!(&body[..], b"ok:100");
 }
 
+#[tokio::test]
+async fn downstream_error_after_settlement_carries_no_receipt() {
+    // Spec receipt §: the receipt rides the 200 and MUST NOT appear on error
+    // responses — a handler that 500s after a successful redeem answers
+    // without `Payment-Receipt` (and without the receipt's
+    // `Cache-Control: private`).
+    use axum::response::IntoResponse;
+    async fn failing(Extension(_redeemed): Extension<Redeemed>) -> axum::response::Response {
+        (StatusCode::INTERNAL_SERVER_ERROR, "downstream boom").into_response()
+    }
+    let state = ChargeMiddlewareState::new(
+        requirement(),
+        CannedRedeemer {
+            outcome: Outcome::Ok {
+                amount: 100,
+                unit: "pop_1782668279".to_string(),
+            },
+        },
+    );
+    let app = Router::new()
+        .route("/gated", get(failing))
+        .layer(from_fn_with_state(
+            Arc::new(state),
+            require_charge::<CannedRedeemer>,
+        ));
+
+    let params = fetch_challenge(&app).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/gated")
+                .header(AUTHORIZATION, auth_header_for(&params, "cashuBany"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        resp.headers().get("payment-receipt").is_none(),
+        "no Payment-Receipt on an error response"
+    );
+    assert_ne!(
+        resp.headers()
+            .get(http::header::CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap_or_default()),
+        Some("private"),
+        "the receipt's Cache-Control: private must not ride an error response"
+    );
+}
+
 // ─────────────────── challenge.expires in the past (D-6) ──────────────────────
 
 #[tokio::test]
@@ -539,6 +591,9 @@ fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
             got: "https://evil.example".into(),
             allowed: vec!["https://mint.example".into()],
         },
+        || ChargeError::MintUrlUserinfo {
+            url: "https://user@mint.example".into(),
+        },
         || ChargeError::MultiMintOrUnit,
         || ChargeError::LockedToken,
         || ChargeError::FeeTooHigh {
@@ -549,6 +604,7 @@ fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
             short_id: "00aabbccddeeff00".into(),
         },
         || ChargeError::DoubleSpend,
+        || ChargeError::SwapRejected("mint said no".into()),
         || ChargeError::Expired,
         || ChargeError::ChallengeExpired,
         || ChargeError::InvalidChallenge,
@@ -608,6 +664,13 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
             402,
         ),
         (
+            || ChargeError::MintUrlUserinfo {
+                url: "https://user@mint.example".into(),
+            },
+            "https://paymentauth.org/problems/verification-failed",
+            402,
+        ),
+        (
             || ChargeError::MultiMintOrUnit,
             "https://paymentauth.org/problems/malformed-credential",
             402,
@@ -634,6 +697,11 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
         ),
         (
             || ChargeError::DoubleSpend,
+            "https://paymentauth.org/problems/verification-failed",
+            402,
+        ),
+        (
+            || ChargeError::SwapRejected("mint said no".into()),
             "https://paymentauth.org/problems/verification-failed",
             402,
         ),
