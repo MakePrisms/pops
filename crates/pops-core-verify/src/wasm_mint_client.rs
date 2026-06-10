@@ -19,6 +19,13 @@
 //! [`MintClientError::Unreachable`] (retryable); a 4xx (the mint refused) is
 //! [`MintClientError::RejectedSwap`]. A 2xx whose body fails to deserialize is
 //! a definitive `RejectedSwap` (the mint answered with something we can't use).
+//!
+//! Unlike [`CdkMintClient`][crate::cdk_mint_client::CdkMintClient], this
+//! client does not parse NUT error codes out of rejection bodies: a swap the
+//! mint refused for keyset retirement or expiry surfaces as `RejectedSwap`
+//! and therefore `verification-failed`, where the native host answers
+//! `payment-expired` — wasm consumers do not receive the spec's
+//! re-present-once signal for that case.
 
 use async_trait::async_trait;
 use cashu::nuts::nut02::{Id, KeySet, KeySetInfo, KeysetResponse};

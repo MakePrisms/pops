@@ -149,6 +149,10 @@ The same crate that parses the credential exposes the inverse builders:
   `parse_payment_credential(authorization)` to parse a credential, and the
   full `verify_and_redeem(token, requirement_json)` for the server side. (See
   [`crates/pops-core-verify/src/wasm.rs`](../crates/pops-core-verify/src/wasm.rs).)
+  One divergence from the native hosts: the wasm mint client does not parse
+  NUT error codes, so a swap the mint rejected for keyset retirement or
+  expiry answers `verification-failed` rather than `payment-expired` (the
+  client gets no re-present-once signal on that path).
 - **Native (Rust):** `encode_payment_credentials(&PaymentCredentials)` —
   returns the same bare blob; prepend `Payment `. The inverse is
   `parse_payment_authorization(header_value)`; the request object codec is
