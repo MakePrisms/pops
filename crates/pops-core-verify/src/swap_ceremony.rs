@@ -758,6 +758,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_keyset_unknown_at_mint_rejects_before_any_swap_post() {
+        // Inputs on a keyset the mint's published list does not contain: the
+        // ceremony's pre-POST resolution rejects as a definitive RejectedSwap
+        // (the validator's verification-failed family — the keyset cannot be
+        // resolved, so neither its unit nor its fee is checkable) and the swap
+        // POST is never reached. The wrapper fails post_swap with Unreachable,
+        // which the ceremony would re-tag indeterminate — so the RejectedSwap
+        // assertion below doubles as proof the POST was never attempted.
+        let inner = MockMint::new(DleqMode::Valid);
+        let foreign_id = {
+            let mut bytes = [0u8; 32];
+            bytes[31] = 0x42;
+            let k = SecretKey::from_slice(&bytes).expect("non-zero scalar");
+            let keys = Keys::new([(Amount::from(1u64), k.public_key())].into_iter().collect());
+            Id::v1_from_keys(&keys)
+        };
+        assert_ne!(foreign_id, inner.keyset_id(), "the input id must be foreign");
+        let proofs = vec![input_proof(8, 0, foreign_id), input_proof(2, 1, foreign_id)];
+        let mint = TransportFailMint {
+            inner,
+            fail_on_post_swap: true,
+            fail_on_keysets: false,
+        };
+
+        let err = swap_to_redeem(&mint, &mint_url(), proofs)
+            .await
+            .expect_err("an unknown input keyset must be rejected");
+        match err {
+            MintClientError::RejectedSwap(msg) => {
+                assert!(
+                    msg.contains("unknown at mint"),
+                    "the rejection must name the unresolvable input keyset, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&foreign_id.to_string()),
+                    "the rejection must name the offending keyset id, got: {msg}"
+                );
+            }
+            other => panic!("expected a pre-POST RejectedSwap, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn swap_one_missing_dleq_in_batch_flags_whole_outcome() {
         // A valid batch with a SINGLE unsigned output smuggled in: the verdict
         // covers the WHOLE batch (one unproven signature ⇒ dleq_ok false), but

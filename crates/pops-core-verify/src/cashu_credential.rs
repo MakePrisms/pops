@@ -121,10 +121,17 @@ pub enum ValidationError {
         got: Amount,
     },
 
-    /// Mint accepted the call but rejected the proofs (expired, double-spent,
-    /// bad signature, keyset rotated, etc.).
+    /// Mint accepted the call but rejected the proofs (double-spent, bad
+    /// signature, etc.) — every rejection EXCEPT the keyset-retirement family.
     #[error("mint rejected swap: {0}")]
     MintRejectedSwap(String),
+
+    /// Mint rejected the call with a keyset-class error: the keyset has
+    /// retired or its `final_expiry` has passed (spec verification step 9 —
+    /// a `payment-expired` condition, never `verification-failed`). The token
+    /// was NOT consumed.
+    #[error("mint rejected swap (keyset retired or final_expiry passed): {0}")]
+    KeysetRetiredOrExpired(String),
 
     /// The keyset charges an `input_fee_ppk` the fee-free profile disallows —
     /// a policy reject raised before the swap (token NOT consumed), kept
@@ -271,6 +278,9 @@ impl<M: MintClient> ChargeValidator<M> {
                     ValidationError::MintUnreachable(msg)
                 }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
+                MintClientError::KeysetRetiredOrExpired(msg) => {
+                    ValidationError::KeysetRetiredOrExpired(msg)
+                }
                 MintClientError::FeeTooHigh {
                     keyset_id,
                     input_fee_ppk,
@@ -355,6 +365,12 @@ impl<M: MintClient> ChargeValidator<M> {
                     ValidationError::MintUnreachableIndeterminate(msg)
                 }
                 MintClientError::RejectedSwap(msg) => ValidationError::MintRejectedSwap(msg),
+                // Spec step 9 split: a keyset-retirement/final_expiry rejection
+                // is payment-expired, kept apart from the verification-failed
+                // catch-all above.
+                MintClientError::KeysetRetiredOrExpired(msg) => {
+                    ValidationError::KeysetRetiredOrExpired(msg)
+                }
                 // A fee-policy reject (raised pre-submit inside the ceremony)
                 // keeps its own arm so it never reads as a double-spend.
                 MintClientError::FeeTooHigh {
@@ -482,9 +498,11 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
         ValidationError::MalformedToken(msg) => {
             ChargeError::MalformedCredential(format!("malformed token: {msg}"))
         }
-        // Both swap-rejections (expired credential OR double-spent proof)
-        // currently surface as DoubleSpend=402. Splitting out an Expired arm
-        // needs the mint's NUT-03 error-body parse, which is not yet done.
+        // Spec step 9: a swap rejected for keyset retirement or passed
+        // `final_expiry` (the mint's NUT keyset-error codes, classified by the
+        // mint client) is payment-expired; every OTHER rejection — already
+        // spent included — is the else-branch verification-failed condition.
+        ValidationError::KeysetRetiredOrExpired(_) => ChargeError::Expired,
         ValidationError::MintRejectedSwap(_) => ChargeError::DoubleSpend,
         ValidationError::FeeTooHigh {
             keyset_id,
@@ -630,6 +648,9 @@ mod tests {
         Unreachable,
         UnreachableIndeterminate,
         RejectedSwap,
+        /// The keyset-class rejection (retired / final_expiry passed) — the
+        /// spec's payment-expired swap outcome.
+        KeysetRetiredOrExpired,
         DleqInvalid,
         /// The ceremony's pre-submit fee-policy reject (fee-bearing keyset).
         FeeTooHigh,
@@ -720,6 +741,9 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
+                SwapResponse::KeysetRetiredOrExpired => Err(
+                    MintClientError::KeysetRetiredOrExpired("mock keyset retired".into()),
+                ),
                 // The ceremony's serve-and-flag contract: a DLEQ failure on the
                 // swap-returned signatures still redeems (spec §security-dleq).
                 SwapResponse::DleqInvalid => Ok(SwapOutcome {
@@ -1046,6 +1070,32 @@ mod tests {
             counters.swap.load(Ordering::SeqCst),
             1,
             "swap must be called once before rejection surfaces"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_propagates_keyset_retired_swap_rejection_distinctly() {
+        // Spec step 9: a swap rejected for keyset retirement / final_expiry
+        // surfaces as its own arm, never collapsed into MintRejectedSwap.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) =
+            MockMintClient::with_swap(SwapResponse::KeysetRetiredOrExpired);
+        let validator = ChargeValidator::new(mock);
+
+        let err = validator
+            .validate(&token, &req)
+            .await
+            .expect_err("a keyset-class rejection must fail");
+        assert!(
+            matches!(err, ValidationError::KeysetRetiredOrExpired(_)),
+            "expected KeysetRetiredOrExpired, got {err:?}"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            1,
+            "swap must be called once before the rejection surfaces"
         );
     }
 
@@ -1574,7 +1624,8 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_redeem_maps_rejected_swap_to_double_spend() {
-        // Any swap rejection collapses to DoubleSpend (see `map_validation_error`).
+        // Every NON-keyset swap rejection collapses to DoubleSpend →
+        // verification-failed (the spec's step-9 else-branch).
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)])
             .to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
@@ -1589,6 +1640,28 @@ mod tests {
         assert!(
             matches!(err, ChargeError::DoubleSpend),
             "expected DoubleSpend, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_maps_keyset_retired_rejection_to_expired() {
+        // Spec step 9 + Keyset Rotation §: a swap rejected because the keyset
+        // retired or its final_expiry passed maps to Expired → payment-expired
+        // 402, distinct from the double-spend verification-failed family.
+        let presented =
+            make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::KeysetRetiredOrExpired);
+        let cred = CashuCredential::new(mock);
+
+        let err = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect_err("a keyset-class rejection must map to Expired");
+        assert!(
+            matches!(err, ChargeError::Expired),
+            "expected Expired (payment-expired), got {err:?}"
         );
     }
 

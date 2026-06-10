@@ -53,6 +53,9 @@ enum SwapResponse {
     Echo,
     /// Transport failure → ChargeError::MintUnreachable.
     Unreachable,
+    /// Success whose swap-output DLEQ verdict failed — the serve-and-flag
+    /// path; the settle log must carry `dleq_ok=false`.
+    DleqInvalid,
 }
 
 struct MockMintClient {
@@ -93,6 +96,10 @@ impl MintClient for MockMintClient {
             SwapResponse::Unreachable => {
                 Err(MintClientError::Unreachable("mock unreachable".into()))
             }
+            SwapResponse::DleqInvalid => Ok(SwapOutcome {
+                proofs,
+                dleq_ok: false,
+            }),
         }
     }
 }
@@ -1066,4 +1073,115 @@ async fn body_at_cap_forwards_normally() {
         "a body at the cap is allowed"
     );
     assert_eq!(up_hits.load(Ordering::SeqCst), 1, "forwarded to upstream");
+}
+
+// ─────────────── The settle log carries the DLEQ verdict ────────────────────
+
+/// A minimal subscriber capturing INFO-and-above events as `field=value`
+/// strings, so the test can assert the gateway's settle line without pulling
+/// in a subscriber crate.
+struct InfoCapture {
+    events: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl tracing::Subscriber for InfoCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Collect(String);
+        impl tracing::field::Visit for Collect {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                use std::fmt::Write;
+                let _ = write!(self.0, "{}={:?} ", field.name(), value);
+            }
+        }
+        let mut collected = Collect(String::new());
+        event.record(&mut collected);
+        self.events.lock().expect("capture lock").push(collected.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[tokio::test]
+async fn settle_log_carries_dleq_ok_verdict() {
+    // §security-dleq serve-and-flag at the gateway: a swap whose returned
+    // signatures failed DLEQ still settles (200, persisted, forwarded), and
+    // the operator-facing settle line carries `dleq_ok=false` so the incident
+    // is visible. The settle line is the gateway's ONLY dleq_ok surface.
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(InfoCapture {
+        events: events.clone(),
+    });
+
+    let settled_with = |events: &Arc<std::sync::Mutex<Vec<String>>>, verdict: &str| {
+        events
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .any(|e| e.contains("charge settled") && e.contains(verdict))
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    // tracing caches per-callsite interest globally; a parallel test's cold
+    // hit on the settle callsite can cache `never` before this thread's
+    // dispatcher registers. Rebuild + retry bounds that race out without
+    // weakening the assertion.
+    for attempt in 0..5 {
+        tracing::callsite::rebuild_interest_cache();
+
+        let sink = dir.path().join(format!("proofs-{attempt}.jsonl"));
+        let (upstream, _hits) = spawn_upstream("GATED OK").await;
+        let (app, _swaps) = gateway(&upstream, &sink, SwapResponse::DleqInvalid, vec![]);
+
+        let header = paid_header(&app, &valid_token_string()).await;
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header(AUTHORIZATION, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a failed swap-output DLEQ verdict still settles and serves"
+        );
+        assert_eq!(
+            read_lines(&sink).len(),
+            1,
+            "the redeemed value is persisted despite the failed verdict"
+        );
+
+        if settled_with(&events, "dleq_ok=false") {
+            break;
+        }
+    }
+
+    let captured = events.lock().expect("capture lock");
+    let settle_line = captured
+        .iter()
+        .find(|e| e.contains("charge settled"))
+        .unwrap_or_else(|| panic!("no settle line captured, got: {captured:?}"));
+    assert!(
+        settle_line.contains("dleq_ok=false"),
+        "the settle line must carry the DLEQ verdict, got: {settle_line}"
+    );
+    assert!(
+        settle_line.contains("token_hash="),
+        "the settle line correlates by token_hash, got: {settle_line}"
+    );
 }

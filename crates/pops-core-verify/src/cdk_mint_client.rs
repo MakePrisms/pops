@@ -108,11 +108,29 @@ impl CdkMintClient {
 }
 
 /// Translate a [`cdk::Error`] into the coarse [`MintClientError`]
-/// the validator understands. Uses `is_definitive_failure` as the
-/// split point (4xx and parse/crypto errors → rejected;
-/// 5xx/timeout/transport → unreachable).
+/// the validator understands.
+///
+/// The keyset-class variants come first: cdk's transport parses the mint's
+/// NUT error body (`{"code", "detail"}`) and maps code 12001
+/// (keyset-not-known) → [`cdk::Error::UnknownKeySet`] and 12002
+/// (keyset-inactive) → [`cdk::Error::InactiveKeyset`];
+/// [`cdk::Error::KeysetUnknown`] is cdk's wallet-local twin of 12001. All
+/// three mean the keyset has retired or its `final_expiry` has passed —
+/// `payment-expired` per `draft-cashu-charge-01` step 9. No registered NUT
+/// error code names `final_expiry` itself, so these keyset codes are the
+/// entire wire signal; a mint rejecting an expired keyset under any other
+/// code stays in the rejected catch-all (the spec's else-branch:
+/// `verification-failed`).
+///
+/// The rest split on `is_definitive_failure` (4xx and parse/crypto errors →
+/// rejected; 5xx/timeout/transport → unreachable).
 fn map_cdk_err(e: cdk::Error) -> MintClientError {
-    if e.is_definitive_failure() {
+    if matches!(
+        e,
+        cdk::Error::UnknownKeySet | cdk::Error::KeysetUnknown(_) | cdk::Error::InactiveKeyset
+    ) {
+        MintClientError::KeysetRetiredOrExpired(e.to_string())
+    } else if e.is_definitive_failure() {
         MintClientError::RejectedSwap(e.to_string())
     } else {
         MintClientError::Unreachable(e.to_string())
@@ -191,8 +209,66 @@ mod tests {
     use cashu::secret::Secret;
     use cashu::{Amount, CurrencyUnit, MintUrl, Proof, PublicKey, SecretKey};
 
-    use super::{CdkMintClient, DEFAULT_MINT_HTTP_TIMEOUT};
+    use super::{map_cdk_err, CdkMintClient, DEFAULT_MINT_HTTP_TIMEOUT};
     use crate::mint_client::{MintClient, MintClientError};
+
+    // ---- the cdk::Error → MintClientError classification --------------------
+    //
+    // What cdk 0.16 exposes for the spec's step-9 split: its transport parses
+    // the mint's NUT error body and surfaces the two REGISTERED keyset codes as
+    // typed variants — 12001 keyset-not-known → `cdk::Error::UnknownKeySet`,
+    // 12002 keyset-inactive → `cdk::Error::InactiveKeyset` (plus the
+    // wallet-local `KeysetUnknown(Id)` twin). There is NO registered NUT error
+    // code for "final_expiry passed" specifically, so those keyset codes are
+    // the entire honest wire signal for "keyset retired or expired"; every
+    // other definitive rejection (already-spent 11001 included) stays in the
+    // `RejectedSwap` catch-all, which the validator maps to the spec's
+    // else-branch `verification-failed`.
+
+    #[test]
+    fn keyset_class_cdk_errors_classify_as_retired_or_expired() {
+        for e in [
+            cdk::Error::UnknownKeySet,
+            cdk::Error::KeysetUnknown(keyset_id()),
+            cdk::Error::InactiveKeyset,
+        ] {
+            let detail = e.to_string();
+            match map_cdk_err(e) {
+                MintClientError::KeysetRetiredOrExpired(msg) => {
+                    assert_eq!(msg, detail, "the cdk detail must be carried through")
+                }
+                other => panic!("expected KeysetRetiredOrExpired, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn already_spent_and_other_definitive_rejections_stay_rejected_swap() {
+        for e in [
+            cdk::Error::TokenAlreadySpent,
+            cdk::Error::TransactionUnbalanced(10, 8, 0),
+            cdk::Error::HttpError(Some(400), "Bad Request".into()),
+        ] {
+            assert!(
+                matches!(map_cdk_err(e), MintClientError::RejectedSwap(_)),
+                "a non-keyset definitive rejection must stay RejectedSwap"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_cdk_errors_stay_unreachable() {
+        for e in [
+            cdk::Error::Timeout,
+            cdk::Error::HttpError(Some(503), "Service Unavailable".into()),
+            cdk::Error::HttpError(None, "connection refused".into()),
+        ] {
+            assert!(
+                matches!(map_cdk_err(e), MintClientError::Unreachable(_)),
+                "an ambiguous transport condition must stay Unreachable"
+            );
+        }
+    }
 
     #[test]
     fn default_timeout_is_ten_seconds() {
@@ -291,9 +367,9 @@ mod tests {
         Id::v1_from_keys(&public_keys())
     }
 
-    /// A real axum mint serving NUT-02 keysets + NUT-01 keys, whose NUT-03
-    /// swap endpoint never responds.
-    async fn hang_on_swap_mint() -> u16 {
+    /// A real axum mint serving NUT-02 keysets + NUT-01 keys, with the supplied
+    /// NUT-03 swap route.
+    async fn mint_with_swap_route(swap_route: axum::routing::MethodRouter) -> u16 {
         let keysets_body = serde_json::to_string(&KeysetResponse {
             keysets: vec![KeySetInfo {
                 id: keyset_id(),
@@ -326,10 +402,7 @@ mod tests {
                 "/v1/keys/:id",
                 get(move || async move { json(keys_body.clone()) }),
             )
-            .route(
-                "/v1/swap",
-                post(|| async { std::future::pending::<String>().await }),
-            );
+            .route("/v1/swap", swap_route);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -339,6 +412,27 @@ mod tests {
             axum::serve(listener, app).await.expect("serve mock mint");
         });
         port
+    }
+
+    /// The mint whose swap endpoint never responds.
+    async fn hang_on_swap_mint() -> u16 {
+        mint_with_swap_route(post(|| async {
+            std::future::pending::<String>().await
+        }))
+        .await
+    }
+
+    /// A mint whose swap endpoint answers HTTP 400 with the given NUT error
+    /// body (`{"code": <u16>, "detail": "…"}`).
+    async fn reject_swap_mint(error_body: &'static str) -> u16 {
+        mint_with_swap_route(post(move || async move {
+            (
+                http::StatusCode::BAD_REQUEST,
+                [(http::header::CONTENT_TYPE, "application/json")],
+                error_body,
+            )
+        }))
+        .await
     }
 
     /// An input proof on the advertised keyset (the C point is arbitrary; the
@@ -376,6 +470,54 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "must give up within the bound plus margin, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn swap_rejected_with_keyset_inactive_code_classifies_as_expired() {
+        // The whole wire path: the mint answers the swap POST with NUT error
+        // code 12002 (keyset-inactive); cdk's transport parses the body into
+        // `InactiveKeyset`, and the client surfaces the payment-expired arm.
+        let port =
+            reject_swap_mint(r#"{"code":12002,"detail":"Keyset is inactive"}"#).await;
+        let client = CdkMintClient::new();
+
+        let err = client
+            .swap(
+                &mint_url_for(port),
+                vec![input_proof(8, 0), input_proof(2, 1)],
+            )
+            .await
+            .expect_err("a 12002-rejected swap must error");
+        match err {
+            MintClientError::KeysetRetiredOrExpired(msg) => {
+                assert!(
+                    msg.contains("Inactive Keyset"),
+                    "cdk's typed detail must surface, got: {msg}"
+                );
+            }
+            other => panic!("expected KeysetRetiredOrExpired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn swap_rejected_with_already_spent_code_stays_rejected_swap() {
+        // NUT error code 11001 (token already spent) is the spec's
+        // verification-failed family — it must NOT classify as expired.
+        let port =
+            reject_swap_mint(r#"{"code":11001,"detail":"Token is already spent"}"#).await;
+        let client = CdkMintClient::new();
+
+        let err = client
+            .swap(
+                &mint_url_for(port),
+                vec![input_proof(8, 0), input_proof(2, 1)],
+            )
+            .await
+            .expect_err("an 11001-rejected swap must error");
+        assert!(
+            matches!(err, MintClientError::RejectedSwap(_)),
+            "an already-spent rejection must stay RejectedSwap, got {err:?}"
         );
     }
 }

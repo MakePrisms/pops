@@ -94,10 +94,21 @@ pub enum MintClientError {
     #[error("mint unreachable (indeterminate swap outcome): {0}")]
     UnreachableIndeterminate(String),
 
-    /// The mint refused the swap (expired, double-spent, bad signature, keyset
-    /// rotated, etc.).
+    /// The mint refused the swap (double-spent, bad signature, unbalanced,
+    /// etc.) — every definitive rejection EXCEPT the keyset-retirement family,
+    /// which has its own arm below. The token was NOT consumed.
     #[error("mint rejected swap: {0}")]
     RejectedSwap(String),
+
+    /// The mint refused the call with a KEYSET-class error (NUT error codes
+    /// 12001 keyset-not-known / 12002 keyset-inactive): the keyset has retired
+    /// or its `final_expiry` has passed. `draft-cashu-charge-01` step 9 makes
+    /// this a `payment-expired` condition, distinct from the double-spend /
+    /// other-rejection family that is `verification-failed`. The token was NOT
+    /// consumed; the client re-presents the SAME token against a fresh
+    /// challenge once, then abandons it.
+    #[error("mint rejected swap (keyset retired or final_expiry passed): {0}")]
+    KeysetRetiredOrExpired(String),
 
     /// The active keyset charges an `input_fee_ppk` over the supported maximum
     /// (0 in the fee-free profile), detected BEFORE the swap is submitted. The

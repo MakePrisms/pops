@@ -448,6 +448,9 @@ mod tests {
         /// Post-submit (indeterminate) failure → exercises the 503 mapping.
         UnreachableIndeterminate,
         RejectedSwap,
+        /// Keyset-class rejection (retired / final_expiry passed) → exercises
+        /// the payment-expired mapping.
+        KeysetRetiredOrExpired,
         /// Swap-output DLEQ verdict failed → serve-and-flag path: the swap
         /// SUCCEEDED, the response is the success path, `dleq_ok` is false.
         DleqInvalid,
@@ -491,6 +494,9 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
+                SwapResponse::KeysetRetiredOrExpired => Err(
+                    MintClientError::KeysetRetiredOrExpired("mock keyset retired".into()),
+                ),
                 SwapResponse::DleqInvalid => Ok(SwapOutcome {
                     proofs,
                     dleq_ok: false,
@@ -1183,7 +1189,8 @@ mod tests {
 
     #[tokio::test]
     async fn mint_rejected_returns_402() {
-        // A rejected swap is a verification failure → 402 + re-challenge.
+        // A non-keyset swap rejection is the spec's step-9 else-branch →
+        // verification-failed 402 + re-challenge.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
@@ -1197,7 +1204,43 @@ mod tests {
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
         assert!(
             body.contains("double-spend"),
-            "expected double-spend (SAFE interim for any swap rejection) message, got: {body}"
+            "expected the double-spend detail, got: {body}"
+        );
+        assert!(
+            body.contains("https://paymentauth.org/problems/verification-failed"),
+            "a swap rejection answers with the verification-failed type, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyset_retired_swap_rejection_returns_402_payment_expired() {
+        // Spec step 9 + Keyset Rotation §: a swap rejected for keyset
+        // retirement or passed final_expiry answers payment-expired (with a
+        // fresh challenge), NOT verification-failed — the client re-presents
+        // the same token once against the fresh challenge.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let encoded = token.to_string();
+
+        let app = router_with(state_with(SwapResponse::KeysetRetiredOrExpired));
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let header = www_authenticate(&response);
+        assert!(
+            header.starts_with("Payment "),
+            "a fresh challenge must accompany the 402: {header}"
+        );
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        assert!(
+            body.contains("https://paymentauth.org/problems/payment-expired"),
+            "a keyset-class rejection answers with the payment-expired type, got: {body}"
+        );
+        assert!(
+            !body.contains("verification-failed"),
+            "must not collapse into verification-failed, got: {body}"
         );
     }
 
