@@ -114,13 +114,21 @@ impl CdkMintClient {
 /// NUT error body (`{"code", "detail"}`) and maps code 12001
 /// (keyset-not-known) → [`cdk::Error::UnknownKeySet`] and 12002
 /// (keyset-inactive) → [`cdk::Error::InactiveKeyset`];
-/// [`cdk::Error::KeysetUnknown`] is cdk's wallet-local twin of 12001. All
-/// three mean the keyset has retired or its `final_expiry` has passed — a
-/// `verification-failed` swap rejection per `draft-cashu-charge-01` step 8,
-/// kept in its own arm so the cause is named in the problem `detail`. No
-/// registered NUT error code names `final_expiry` itself, so these keyset
-/// codes are the entire wire signal; a mint rejecting an expired keyset under
-/// any other code stays in the rejected catch-all, also `verification-failed`.
+/// [`cdk::Error::KeysetUnknown`] is cdk's wallet-local twin of 12001. cdk 0.16
+/// types only 12001 and 12002, so code 12003 (keyset-expired) is NOT a typed
+/// variant: cdk decodes it to `ErrorCode::Unknown(12003)`, whose
+/// `From<ErrorResponse>` catch-all yields `cdk::Error::UnknownErrorResponse`
+/// carrying the rendered `code: 12003, detail: ...` string. That variant is
+/// `is_definitive_failure() == false`, so without a code-12003 arm it would
+/// surface as a 503 (mint-unreachable) — but a typed mint rejection is a
+/// definitive outcome, and an expired keyset is exactly the `final_expiry`
+/// case. So match 12003 in the `UnknownErrorResponse` payload and route it to
+/// the same arm as 12001/12002. All of these mean the keyset has retired or its
+/// `final_expiry` has passed: a `verification-failed` swap rejection per
+/// `draft-cashu-charge-01` step 8, kept in its own arm so the cause is named in
+/// the problem `detail`. A mint rejecting an expired keyset under any code OTHER
+/// than 12001/12002/12003 stays in the rejected catch-all, also
+/// `verification-failed`.
 ///
 /// The already-spent rejection (NUT code 11001 → [`cdk::Error::TokenAlreadySpent`])
 /// keeps its own arm so the spent case carries the honest double-spend detail;
@@ -132,13 +140,23 @@ fn map_cdk_err(e: cdk::Error) -> MintClientError {
     } else if matches!(
         e,
         cdk::Error::UnknownKeySet | cdk::Error::KeysetUnknown(_) | cdk::Error::InactiveKeyset
-    ) {
+    ) || is_keyset_expired_12003(&e)
+    {
         MintClientError::KeysetRetiredOrExpired(e.to_string())
     } else if e.is_definitive_failure() {
         MintClientError::RejectedSwap(e.to_string())
     } else {
         MintClientError::Unreachable(e.to_string())
     }
+}
+
+/// True for a NUT error code 12003 (keyset-expired) rejection. cdk 0.16 has no
+/// typed variant for 12003, so it arrives as
+/// [`cdk::Error::UnknownErrorResponse`] whose payload is the rendered
+/// `ErrorResponse` (`code: 12003, detail: ...`). Match the registered code, not
+/// the human detail text, which the mint controls and may localize.
+fn is_keyset_expired_12003(e: &cdk::Error) -> bool {
+    matches!(e, cdk::Error::UnknownErrorResponse(msg) if msg.contains("12003"))
 }
 
 /// The raw mint HTTP, via cdk's [`HttpClient`]/[`MintConnector`]. These three
@@ -245,6 +263,34 @@ mod tests {
                 other => panic!("expected KeysetRetiredOrExpired, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn keyset_expired_12003_classifies_as_retired_or_expired() {
+        // cdk 0.16 types no 12003 variant, so the mint's keyset-expired
+        // rejection arrives as `UnknownErrorResponse` carrying the rendered
+        // `code: 12003, detail: ...`. It must classify as the keyset-expiry arm
+        // (verification-failed on the wire), NOT fall through to Unreachable
+        // (503) on the strength of `UnknownErrorResponse` being non-definitive.
+        let e = cdk::Error::UnknownErrorResponse("code: 12003, detail: Keyset has expired".into());
+        match map_cdk_err(e) {
+            MintClientError::KeysetRetiredOrExpired(msg) => {
+                assert!(msg.contains("12003"), "the cdk detail must carry through: {msg}");
+            }
+            other => panic!("expected KeysetRetiredOrExpired for 12003, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_unknown_error_responses_stay_unreachable() {
+        // The 12003 match is scoped to that code: a different unknown-code
+        // rejection keeps the ambiguous `UnknownErrorResponse` classification
+        // (Unreachable / 503), so the narrowing does not swallow other codes.
+        let e = cdk::Error::UnknownErrorResponse("code: 50000, detail: Concurrent update".into());
+        assert!(
+            matches!(map_cdk_err(e), MintClientError::Unreachable(_)),
+            "a non-12003 unknown-code response must stay Unreachable"
+        );
     }
 
     #[test]
@@ -515,6 +561,40 @@ mod tests {
                 );
             }
             other => panic!("expected KeysetRetiredOrExpired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn swap_rejected_with_keyset_expired_code_classifies_as_expired_not_503() {
+        // The whole wire path for the live bazaar rig failure: the mint answers
+        // the swap POST with NUT error code 12003 (keyset-expired). cdk 0.16 has
+        // no typed 12003 variant, so its transport surfaces `UnknownErrorResponse`
+        // (rendered `code: 12003, detail: ...`); the client must still classify
+        // it as the keyset-expiry arm (a 402 verification-failed downstream), NOT
+        // the mint-unreachable 503 path that `UnknownErrorResponse` otherwise
+        // takes.
+        let port =
+            reject_swap_mint(r#"{"code":12003,"detail":"Keyset has expired"}"#).await;
+        let client = CdkMintClient::new();
+
+        let err = client
+            .swap(
+                &mint_url_for(port),
+                vec![input_proof(8, 0), input_proof(2, 1)],
+            )
+            .await
+            .expect_err("a 12003-rejected swap must error");
+        match err {
+            MintClientError::KeysetRetiredOrExpired(msg) => {
+                assert!(
+                    msg.contains("12003"),
+                    "the keyset-expired code must surface in the detail, got: {msg}"
+                );
+            }
+            other => panic!(
+                "a 12003 keyset-expired rejection must be KeysetRetiredOrExpired, \
+                 never Unreachable (503), got {other:?}"
+            ),
         }
     }
 
