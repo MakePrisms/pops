@@ -45,8 +45,17 @@ The **five required config facts** at a glance:
 | `[charge].unit` | the `pop_<unix_ts>` unit you accept (rotates — see below)             |
 | `[charge].amount` | exact net value required per request (must be > 0)                  |
 
-Authoritative doc (optionals, per-path `[[routes]]` gating, value model,
-build-from-source): **[crates/pops-gateway/README.md](../crates/pops-gateway/README.md)**.
+The knobs worth knowing about (all optional, sane defaults):
+
+| key | default | what it does |
+|---|---|---|
+| `binding_key` | generated at boot | Hex server secret the stateless challenge binding HMACs ids under (≥ 16 bytes; 32 recommended). The **`POPS_BINDING_KEY`** env var overrides it. Without a configured key, a restart invalidates outstanding challenges (clients just refetch the 402). The key is a secret — never log or share it. |
+| `challenge_ttl_secs` | `300` | Lifetime stamped into each challenge's `expires` (must be > 0 — a 0-TTL challenge is born expired). |
+| `mint_http_timeout_secs` | `10` | Bound on each mint HTTP call (keysets/keys/swap); a hung mint surfaces as the 503 mint-unavailable path. Must be > 0 — **`0` is a config error** (an unbounded mint call would hang a request whose token may already be consumed). |
+
+Authoritative doc (all optionals, per-path `[[routes]]` gating, value model,
+build-from-source): **[crates/pops-gateway/README.md](../crates/pops-gateway/README.md)**
+and the commented [`config.example.toml`](../crates/pops-gateway/config.example.toml).
 
 ---
 
@@ -70,7 +79,11 @@ feature):
   `single_use`. This is the config you build the challenge from. (Defined in
   [`challenge.rs`](../crates/pops-core-verify/src/challenge.rs).)
 - **`require_charge_state(requirement) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>>`**
-  — the convenience constructor that wires the default cdk-backed mint client.
+  — the convenience constructor that wires the default cdk-backed mint client
+  (mint HTTP bounded at 10s; `require_charge_state_with_mint_timeout` takes an
+  explicit bound). Chain **`.with_binding_key(BindingKey::from_hex(…)?)`** to
+  keep challenges valid across restarts (default: a fresh per-boot key) and
+  **`.with_challenge_ttl(Duration)`** to override the 300s `expires` TTL.
 - **`require_charge`** — the axum middleware function. Register it with
   `axum::middleware::from_fn_with_state(Arc::new(state), require_charge)`.
 
@@ -90,12 +103,17 @@ let app = Router::new()
 ```
 
 On a bare request the middleware returns `402` with the `WWW-Authenticate:
-Payment` challenge; on a valid `Authorization: Payment <blob>` retry it runs the
-full verify + NUT-03 swap, then inserts the redeemed result into the request
+Payment` challenge (HMAC-bound `id` + `expires`); on a valid `Authorization:
+Payment <blob>` retry it authenticates the echoed challenge, runs the full
+verify + NUT-03 swap, then inserts the redeemed result into the request
 extensions, so your handler can read it via `Extension<Redeemed>` (the redeemed
-proofs + amount/unit/token_hash — that is the value you now hold). Failure
+proofs + amount/unit/token_hash — that is the value you now hold — plus
+**`dleq_ok`**: `false` means the mint's swap-returned signatures failed their
+NUT-12 check, a mint-trust incident to alert on while still serving). Failure
 mapping: mint unreachable → `503` (token NOT consumed, retry); malformed request
-→ `400`; any other verification failure → `402` + a fresh challenge.
+/ non-`cashu` method → `400`; stale challenge or retired keyset →
+`402 payment-expired`; any other verification failure → `402` + a fresh
+challenge. Every error body is RFC-9457 `application/problem+json`.
 
 Authoritative source: the module docs in
 [`middleware.rs`](../crates/pops-core-verify/src/middleware.rs).
@@ -116,17 +134,21 @@ calls `parse_payment_credential` then `verify_and_redeem`:
 
 ```js
 const credsJson = wasm.parse_payment_credential(authorization);   // extract the cashuB token
-const cashuToken = JSON.parse(credsJson).payload.cashu_token;
+const cashuToken = JSON.parse(credsJson).payload.token;
 const redeemed = await wasm.verify_and_redeem(                      // full verify + NUT-03 swap
   cashuToken,
   JSON.stringify(requirement),                                     // { amount, unit, mints, payment_id, description, single_use }
-);                                                                  // resolves { ok, fresh_proofs, amount, unit, active_keyset_id, token_hash }
+);     // resolves { ok, fresh_proofs, amount, unit, active_keyset_id, token_hash, dleq_ok }
 ```
 
-`verify_and_redeem` **resolves** with the fresh proofs you now hold, or
-**rejects** with `{ ok:false, code, message }` whose `code` maps to a status:
-`mint-unreachable` → `503`, `malformed-request` → `400`, everything else → `402`
-+ a fresh challenge.
+`verify_and_redeem` **resolves** with the fresh proofs you now hold (PERSIST
+them — they are the money; `dleq_ok: false` flags a mint-trust incident to
+alert on while still serving), or **rejects** with
+`{ ok:false, code, message, status, problem_type, problem_slug }` — answer with
+the mapped `status` (`503` mint-unreachable + `Retry-After`, `400`
+malformed-request/method-unsupported, everything else `402` + a fresh
+challenge) and use `problem_type` for the RFC-9457 body, so the JS route emits
+the same wire as the native hosts.
 
 Install the bindings prebuilt from GitHub — no Rust/wasm toolchain, no
 npm-registry auth:
@@ -162,13 +184,27 @@ These hold no matter which mode you pick:
   given unit eventually goes **inactive**. Use your mint's currently-active
   unit: `GET <mint_url>/v1/keysets` and pick a keyset with `active: true`. A
   stale unit in your config silently stops accepting valid current pops.
+- **Challenges are bound and they expire.** Every challenge carries an
+  HMAC-bound `id` (under `binding_key` / the middleware's `BindingKey`) and an
+  `expires` (default TTL 300s). A credential must echo every issued param
+  byte-for-byte or it is rejected as `invalid-challenge`; a stale echo is
+  `payment-expired`. Configure a stable `binding_key` if challenges must
+  survive a restart.
+- **DLEQ serve-and-flag.** A missing/invalid NUT-12 DLEQ on the signatures the
+  mint returns from the redeeming swap is a mint-trust incident, NOT a payment
+  failure: the request still succeeds (the client's payment settled) and the
+  verdict surfaces to YOU — `dleq_ok=false` on the gateway's settle log line
+  (plus a WARN naming the mint), on `Extension<Redeemed>.dleq_ok` in-process,
+  and on the WASM success object. Alert on it and consider quarantining the
+  mint.
 - **Health + fail-fast (gateway).** `GET /healthz` → `200` whenever the process
   is up; `GET /readyz` → `200` only if the mint is reachable (a cheap `GET
   <mint_url>/v1/keysets`), else `503`. On boot the gateway validates the config
   and **exits nonzero** with a single structured stderr line on any problem
-  (bad URL, malformed `pop_<ts>` unit, `amount <= 0`, unwritable `proofs_sink`
-  parent) — never a panic. The in-process and WASM modes surface the same
-  reachability concern as the `503` (mint-unreachable) mapping.
+  (bad URL, malformed `pop_<ts>` unit, `amount <= 0`, `mint_http_timeout_secs
+  = 0`, `challenge_ttl_secs = 0`, unwritable `proofs_sink` parent) — never a
+  panic. The in-process and WASM modes surface the same reachability concern as
+  the `503` (mint-unreachable) mapping.
 - **The "paid-but-upstream-down" v1 edge (gateway).** The pop is **redeemed
   before** the upstream call. If the upstream is down after a successful charge,
   the gateway returns `502`/`504`, the value is **already persisted** (you keep
@@ -180,14 +216,28 @@ These hold no matter which mode you pick:
 
 ## Test your gate
 
-To exercise your own `402` by hand — build a credential, present it, and watch
-it gate through — you need the wire format. Build the credential with the
-canonical encoders (don't hand-roll the base64/JSON):
-**[skills/payment-credential.md](payment-credential.md)**.
+The easiest end-to-end test is the `pop` CLI with a **real** held pop:
 
-To pay your gate with a **real** held pop instead, drive the `pop` CLI:
-`pop pay <your-url> --token <cashuB>` runs the full 402 dance — see
+```sh
+pop pay <your-url> --token <cashuB> --max-amount 5000
+```
+
+It runs the full dance against the current wire: fetches the 402, refuses an
+expired challenge outright (`challenge_expired`), decodes and cross-checks the
+challenge's `paymentRequest` (amount/unit/mints), splits the held token to the
+exact charge, echoes every issued challenge param verbatim (so the gate's
+HMAC binding verifies), and presents. A `paid: true` JSON result (with any
+`change_token`) proves the whole gate. See
 **[skills/pop-wallet.md](pop-wallet.md)**.
+
+To exercise the `402` by hand instead — build a credential yourself and watch
+it gate through — you need the wire format:
+**[skills/payment-credential.md](payment-credential.md)**. Two things bite
+hand-rollers under the bound challenge: the credential must echo a challenge
+**this server actually issued** (fetch a fresh 402 first; you cannot invent
+`id`/`expires`), and the `request` param must be echoed **byte-for-byte**
+(never decode-and-re-encode it). Build with the canonical encoders, not by
+hand-assembling base64/JSON.
 
 ---
 

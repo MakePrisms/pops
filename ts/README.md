@@ -107,8 +107,8 @@ for production.)
 
 The package exports (see `pkg/pops_core_verify.d.ts` after a build):
 `verify_and_redeem` (the full verify+redeem, async), `parse_payment_credential`,
-`build_payment_credential`, `parse_payment_params`, `encode_request_envelope`,
-`decode_request_envelope`.
+`build_payment_credential`, `parse_payment_params`, `encode_request_object`,
+`decode_request_object`.
 
 ---
 

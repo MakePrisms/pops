@@ -3,7 +3,7 @@
 > **Agents → [AGENTS.md](AGENTS.md).** That's the entry point: it maps the two
 > pathways — **use pops** (drive the `pop` wallet from its machine contract,
 > **[skills/pop-wallet.md](skills/pop-wallet.md)** — exact per-command JSON, the
-> frozen 31-code error table, and the safety rails for locking real BTC) and
+> frozen 33-code error table, and the safety rails for locking real BTC) and
 > **gate your own service** (**[skills/gate-a-service.md](skills/gate-a-service.md)**)
 > — plus the shared `Payment` wire format.
 
@@ -15,8 +15,11 @@ token — and presents it to reach a gated resource. No upfront payment and no
 account: spam-resistance comes from the **locked capital** ("power"), which
 can't be cheaply farmed at scale. It's HTTP-402-native (a gated resource answers
 with `402` + a `WWW-Authenticate: Payment` challenge; the client retries with
-the pop in `Authorization: Payment …`). The verifier is **ecash-agnostic** —
-pops are one supported credential type.
+the pop in `Authorization: Payment …`), conforming to `draft-cashu-charge-01`:
+challenges are stateless-bound (HMAC `id`) and expire, value at or above the
+charge is accepted (excess retained), and a mint-trust DLEQ incident is
+flagged to the operator rather than failing a settled payment. The verifier is
+**ecash-agnostic** — pops are one supported credential type.
 
 **Non-custodial:** there is no third party. A spent pop is bearer ecash that the
 operator redeems into fresh proofs **only they control** — the operator keeps the

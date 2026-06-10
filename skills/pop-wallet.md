@@ -64,7 +64,7 @@ CONTRACT below and `pop-wallet.schema.json` for the schema.
 - **Failure**: `{ "schema_version": 1, "error": { "code", "retriable",
   "message", "details"? } }` on **stdout**, with a **non-zero exit (1)**. Two
   failure signals: the `error` key AND the non-zero exit.
-  - `code` — stable lower_snake_case enum (the 31 codes below). **Branch on
+  - `code` — stable lower_snake_case enum (the 33 codes below). **Branch on
     `code`, never on `message`.**
   - `retriable` — bool; `true` ⟺ the failure is transient (safe to retry the
     same call as-is).
@@ -540,7 +540,7 @@ Schema: `pop-wallet.schema.json` (next to this file). Filled example
 
 ---
 
-## ERROR CONTRACT — the 31 codes (FROZEN, additive-only)
+## ERROR CONTRACT — the 33 codes (FROZEN, additive-only)
 
 On failure, `pop` writes `{ "schema_version": 1, "error": { "code", "retriable",
 "message", "details"? } }` to **stdout** and exits **1**. Branch on `code` +
@@ -563,10 +563,12 @@ from them.
 | `quote_expired` | false | needs_input | `{quote_id, expired_at}` REQ | STOP polling + re-`quote`; funds sent are recoverable after CLTV |
 | `amount_mismatch` | false | needs_input | `{expected_sats, funded_sats}` REQ | PoP is exact-amount; funds are safe on-chain — `recover` that deposit |
 | `value_below_fee` | false | needs_input | `{value_sats, fee_sats}` REQ | UTXO uneconomical to sweep — lower `--fee` or wait for feerate |
+| `fee_too_high` | false | needs_input | `{fee_sats, value_sats, max_percent}` REQ | (`recover`) the AUTO-estimated sweep fee would eat ≥ `max_percent`% of the UTXO — refused BEFORE broadcast. Pass an explicit `--fee <sats>` if intentional, `--no-broadcast` to inspect, or wait for the feerate to drop |
 | `not_402` | false | terminal | `{url, status_got}` REQ | (`pay`) the URL answered neither 2xx nor 402 — it isn't gating with payment; check the URL |
 | `payment_rejected` | false | terminal/needs_input | `{required_amount?, unit?, reason?}` REQ when the 402 told us | (`pay`) service rejected the payment |
 | `no_payment_challenge` | false | terminal | `{url, reason}` REQ | (`pay`) the 402 had no parseable `WWW-Authenticate: Payment` challenge; nothing to satisfy |
-| `challenge_parse_failed` | false | terminal | `{reason}` REQ | (`pay`) the challenge didn't decode into a charge (bad request envelope/`creqA`, or missing amount) |
+| `challenge_parse_failed` | false | terminal | `{reason}` REQ | (`pay`) the challenge didn't decode into a charge (bad request object/`creqA`, or missing amount) |
+| `challenge_expired` | false | needs_input | `{url, expires}` REQ | (`pay`) the 402 challenge's `expires` is already past — a credential must NOT be submitted against it, so NOTHING was sent and the held token is intact. Re-request the resource for a fresh challenge, then pay that |
 | `token_unit_mismatch` | false | needs_input | `{required, got}` REQ | (`pay`) `--token` unit ≠ the charge's unit; present a token in `required` — SENT NOTHING |
 | `token_mint_mismatch` | false | needs_input | `{token_mint, accepted_mints}` REQ | (`pay`) `--token`'s mint isn't accepted by the charge (or the charge named no mints); use an accepted-mint token — SENT NOTHING |
 | `insufficient_token_value` | false | needs_input | `{have, need}` REQ | (`pay`) `--token` is worth less than the charge (+ any swap fee, folded into `need`); present a bigger token — SENT NOTHING |
@@ -599,14 +601,15 @@ Notes:
 - `cltv_not_expired` is the **single**-`--deposit` immature signal; a `--all`
   sweep instead returns a per-deposit `"status":"immature"` row (see recover).
 - **`pay`-path codes** (`not_402`, `payment_rejected`, `no_payment_challenge`,
-  `challenge_parse_failed`, `token_unit_mismatch`, `token_mint_mismatch`,
-  `insufficient_token_value`, `amount_exceeds_cap`, `swap_failed`,
-  `exact_amount_assertion_failed`, `gateway_rejected_payment`,
+  `challenge_parse_failed`, `challenge_expired`, `token_unit_mismatch`,
+  `token_mint_mismatch`, `insufficient_token_value`, `amount_exceeds_cap`,
+  `swap_failed`, `exact_amount_assertion_failed`, `gateway_rejected_payment`,
   `gateway_retry_failed`, `token_encode_failed`) all belong to `pop pay` —
   EXCEPT `token_encode_failed`, which `pop mint` ALSO emits if a freshly-issued
   token cannot be encoded to its `cashuB` string (then only `send_proofs` is
   present; the issued ecash is recoverable from them). The
-  validation codes (`token_*`, `insufficient_token_value`, `amount_exceeds_cap`)
+  validation codes (`challenge_expired`, `token_*`,
+  `insufficient_token_value`, `amount_exceeds_cap`)
   and `swap_failed` are raised BEFORE / without a completed swap — when you see
   them, **no token was sent and the held pop is intact** (verify on `swap_failed`).
   `exact_amount_assertion_failed` also sends nothing (it fires before the gateway).

@@ -1129,6 +1129,41 @@ mod tests {
         assert!(e.details().is_none());
     }
 
+    /// The agent-facing error table in skills/pop-wallet.md must carry one row
+    /// per contract code and advertise the actual count — the doc freezing a
+    /// stale count is exactly the drift this pins against.
+    #[test]
+    fn error_code_table_in_pop_wallet_skill_matches_the_contract() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/pop-wallet.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|e| panic!("read {doc_path:?}: {e}"));
+
+        let samples = sample_errors();
+        let codes: std::collections::BTreeSet<&str> =
+            samples.iter().map(|e| e.code()).collect();
+        assert_eq!(
+            codes.len(),
+            samples.len(),
+            "sample_errors must carry exactly one entry per code"
+        );
+
+        for code in &codes {
+            assert!(
+                doc.contains(&format!("| `{code}` |")),
+                "skills/pop-wallet.md error table is missing a row for `{code}`"
+            );
+        }
+
+        let advertised = format!("the {} codes", codes.len());
+        assert!(
+            doc.contains(&advertised),
+            "skills/pop-wallet.md must advertise the actual code count \
+             ({}; expected the phrase {advertised:?})",
+            codes.len()
+        );
+    }
+
     /// A non-PopError boxed error resolves to internal_error.
     #[test]
     fn from_boxed_wraps_unknown_as_internal() {

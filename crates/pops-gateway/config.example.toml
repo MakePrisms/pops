@@ -45,6 +45,22 @@ proofs_sink = "/data/proofs.jsonl"
 # token, so it must always be bounded).
 # mint_http_timeout_secs = 10
 
+# Hex-encoded server SECRET for the stateless challenge binding: each 402's
+# `id` is an HMAC-SHA256 over the issued challenge params under this key. At
+# least 16 bytes (32 hex chars); 32 bytes (64 hex chars) recommended. The
+# POPS_BINDING_KEY env var, when set, OVERRIDES this value (so the secret can
+# stay out of the mounted file). Omitted ⇒ a fresh key is generated at boot:
+# outstanding challenges then die with the process and clients refetch the
+# 402 — fine for a single instance, but configure a stable key for restarts or
+# multiple replicas. NEVER log or share it.
+# binding_key = "<64 hex chars>"
+
+# Challenge lifetime in SECONDS, stamped into each challenge's `expires`
+# auth-param. A credential echoing a challenge older than this is rejected as
+# payment-expired (the client refetches). Default: 300. Must be > 0 (a 0-TTL
+# challenge is born expired).
+# challenge_ttl_secs = 300
+
 [charge]
 # The pop_<unix_ts> currency unit you accept.
 #

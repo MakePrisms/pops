@@ -49,9 +49,9 @@ cdk = { version = "0.16", default-features = false, features = ["wallet"], optio
 axum = { version = "0.7", optional = true }
 # http types (StatusCode / HeaderValue) used directly by the middleware.
 http = { version = "1", optional = true }
-# uuid is NOT used by this crate's code anymore (the HMAC challenge binding
-# replaced the old uuid-v4 challenge `id`); it stays declared only so the
-# `wasm` feature can flip `uuid/js` on the uuid that cashu pulls transitively
+# Not referenced by this crate's code. Declared purely as a feature handle:
+# the `wasm` feature must flip `uuid/js` on the uuid that cashu pulls in
+# transitively, and a feature can only be forwarded through a declared dep
 # (see the `[features]` note).
 uuid = { version = "1", features = ["v4"], optional = true }
 # tokio::time::timeout bounds every mint HTTP call in `cdk_mint_client` (a hung
