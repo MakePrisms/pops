@@ -187,7 +187,7 @@ fn challenge_header(mint_url: &str) -> String {
         description: None,
         single_use: true,
     };
-    let request = encode_charge_request(&req);
+    let request = encode_charge_request(&req).expect("requirement encodes");
     format!(
         r#"Payment id="ch-recovery", realm="pops", method="cashu", intent="charge", request="{request}""#
     )

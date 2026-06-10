@@ -16,6 +16,26 @@ use cashu::nuts::nut02::KeySetInfo;
 use cashu::{MintUrl, Proofs};
 use thiserror::Error;
 
+/// What a successful swap yields: the fresh verifier-held proofs plus the
+/// NUT-12 verdict on the blind signatures the mint returned.
+///
+/// `dleq_ok: false` is a MINT-TRUST INCIDENT, not a payment failure
+/// (`draft-cashu-charge-01` §security-dleq): the client's inputs were genuine
+/// and were consumed by the successful swap; only the mint controls the
+/// signatures it returns. Callers serve the resource, surface the flag to the
+/// operator (alert + quarantine the mint), and MUST NOT answer with a payment
+/// failure — the swap succeeded, so a 402 here would charge the client twice
+/// for a settled payment.
+#[derive(Debug, Clone)]
+pub struct SwapOutcome {
+    /// The unblinded swap outputs, under fresh verifier secrets.
+    pub proofs: Proofs,
+    /// Whether EVERY swap-returned blind signature carried a NUT-12 DLEQ that
+    /// verifies against the active keyset's advertised key. `false` = missing
+    /// or invalid on at least one signature.
+    pub dleq_ok: bool,
+}
+
 /// Abstraction over the calls the verify core makes to a Cashu mint.
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
@@ -29,12 +49,13 @@ pub trait MintClient: Send + Sync {
     ) -> Result<Vec<KeySetInfo>, MintClientError>;
 
     /// Swap `proofs` for new verifier-held proofs. The mint atomically consumes
-    /// the inputs (failing if spent/expired/invalid).
+    /// the inputs (failing if spent/expired/invalid). The returned
+    /// [`SwapOutcome::dleq_ok`] reports the swap-output DLEQ verdict.
     async fn swap(
         &self,
         mint_url: &MintUrl,
         proofs: Proofs,
-    ) -> Result<Proofs, MintClientError>;
+    ) -> Result<SwapOutcome, MintClientError>;
 }
 
 /// Abstraction over the calls the verify core makes to a Cashu mint
@@ -53,7 +74,7 @@ pub trait MintClient {
         &self,
         mint_url: &MintUrl,
         proofs: Proofs,
-    ) -> Result<Proofs, MintClientError>;
+    ) -> Result<SwapOutcome, MintClientError>;
 }
 
 /// Errors returned by [`MintClient`] implementations.
@@ -73,19 +94,41 @@ pub enum MintClientError {
     #[error("mint unreachable (indeterminate swap outcome): {0}")]
     UnreachableIndeterminate(String),
 
-    /// The mint refused the swap (expired, double-spent, bad signature, keyset
-    /// rotated, etc.).
+    /// The mint refused the swap WITHOUT typing the reason as already-spent or
+    /// keyset-class (bad signature, unbalanced, etc.) — the definitive-rejection
+    /// catch-all. The token was NOT consumed.
     #[error("mint rejected swap: {0}")]
     RejectedSwap(String),
 
-    /// A returned blind signature failed DLEQ verification (NUT-12 proof MISSING
-    /// or INVALID against the advertised key).
-    ///
-    /// SECURITY-CRITICAL, deliberately distinct from [`Self::RejectedSwap`]: the
-    /// mint did NOT prove it signed the outputs with the advertised key, so the
-    /// proofs are not provably valid bearer value and MUST NOT be redeemed (no
-    /// redeemed value without a verified DLEQ). Maps to `DleqInvalid`
-    /// (402, resource not served), NOT a double-spend.
-    #[error("swap-output DLEQ verification failed: {0}")]
-    SwapOutputDleqInvalid(String),
+    /// The mint refused the swap because an input proof is ALREADY SPENT (NUT
+    /// error code 11001 / `cdk::Error::TokenAlreadySpent`). Kept apart from
+    /// [`Self::RejectedSwap`] so only a mint-typed double-spend ever reads as
+    /// one.
+    #[error("mint rejected swap: proof already spent: {0}")]
+    AlreadySpent(String),
+
+    /// The mint refused the call with a KEYSET-class error (NUT error codes
+    /// 12001 keyset-not-known / 12002 keyset-inactive): the keyset has retired
+    /// or its `final_expiry` has passed. `draft-cashu-charge-01` step 9 makes
+    /// this a `payment-expired` condition, distinct from the double-spend /
+    /// other-rejection family that is `verification-failed`. The token was NOT
+    /// consumed; the client re-presents the SAME token against a fresh
+    /// challenge once, then abandons it.
+    #[error("mint rejected swap (keyset retired or final_expiry passed): {0}")]
+    KeysetRetiredOrExpired(String),
+
+    /// The active keyset charges an `input_fee_ppk` over the supported maximum
+    /// (0 in the fee-free profile), detected BEFORE the swap is submitted. The
+    /// token was NOT consumed. Distinct from [`Self::RejectedSwap`] so the
+    /// policy reject never reads as a double-spend.
+    #[error(
+        "fee-bearing keyset {keyset_id} disallowed: input_fee_ppk {input_fee_ppk} \
+         exceeds the fee-free profile"
+    )]
+    FeeTooHigh {
+        /// Keyset whose fee exceeded the profile (hex id).
+        keyset_id: String,
+        /// The disallowed `input_fee_ppk` the mint publishes for it.
+        input_fee_ppk: u64,
+    },
 }

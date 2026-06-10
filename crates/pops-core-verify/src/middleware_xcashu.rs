@@ -12,13 +12,18 @@
 //! money core with the `Payment` middleware; only the wire differs (single
 //! `X-Cashu` header both directions, vs `WWW-Authenticate`/`Authorization`).
 //!
-//! Status mapping (stricter and safer than NUT-24's bare `400`):
-//! `MintUnreachable` → `503` (transport blip, token NOT consumed — never a
-//! `400`/`402` that says "re-pay" against a valid token); `MalformedRequest` →
-//! `400` (server-side requirement is misconfigured); every other validation
-//! failure → `402` + a fresh `X-Cashu: <creqA>` re-challenge. Amount is EXACT:
-//! an over- or under-funded token is an `AmountMismatch` rejection, never
-//! silent overage capture. Every `402` carries `Cache-Control: no-store`.
+//! Status mapping (stricter and safer than NUT-24's bare `400`) — the
+//! single-sourced [`crate::problem`] map, shared with every other host:
+//! `MintUnreachable` → `503` + `Retry-After` (transport blip, token NOT
+//! consumed — never a `400`/`402` that says "re-pay" against a valid token);
+//! `MalformedRequest` → `400` (server-side requirement is misconfigured); every
+//! other validation failure → `402` + a fresh `X-Cashu: <creqA>` re-challenge.
+//! Value follows the spec's step-8 rule: an under-funded token is a
+//! `PaymentInsufficient` rejection; value above the requirement is accepted
+//! and retained (the server makes no change). Every `402` carries
+//! `Cache-Control: no-store`, and every failure body is RFC-9457
+//! `application/problem+json` with the absolute problem-type URI (NUT-24
+//! leaves the body unspecified, so the richer body is compatible).
 //!
 //! [`Redeemer`]: crate::redeemer::Redeemer
 
@@ -34,7 +39,9 @@ use crate::charge::ChargeError;
 
 use crate::cashu_credential::charge_requirement_from_cashu;
 use crate::challenge::CashuRequirement;
+use crate::http_status::charge_error_status;
 use crate::middleware::ChargeMiddlewareState;
+use crate::problem::{Problem, PROBLEM_JSON};
 use crate::redeemer::Redeemer;
 use crate::xcashu::{xcashu_challenge_value, xcashu_token_from_header};
 
@@ -65,7 +72,10 @@ where
     let header_value = match header_raw.to_str() {
         Ok(v) => v,
         Err(_) => {
-            return challenge_response(&ctx.requirement, Some("invalid X-Cashu header encoding"));
+            return charge_error_to_response(
+                ChargeError::MalformedCredential("invalid X-Cashu header encoding".to_string()),
+                &ctx.requirement,
+            );
         }
     };
 
@@ -73,7 +83,12 @@ where
     // Like every other malformed presentation it is non-serving → 402.
     let token = match xcashu_token_from_header(header_value) {
         Ok(t) => t,
-        Err(e) => return challenge_response(&ctx.requirement, Some(&e.to_string())),
+        Err(e) => {
+            return charge_error_to_response(
+                ChargeError::MalformedCredential(e.to_string()),
+                &ctx.requirement,
+            )
+        }
     };
 
     // Verify + redeem via the generic seam; the `ChargeError` variant decides the
@@ -91,11 +106,11 @@ where
 }
 
 /// Build a `402` carrying a fresh `X-Cashu: <creqA>` challenge (always
-/// `Cache-Control: no-store`). `failure_reason`, when set, becomes the body so
-/// the client sees why the previous attempt failed; a bare "no attempt yet"
-/// `402` gets an empty body. NUT-24 has no challenge id / realm / echo, so the
-/// header value is the bare `creqA`.
-fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&str>) -> Response {
+/// `Cache-Control: no-store`). `problem`, when set, becomes the
+/// `application/problem+json` body naming why the previous attempt failed; a
+/// bare "no attempt yet" `402` gets an empty body. NUT-24 has no challenge id /
+/// realm / echo, so the header value is the bare `creqA`.
+fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>) -> Response {
     let creq_a = xcashu_challenge_value(requirement);
 
     // The `creqA` is base64url, always a valid header value; the `from_str`
@@ -112,35 +127,68 @@ fn challenge_response(requirement: &CashuRequirement, failure_reason: Option<&st
     };
 
     let cache_control = HeaderValue::from_static("no-store");
-    let body = failure_reason.unwrap_or("").to_string();
 
-    (
-        StatusCode::PAYMENT_REQUIRED,
-        [
-            (x_cashu_header(), x_cashu),
-            (http::header::CACHE_CONTROL, cache_control),
-        ],
-        body,
-    )
-        .into_response()
+    match problem {
+        Some(p) => (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                (x_cashu_header(), x_cashu),
+                (http::header::CACHE_CONTROL, cache_control),
+                (
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(PROBLEM_JSON),
+                ),
+            ],
+            p.to_json(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                (x_cashu_header(), x_cashu),
+                (http::header::CACHE_CONTROL, cache_control),
+            ],
+            String::new(),
+        )
+            .into_response(),
+    }
 }
 
-/// Map a [`ChargeError`] to an HTTP response. The three non-collapsing concerns
-/// drive the status (the `402` body is the Display string; every `402` is
-/// no-store): `MintUnreachable` → `503` (transport, token NOT consumed, NEVER a
-/// `402`), `MalformedRequest` → `400` (server-side requirement misconfigured),
-/// everything else (verification / malformed-credential / amount mismatch) →
-/// `402` + a fresh `X-Cashu: <creqA>` re-challenge.
+/// Map a [`ChargeError`] to an HTTP response from the single-sourced
+/// [`crate::problem`] map (every failure body is `application/problem+json`):
+/// `MintUnreachable` → `503` + `Retry-After` (transport, token NOT consumed,
+/// NEVER a `402`), `MalformedRequest`/`MethodUnsupported` → `400`, everything
+/// else (verification / malformed-credential / insufficient value) → `402` + a
+/// fresh `X-Cashu: <creqA>` re-challenge. A non-402 carries NO re-challenge —
+/// on a 503 re-presenting the SAME token is correct.
 fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
-    match &e {
-        ChargeError::MintUnreachable { .. } => {
-            (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response()
-        }
-        ChargeError::MalformedRequest(_) => {
-            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
-        }
-        _ => challenge_response(requirement, Some(&e.to_string())),
+    let problem = Problem::for_error(&e);
+    let status = charge_error_status(&e);
+    if status == StatusCode::PAYMENT_REQUIRED {
+        return challenge_response(requirement, Some(&problem));
     }
+    let mut response = (
+        status,
+        [
+            (
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static(PROBLEM_JSON),
+            ),
+            (
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            ),
+        ],
+        problem.to_json(),
+    )
+        .into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_static("2"),
+        );
+    }
+    response
 }
 
 #[cfg(test)]
@@ -166,7 +214,7 @@ mod tests {
     use crate::cashu_credential::CashuCredential;
     use crate::challenge::CashuRequirement;
     use crate::middleware::ChargeMiddlewareState;
-    use crate::mint_client::{MintClient, MintClientError};
+    use crate::mint_client::{MintClient, MintClientError, SwapOutcome};
     use crate::redeemer::Redeemed;
     use crate::xcashu::X_CASHU;
 
@@ -177,8 +225,10 @@ mod tests {
         Unreachable,
         UnreachableIndeterminate,
         RejectedSwap,
-        /// Swap-output DLEQ gate rejected the mint's blind signatures →
-        /// money-safety path: 402 + re-challenge, resource NOT served.
+        /// The mint typed the rejection as already-spent.
+        AlreadySpent,
+        /// Swap-output DLEQ verdict failed → serve-and-flag path: the swap
+        /// SUCCEEDED, the response is the success path, `dleq_ok` is false.
         DleqInvalid,
     }
 
@@ -202,9 +252,12 @@ mod tests {
             &self,
             _mint_url: &MintUrl,
             proofs: Proofs,
-        ) -> Result<Proofs, MintClientError> {
+        ) -> Result<SwapOutcome, MintClientError> {
             match self.swap_response {
-                SwapResponse::Echo => Ok(proofs),
+                SwapResponse::Echo => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: true,
+                }),
                 SwapResponse::Unreachable => {
                     Err(MintClientError::Unreachable("mock unreachable".into()))
                 }
@@ -214,9 +267,13 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
-                SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
-                    "mock swap-output DLEQ invalid".into(),
-                )),
+                SwapResponse::AlreadySpent => {
+                    Err(MintClientError::AlreadySpent("mock already spent".into()))
+                }
+                SwapResponse::DleqInvalid => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: false,
+                }),
             }
         }
     }
@@ -447,28 +504,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dleq_invalid_returns_402_and_does_not_serve_resource() {
-        // Money-safety: a missing/invalid swap-output DLEQ → 402 re-challenge,
-        // and the gated handler MUST NOT run.
+    async fn dleq_failure_serves_resource_with_flag_in_extension() {
+        // Spec step 9: a failed/missing DLEQ on the swap-RETURNED signatures
+        // is a mint-trust incident, not a payment failure — the X-Cashu host
+        // serves the resource too, with the verdict on `Extension<Redeemed>`.
+        async fn echo_flag(Extension(redeemed): Extension<Redeemed>) -> String {
+            format!("ok:{}:dleq_ok={}", redeemed.amount, redeemed.dleq_ok)
+        }
+        let app = Router::new()
+            .route("/gated", get(echo_flag))
+            .layer(from_fn_with_state(
+                state_with(SwapResponse::DleqInvalid),
+                require_charge_xcashu::<TestCredential>,
+            ));
+
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
-        let app = router_with(state_with(SwapResponse::DleqInvalid));
         let response = app
             .oneshot(request_with_xcashu(&token.to_string()))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(response.headers().get(super::x_cashu_header()).is_some());
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a settled payment must not be answered with a payment failure"
+        );
         let body = body_string(response).await;
-        assert!(!body.starts_with("ok:"), "resource must NOT be served on a DLEQ failure");
-        assert!(
-            body.to_ascii_lowercase().contains("dleq"),
-            "expected a DLEQ failure body, got: {body}"
+        assert_eq!(
+            body, "ok:10:dleq_ok=false",
+            "resource served; extension carries the false verdict"
         );
     }
 
     #[tokio::test]
     async fn double_spend_returns_402_and_does_not_serve() {
-        // A rejected swap (double-spend / expired) → 402 re-challenge.
+        // A mint-typed already-spent rejection → 402 re-challenge with the
+        // spent-specific detail.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::AlreadySpent));
+        let response = app
+            .oneshot(request_with_xcashu(&token.to_string()))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body = body_string(response).await;
+        assert!(!body.starts_with("ok:"), "resource must NOT be served");
+        assert!(body.contains("double-spend"), "expected double-spend body, got: {body}");
+    }
+
+    #[tokio::test]
+    async fn untyped_rejection_returns_402_with_neutral_detail() {
+        // A rejection the mint did NOT type as already-spent → the neutral
+        // rejected-swap detail; same 402 re-challenge.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let app = router_with(state_with(SwapResponse::RejectedSwap));
         let response = app
@@ -478,7 +564,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body = body_string(response).await;
         assert!(!body.starts_with("ok:"), "resource must NOT be served");
-        assert!(body.contains("double-spend"), "expected double-spend body, got: {body}");
+        assert!(
+            body.contains("the mint rejected the swap"),
+            "expected the neutral detail, got: {body}"
+        );
+        assert!(
+            !body.contains("double-spend"),
+            "must not claim a double-spend, got: {body}"
+        );
     }
 
     // ---- Mint-unreachable → 503, token NOT consumed ------------------
@@ -498,6 +591,10 @@ mod tests {
         assert!(
             response.headers().get(super::x_cashu_header()).is_none(),
             "a 503 must NOT carry an X-Cashu re-challenge (the token is still good)"
+        );
+        assert!(
+            response.headers().get(http::header::RETRY_AFTER).is_some(),
+            "a 503 SHOULD carry Retry-After"
         );
         let body = body_string(response).await;
         assert!(

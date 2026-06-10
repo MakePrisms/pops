@@ -1,9 +1,11 @@
 # pops-gateway — example config.
 #
 # Copy this to `config.toml`, fill in the five REQUIRED facts below, then run
-# the gateway pointing at it (see the README quickstart). This file is parsed
-# by the gateway's `Config` (serde, `deny_unknown_fields`) — keep field names
-# and table nesting exactly as shown; an unknown key is a fail-fast error.
+# the gateway pointing at it (see the README quickstart). The gateway reads the
+# path in the POPS_GATEWAY_CONFIG env var, defaulting to
+# /etc/pops-gateway/config.toml. This file is parsed by the gateway's `Config`
+# (serde, `deny_unknown_fields`) — keep field names and table nesting exactly
+# as shown; an unknown key is a fail-fast error.
 
 # ── REQUIRED — the five facts ────────────────────────────────────────────────
 
@@ -39,6 +41,28 @@ proofs_sink = "/data/proofs.jsonl"
 # the 504 response reachable. Default: 30. Set to 0 to disable (NOT recommended).
 # upstream_timeout_secs = 30
 
+# Per-call MINT HTTP timeout in SECONDS (keysets / keys / swap). Bounds a hung
+# mint so the request surfaces as 503 mint-unavailable instead of hanging.
+# Default: 10. Must be > 0 (0 is a config error — a mint call can consume the
+# token, so it must always be bounded).
+# mint_http_timeout_secs = 10
+
+# Hex-encoded server SECRET for the stateless challenge binding: each 402's
+# `id` is an HMAC-SHA256 over the issued challenge params under this key. At
+# least 16 bytes (32 hex chars); 32 bytes (64 hex chars) recommended. The
+# POPS_BINDING_KEY env var, when set, OVERRIDES this value (so the secret can
+# stay out of the mounted file). Omitted ⇒ a fresh key is generated at boot:
+# outstanding challenges then die with the process and clients refetch the
+# 402 — fine for a single instance, but configure a stable key for restarts or
+# multiple replicas. NEVER log or share it.
+# binding_key = "<64 hex chars>"
+
+# Challenge lifetime in SECONDS, stamped into each challenge's `expires`
+# auth-param. A credential echoing a challenge older than this is rejected as
+# payment-expired (the client refetches). Default: 300. Must be > 0 (a 0-TTL
+# challenge is born expired).
+# challenge_ttl_secs = 300
+
 [charge]
 # The pop_<unix_ts> currency unit you accept.
 #
@@ -60,6 +84,12 @@ amount = 1
 
 # Human-readable description shown in the 402 challenge.
 # description = "my API"
+
+# Max proofs accepted per credential — a pre-swap DoS guard (a token stuffed
+# with tiny proofs inflates swap cost). Over the cap → 402 BEFORE any swap (the
+# pop is not consumed). Default: 64 (generous; an exact-amount token needs only
+# a handful). Must be > 0.
+# max_proofs = 64
 
 # OPTIONAL per-path gating rules. Absent ⇒ gate EVERY path. When present, only
 # paths matching a non-`public` rule are gated; `public = true` paths forward

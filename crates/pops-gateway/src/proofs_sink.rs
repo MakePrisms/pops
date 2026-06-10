@@ -29,7 +29,8 @@ pub struct ProofsRecord<'a> {
     pub received_at: u64,
     /// SHA-256 (lowercase hex) of the presented credential — the receipt ref.
     pub token_hash: &'a str,
-    /// Net value received (the requested `amount`).
+    /// Net value received: at least the requested `amount` (excess presented
+    /// value is retained, so this MAY exceed it).
     pub amount: u64,
     /// Unit of the redeemed value (`pop_<ts>`).
     pub unit: &'a str,

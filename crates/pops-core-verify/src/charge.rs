@@ -22,7 +22,8 @@ pub enum ChargeError {
     /// unresolved after a 5xx/timeout. Token NOT consumed; the caller MAY retry
     /// the same token.
     ///
-    /// HTTP 503 · `mint-unavailable` · RETRYABLE · SHOULD carry `Retry-After`.
+    /// HTTP 503 · no problem type (`about:blank` body) · RETRYABLE · SHOULD
+    /// carry `Retry-After`.
     #[error("mint unavailable at {mint_url}: {transport_detail}")]
     MintUnreachable {
         /// Mint endpoint that could not be reached.
@@ -37,12 +38,13 @@ pub enum ChargeError {
     },
 
     // (B) VERIFICATION — 402 + fresh re-challenge, terminal for this token.
-    /// Presented value ≠ `amount + expected_swap_fee` (over- or under-funded; the
-    /// server makes no change).
+    /// Presented value < `amount + expected_swap_fee` (spec verification step 8).
+    /// UNDER-funded only: value above the requirement is accepted and retained
+    /// by the server (the spec's Errors § has no over-payment counterpart).
     ///
-    /// HTTP 402 · `amount-mismatch` · terminal.
-    #[error("amount mismatch: presented {presented}, required {required} (= amount {amount} + swap_fee {expected_swap_fee})")]
-    AmountMismatch {
+    /// HTTP 402 · `payment-insufficient` · terminal.
+    #[error("payment insufficient: presented {presented}, required {required} (= amount {amount} + swap_fee {expected_swap_fee})")]
+    PaymentInsufficient {
         /// `amount + expected_swap_fee` the server requires.
         required: u64,
         /// Total value the presented token carried.
@@ -76,6 +78,32 @@ pub enum ChargeError {
         allowed: Vec<String>,
     },
 
+    /// Token's mint URL carries userinfo (`user@host`) — rejected outright per
+    /// the spec's mint-trust §, before any membership comparison.
+    ///
+    /// HTTP 402 · `verification-failed` · terminal.
+    #[error("mint URL rejected: userinfo (user@host) is not allowed in a mint URL: {url}")]
+    MintUrlUserinfo {
+        /// The offending mint URL.
+        url: String,
+    },
+
+    /// The keyset charges a swap fee this server's fee-free profile disallows
+    /// (`input_fee_ppk` over the supported maximum of 0). A policy-disallowed
+    /// unit per the spec's Errors §, NOT a double-spend.
+    ///
+    /// HTTP 402 · `verification-failed` · terminal.
+    #[error(
+        "fee-bearing keyset disallowed by server policy: keyset {keyset_id} charges \
+         input_fee_ppk {input_fee_ppk} (this server's profile is fee-free)"
+    )]
+    FeeTooHigh {
+        /// Keyset whose fee exceeded the profile (hex id).
+        keyset_id: String,
+        /// The disallowed `input_fee_ppk` the mint publishes for it.
+        input_fee_ppk: u64,
+    },
+
     /// Token's proofs reference more than one mint or unit.
     ///
     /// HTTP 402 · `verification-failed` · terminal.
@@ -89,14 +117,6 @@ pub enum ChargeError {
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
 
-    /// A blind signature the swap RETURNED failed NUT-12 DLEQ — invalid or
-    /// omitted by the mint (a malicious mint reporting outputs it never validly
-    /// signed, which the server then could not spend). Security-critical.
-    ///
-    /// HTTP 402 · `verification-failed` · terminal.
-    #[error("swap-output DLEQ verification failed")]
-    DleqInvalid,
-
     /// A proof's short (v1) keyset id does not resolve, or resolves ambiguously,
     /// against the mint's published keysets.
     ///
@@ -107,11 +127,20 @@ pub enum ChargeError {
         short_id: String,
     },
 
-    /// Swap rejected because a proof was already spent (double-spend / replay).
+    /// Swap rejected because a proof was already spent (double-spend / replay)
+    /// — only when the mint TYPED the rejection as already-spent (NUT 11001).
     ///
     /// HTTP 402 · `verification-failed` · terminal.
     #[error("double-spend: a proof in the token is already spent")]
     DoubleSpend,
+
+    /// Swap rejected by the mint for a reason it did not type as already-spent
+    /// or keyset-class (bad signature, unbalanced, …). The neutral detail never
+    /// claims a double-spend the mint never asserted.
+    ///
+    /// HTTP 402 · `verification-failed` · terminal.
+    #[error("the mint rejected the swap: {0}")]
+    SwapRejected(String),
 
     /// Swap rejected because the keyset retired or its `final_expiry` (NUT-02)
     /// passed — distinct from double-spend. For `pop_<ts>` this is where the CLTV
@@ -139,19 +168,32 @@ pub enum ChargeError {
 
     // (C) MALFORMED — 400 for a bad request frame, 402 for a bad credential.
     /// The credential could not be decoded/parsed: bad base64url or JSON, a
-    /// required field absent/wrong-typed, `cashu_token` not a Cashu token, or a
-    /// `cashuA…` (TokenV3 — this intent is cashuB/TokenV4 only).
+    /// required field absent/wrong-typed, `payload.token` not a Cashu token, or
+    /// a `cashuA…` (TokenV3 — this intent is cashuB/TokenV4 only).
     ///
     /// HTTP 402 · `malformed-credential` (a bad credential is 402, not 400 — it
     /// is still a re-makeable attempt).
     #[error("malformed credential: {0}")]
     MalformedCredential(String),
 
-    /// The credential names an unsupported method, or the request bore more than
-    /// one `Authorization: Payment` credential.
+    /// The credential names a payment method this server does not support
+    /// (anything ≠ `"cashu"`). Framework problem type `method-unsupported`.
     ///
-    /// HTTP 400 · framework status (not a well-formed payment attempt).
-    #[error("unsupported method or malformed request: {0}")]
+    /// HTTP 400 · `method-unsupported` (the framework's status table; not a
+    /// payment-verification failure, so no 402 re-challenge).
+    #[error("unsupported payment method {method:?} (this server accepts \"cashu\")")]
+    MethodUnsupported {
+        /// The method string the credential carried.
+        method: String,
+    },
+
+    /// The REQUEST frame is malformed — more than one `Authorization: Payment`
+    /// credential, or a server-side requirement that cannot be parsed. Follows
+    /// the framework's status handling (400), NOT a 402: there is no problem
+    /// type registered for it, so the body's `type` is `about:blank`.
+    ///
+    /// HTTP 400 · no registered slug.
+    #[error("malformed request: {0}")]
     MalformedRequest(String),
 
     /// Token carries more proofs than the configured maximum (DoS guard),
@@ -179,9 +221,9 @@ pub struct RedeemedProofs {
     /// keyset — a serialized `cashuB…` string the operator/wallet re-parses to
     /// spend.
     pub fresh_proofs: String,
-    /// Net value received = the requested `amount` exactly (the mint deducted the
-    /// swap fee). The caller asserts `amount == challenge.amount` to confirm
-    /// settlement.
+    /// Net value received: at least the requested `amount` (the mint deducted
+    /// the swap fee; value presented above the requirement is retained, so this
+    /// MAY exceed `challenge.amount`).
     pub amount: u64,
     /// Unit of the redeemed value (echoes the challenge `currency`).
     pub unit: String,
@@ -189,8 +231,9 @@ pub struct RedeemedProofs {
     /// keyset, which MAY differ from the input proofs' keyset. For spending
     /// without re-fetching keysets, and for audit.
     pub active_keyset_id: String,
-    /// SHA-256 (lowercase hex) of the EXACT presented `cashu_token` — the receipt
-    /// `reference`: a stable, shareable settlement id that exposes no secret.
+    /// SHA-256 (lowercase hex) of the EXACT presented `payload.token` string —
+    /// the receipt `reference`: a stable, shareable settlement id that exposes
+    /// no secret.
     pub token_hash: String,
 }
 
@@ -199,14 +242,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dleq_invalid_displays() {
-        let err = ChargeError::DleqInvalid;
-        assert_eq!(err.to_string(), "swap-output DLEQ verification failed");
-    }
-
-    #[test]
-    fn amount_mismatch_display() {
-        let err = ChargeError::AmountMismatch {
+    fn payment_insufficient_display() {
+        let err = ChargeError::PaymentInsufficient {
             required: 1100,
             presented: 1000,
             amount: 1000,
@@ -214,7 +251,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "amount mismatch: presented 1000, required 1100 (= amount 1000 + swap_fee 100)"
+            "payment insufficient: presented 1000, required 1100 (= amount 1000 + swap_fee 100)"
         );
     }
 

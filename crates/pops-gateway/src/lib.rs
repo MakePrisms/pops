@@ -3,11 +3,12 @@
 //!
 //! The gateway is a THIN HOST around the existing verify gate in
 //! `pops-core-verify`: it reuses `CashuCredential<CdkMintClient>` (verify +
-//! NUT-03 swap), the cashu-typed challenge codec, and the request envelope, and
-//! adds only the host concerns — config, durable proof persistence
-//! (persist-before-forward), upstream forwarding, health/readiness, and JSON
-//! structured logs. Operator-run, non-custodial: redeemed bearer proofs settle
-//! into the operator's `proofs_sink` (their money).
+//! NUT-03 swap), the shared `draft-cashu-charge-01` request-object codec, and
+//! the single-sourced problem map, and adds only the host concerns — config,
+//! durable proof persistence (persist-before-forward), upstream forwarding,
+//! health/readiness, and JSON structured logs. Operator-run, non-custodial:
+//! redeemed bearer proofs settle into the operator's `proofs_sink` (their
+//! money).
 //!
 //! See [`config`] for the declarative surface, [`gateway`] for the per-request
 //! orchestration, and [`build_router`] to assemble the axum app.

@@ -14,7 +14,7 @@ with the pop in `Authorization: Payment …`.
 1. **Use pops** — hold/lock BTC, mint pops, and pay HTTP-402-gated resources.
    Drive the `pop` CLI wallet from its machine contract:
    **[skills/pop-wallet.md](skills/pop-wallet.md)** (exact per-command JSON, the
-   frozen 31-code error table, and the safety rails for locking real BTC).
+   frozen 33-code error table, and the safety rails for locking real BTC).
    `pop pay <URL> --token <cashuB>` runs the 402 dance for you.
 
 2. **Accept pops** — gate your own HTTP service so it charges a pop per request.
@@ -41,7 +41,7 @@ build with no special access (`cdk-common` is a normal crates.io `0.16` dep). Th
 `pop` CLI is a Cargo workspace member: `cargo build -p pop` / `cargo test -p
 pop`. The toolchain is pinned in `rust-toolchain.toml` (Rust 1.95). The other
 crates: `pops-core-verify` (the verifier), `pops-gateway` (the reverse-proxy),
-`pops-core-funder` (the in-repo funder crypto kernel, extracted from `cdk-pop`) /
-`pops-core-types` (support), plus `ts/` (WASM bindings + a Next.js serverless
-demo). The gateway image and the WASM bindings are also published (ghcr +
-`wasm-pkg` branch) if you want to consume rather than build.
+and `pops-core-funder` (the in-repo funder crypto kernel, extracted from
+`cdk-pop`), plus `ts/` (WASM bindings + a Next.js serverless demo). The gateway
+image and the WASM bindings are also published (ghcr + `wasm-pkg` branch) if
+you want to consume rather than build.

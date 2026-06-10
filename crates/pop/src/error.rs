@@ -214,6 +214,18 @@ pub enum PopError {
         /// What failed to decode.
         reason: String,
     },
+    /// The 402 challenge's `expires` is already in the past. The framework
+    /// forbids submitting a credential against an expired challenge, so
+    /// NOTHING was sent and no token was touched — re-request the resource
+    /// for a fresh challenge. (`challenge_expired`)
+    ChallengeExpired {
+        /// The URL whose challenge expired.
+        url: String,
+        /// The challenge's `expires` value verbatim (RFC 3339; an
+        /// unparseable value is refused the same way — freshness cannot be
+        /// established).
+        expires: String,
+    },
     /// The held token's unit differs from the charge's; paying would be
     /// wrong-currency. Send nothing. (`token_unit_mismatch`)
     TokenUnitMismatch {
@@ -263,18 +275,22 @@ pub enum PopError {
         /// What it actually summed to.
         got: u64,
     },
-    /// The gateway rejected the presented payment on retry. It did NOT redeem, so
-    /// BOTH the send set (worth `amount`) AND any change are unspent ecash —
-    /// carried so no value is silently lost. (`gateway_rejected_payment`)
+    /// The gateway answered the payment retry with a non-2xx. On a 4xx
+    /// (verification rejections above all) the gateway determinately did NOT
+    /// redeem, so the send set AND any change are unspent ecash. On a 5xx the
+    /// error can FOLLOW a successful swap (e.g. the gateway's persist or
+    /// upstream failed after settlement), so the send token's redemption state
+    /// is UNKNOWN — hold it and verify before assuming either way. Both tokens
+    /// are carried so no value is silently lost. (`gateway_rejected_payment`)
     GatewayRejectedPayment {
         /// HTTP status the retry returned (typically 402).
         status: u16,
         /// The gateway's response body verbatim.
         body: String,
-        /// Worth EXACTLY the charge; unredeemed, so valid ecash that MUST be
-        /// recovered (the bigger half of the value).
+        /// Worth EXACTLY the charge — carry and recover it (on a 4xx it is
+        /// unspent; on a 5xx its state is unknown until verified).
         send_token: String,
-        /// Change token, if a swap produced one — also unspent.
+        /// Change token, if a swap produced one — unspent (it was never sent).
         change_token: Option<String>,
     },
     /// A freshly-minted proof set could not be encoded to its `cashuB` string.
@@ -332,6 +348,7 @@ impl PopError {
             PopError::PaymentRejected { .. } => "payment_rejected",
             PopError::NoPaymentChallenge { .. } => "no_payment_challenge",
             PopError::ChallengeParseFailed { .. } => "challenge_parse_failed",
+            PopError::ChallengeExpired { .. } => "challenge_expired",
             PopError::TokenUnitMismatch { .. } => "token_unit_mismatch",
             PopError::TokenMintMismatch { .. } => "token_mint_mismatch",
             PopError::InsufficientTokenValue { .. } => "insufficient_token_value",
@@ -507,6 +524,10 @@ impl PopError {
             })),
             PopError::ChallengeParseFailed { reason } => Some(json!({
                 "reason": reason,
+            })),
+            PopError::ChallengeExpired { url, expires } => Some(json!({
+                "url": url,
+                "expires": expires,
             })),
             PopError::TokenUnitMismatch { required, got } => Some(json!({
                 "required": required,
@@ -695,6 +716,11 @@ impl PopError {
             PopError::ChallengeParseFailed { reason } => {
                 format!("could not decode the 402 payment challenge into a charge: {reason}")
             }
+            PopError::ChallengeExpired { url, expires } => format!(
+                "the 402 challenge from {url} expired at {expires}; a credential must not be \
+                 submitted against an expired challenge, so nothing was sent (the held token is \
+                 untouched). Re-request the resource to get a fresh challenge, then pay that."
+            ),
             PopError::TokenUnitMismatch { required, got } => format!(
                 "the held token's unit `{got}` does not match the charge's required unit `{required}`; \
                  not paying (wrong currency). Present a token in `{required}`."
@@ -740,11 +766,25 @@ impl PopError {
                     Some(_) => " plus a change token",
                     None => "",
                 };
-                format!(
-                    "the gateway rejected the payment (HTTP {status}): {body}. The gateway did \
-                     NOT redeem, so the send token{change_suffix} are unspent ecash — RECOVER them \
-                     (json: `details.send_token`/`details.change_token`; human mode prints them below)"
-                )
+                if *status >= 500 {
+                    // A 5xx can follow a successful swap (persist/upstream
+                    // failure after settlement) — the redemption state is
+                    // genuinely unknown.
+                    format!(
+                        "the server reported an error after the token was sent (HTTP {status}): \
+                         {body}. Redemption state UNKNOWN — do not assume the send token is \
+                         spendable, and do not assume it is spent; hold the send \
+                         token{change_suffix} and verify its state before reuse \
+                         (json: `details.send_token`/`details.change_token`; human mode prints \
+                         them below)"
+                    )
+                } else {
+                    format!(
+                        "the gateway rejected the payment (HTTP {status}): {body}. The gateway did \
+                         NOT redeem, so the send token{change_suffix} are unspent ecash — RECOVER them \
+                         (json: `details.send_token`/`details.change_token`; human mode prints them below)"
+                    )
+                }
             }
             PopError::GatewayRetryFailed {
                 reason,
@@ -1019,6 +1059,41 @@ mod tests {
         assert_eq!(e.recovery_tokens(), Some(("cashuBsend", None)));
     }
 
+    /// The post-send message is truthful per status class: a 4xx (verification
+    /// rejection) determinately did NOT redeem (tokens unspent); a 5xx can
+    /// follow a successful swap, so it must claim uncertainty — never
+    /// "unspent ecash".
+    #[test]
+    fn gateway_rejected_payment_message_is_truthful_per_status_class() {
+        let rejected_402 = PopError::GatewayRejectedPayment {
+            status: 402,
+            body: "verification failed".to_string(),
+            send_token: "cashuBsend".to_string(),
+            change_token: None,
+        };
+        let msg = rejected_402.message();
+        assert!(msg.contains("did NOT redeem"), "got: {msg}");
+        assert!(msg.contains("unspent ecash"), "got: {msg}");
+
+        let failed_500 = PopError::GatewayRejectedPayment {
+            status: 500,
+            body: "failed to persist redeemed proofs".to_string(),
+            send_token: "cashuBsend".to_string(),
+            change_token: None,
+        };
+        let msg = failed_500.message();
+        assert!(
+            msg.contains("Redemption state UNKNOWN"),
+            "a 5xx must claim uncertainty, got: {msg}"
+        );
+        assert!(
+            !msg.contains("unspent ecash") && !msg.contains("did NOT redeem"),
+            "a 5xx must not claim the token is unspent, got: {msg}"
+        );
+        // The recovery surface is unchanged either way.
+        assert_eq!(failed_500.recovery_tokens(), Some(("cashuBsend", None)));
+    }
+
     /// `gateway_retry_failed` is terminal (NOT retriable — the input proofs are
     /// already spent), carrying BOTH unspent tokens so a retry network error
     /// never loses the freshly-minted ecash.
@@ -1074,6 +1149,28 @@ mod tests {
         assert!(e.recovery_tokens().is_none());
     }
 
+    /// `challenge_expired` is terminal-for-this-challenge (re-fetch, don't
+    /// retry as-is) and carries the url + verbatim expires so the caller can
+    /// see what lapsed. Nothing was sent.
+    #[test]
+    fn challenge_expired_carries_url_and_expires() {
+        let e = PopError::ChallengeExpired {
+            url: "https://app.example/resource".into(),
+            expires: "2026-03-15T12:05:00Z".into(),
+        };
+        let env = e.to_envelope();
+        assert_eq!(env["error"]["code"], json!("challenge_expired"));
+        assert_eq!(env["error"]["retriable"], json!(false));
+        assert_eq!(
+            env["error"]["details"]["url"],
+            json!("https://app.example/resource")
+        );
+        assert_eq!(
+            env["error"]["details"]["expires"],
+            json!("2026-03-15T12:05:00Z")
+        );
+    }
+
     /// Message-only codes carry no `details` key.
     #[test]
     fn message_only_codes_have_no_details() {
@@ -1083,6 +1180,41 @@ mod tests {
         let env = e.to_envelope();
         assert!(env["error"].get("details").is_none());
         assert!(e.details().is_none());
+    }
+
+    /// The agent-facing error table in skills/pop-wallet.md must carry one row
+    /// per contract code and advertise the actual count — the doc freezing a
+    /// stale count is exactly the drift this pins against.
+    #[test]
+    fn error_code_table_in_pop_wallet_skill_matches_the_contract() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../skills/pop-wallet.md");
+        let doc = std::fs::read_to_string(&doc_path)
+            .unwrap_or_else(|e| panic!("read {doc_path:?}: {e}"));
+
+        let samples = sample_errors();
+        let codes: std::collections::BTreeSet<&str> =
+            samples.iter().map(|e| e.code()).collect();
+        assert_eq!(
+            codes.len(),
+            samples.len(),
+            "sample_errors must carry exactly one entry per code"
+        );
+
+        for code in &codes {
+            assert!(
+                doc.contains(&format!("| `{code}` |")),
+                "skills/pop-wallet.md error table is missing a row for `{code}`"
+            );
+        }
+
+        let advertised = format!("the {} codes", codes.len());
+        assert!(
+            doc.contains(&advertised),
+            "skills/pop-wallet.md must advertise the actual code count \
+             ({}; expected the phrase {advertised:?})",
+            codes.len()
+        );
     }
 
     /// A non-PopError boxed error resolves to internal_error.
@@ -1196,6 +1328,10 @@ mod tests {
             },
             PopError::ChallengeParseFailed {
                 reason: "bad creqA".into(),
+            },
+            PopError::ChallengeExpired {
+                url: "https://x".into(),
+                expires: "2026-03-15T12:05:00Z".into(),
             },
             PopError::TokenUnitMismatch {
                 required: "pop_2".into(),

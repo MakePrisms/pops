@@ -39,6 +39,10 @@ docker run -p 8080:8080 \
   ghcr.io/makeprisms/pops-gateway:latest
 ```
 
+The gateway reads its config from the path in the **`POPS_GATEWAY_CONFIG`**
+env var, defaulting to **`/etc/pops-gateway/config.toml`** (which is why the
+mount above lands there).
+
 Prefer to build from source? See [Building the image
 yourself](#building-the-image-yourself) — the run command is identical, just
 swap the local tag for the `ghcr.io/...` one.
@@ -126,21 +130,34 @@ value — it is the payment for the gated request.
 
 1. **No / invalid credential** → `402 Payment Required` + `WWW-Authenticate:
    Payment id="…", realm="pops-gateway", method="cashu", intent="charge",
-   request="<creqA-envelope>"`, body `{"error":"payment_required", …}`,
-   `Cache-Control: no-store`.
-2. **Valid credential** → verify + NUT-03 swap against `mint_url`.
+   request="<request-object>", expires="…"`, an RFC-9457
+   `application/problem+json` body, and `Cache-Control: no-store`. The `id` is
+   a per-request HMAC binding every issued param under **`binding_key`** (or
+   the **`POPS_BINDING_KEY`** env var, which wins; omitted ⇒ a fresh key per
+   boot), and `expires` stamps **`challenge_ttl_secs`** (default 300) into the
+   challenge.
+2. **Valid credential** → the echoed challenge is authenticated first (the
+   HMAC recomputed over the echo; `expires` checked), then verify + NUT-03
+   swap against `mint_url` (each mint call bounded by
+   **`mint_http_timeout_secs`**, default 10s; `0` is a config error).
 3. On success the gateway **persists `fresh_proofs` durably (append + flush +
    fsync) BEFORE forwarding** — a crash between forward and persist would
    otherwise lose already-consumed value.
 4. Then the **original** request (method/path/query/headers/body) is forwarded
    to `upstream_url` (with a bounded **`upstream_timeout_secs`**, default 30s)
    and the response is streamed back.
-5. Error mapping (mirrors the reference verifier):
+5. Error mapping (the verifier's single-sourced problem map; every error body
+   is `application/problem+json` with an absolute problem-type URI):
    - mint unreachable → `503` + `Retry-After` (token **not** consumed, retry).
    - request body over **`max_body_bytes`** (default 1 MiB) → `413 Payload Too
      Large`. On a gated path this is checked **before the charge**, so the pop
      is **not** consumed.
-   - malformed request → `400`.
+   - credential carrying more than **`[charge].max_proofs`** proofs (default
+     64) → `402` BEFORE any swap (a pre-swap DoS guard; the pop is **not**
+     consumed).
+   - malformed request frame (>1 credential) / non-`cashu` method → `400`.
+   - tampered or unissued challenge echo → `402 invalid-challenge`; stale
+     `expires` or a keyset retired at the mint → `402 payment-expired`.
    - upstream hung past the timeout → `504`; upstream down → `502` (the pop, if
      gated, is already spent — see the v1 edge below).
    - any other verification failure → `402` + a fresh challenge.
@@ -166,6 +183,14 @@ Both are gateway-own and never forwarded upstream.
 Logs are **JSON structured** (`tracing-subscriber` json) so an agent or operator
 can parse outcomes. Set `RUST_LOG` to tune verbosity (default `info`).
 
+Each settlement logs one INFO line (`charge settled and persisted; forwarding
+upstream`) carrying `token_hash`, `amount`, `unit`, `active_keyset_id`, and
+**`dleq_ok`** — the NUT-12 verdict on the signatures the mint returned from the
+redeeming swap. `dleq_ok=false` is a **mint-trust incident**, not a payment
+failure: the client's payment settled and was served, but the mint could not
+prove it signed your fresh proofs with its advertised key (a WARN naming the
+mint fires too). Alert on it and consider quarantining the mint.
+
 ---
 
 ## Fail-fast config validation
@@ -178,11 +203,15 @@ config field charge.amount: must be greater than 0
 ```
 
 Checks: `upstream_url` / `mint_url` parse; `charge.unit` is a well-formed
-`pop_<ts>`; `charge.amount > 0`; `max_body_bytes > 0`; every `charge.mints`
-entry parses; and `proofs_sink`'s parent directory exists **and is actually
-writable by the running uid** — verified with a real create+fsync+delete
-write-probe (not just an inode mode-bit inspection), so a dir the process can't
-write is caught at boot rather than on the first redeemed proof.
+`pop_<ts>`; `charge.amount > 0`; `max_body_bytes > 0`;
+`mint_http_timeout_secs > 0` (an unbounded mint call would hang a request
+whose token may already be consumed); `challenge_ttl_secs > 0` (a 0-TTL
+challenge is born expired); a configured `binding_key` is plausible hex of at
+least 16 bytes; every `charge.mints` entry parses; and `proofs_sink`'s parent
+directory exists **and is actually writable by the running uid** — verified
+with a real create+fsync+delete write-probe (not just an inode mode-bit
+inspection), so a dir the process can't write is caught at boot rather than on
+the first redeemed proof.
 
 ---
 

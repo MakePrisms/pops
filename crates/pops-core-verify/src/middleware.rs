@@ -5,19 +5,25 @@
 //! Flow: a request without `Authorization: Payment <blob>` gets a 402 carrying a
 //! `WWW-Authenticate: Payment` challenge (whose `request="…"` is the
 //! `draft-cashu-charge-01` request object built from the
-//! [`CashuRequirement`]). The client retries
-//! with the credentials blob; the middleware verify+redeems through the generic
-//! [`Redeemer`] seam and, on success, attaches the
-//! [`Redeemed`] to `request.extensions_mut()` and
-//! emits a `Payment-Receipt`.
+//! [`CashuRequirement`]). Every challenge is stateless-bound per the framework:
+//! its `id` is the HMAC-SHA256 over the issued auth-params under the state's
+//! [`BindingKey`], and it carries an RFC 3339 `expires` (`now + challenge_ttl`).
+//! The client retries with the credentials blob; the middleware authenticates
+//! the echoed challenge (recompute the id-HMAC; check `expires` freshness),
+//! then verify+redeems through the generic [`Redeemer`] seam and, on success,
+//! attaches the [`Redeemed`] to `request.extensions_mut()` and emits a
+//! `Payment-Receipt`. A tampered/inconsistent echo → `invalid-challenge` 402;
+//! a stale `expires` → `payment-expired` 402.
 //!
-//! Status mapping: a verification or malformed-credential failure → 402 + a fresh
-//! re-challenge; a transport failure to reach the mint → 503; a malformed request
-//! frame → 400. Every error body is RFC-9457 `application/problem+json` carrying
-//! the `draft-cashu-charge-01` problem-type. Every 402 carries
-//! `Cache-Control: no-store`; the 200 carries `Cache-Control: private`.
+//! Status mapping (the single-sourced [`crate::problem`] map): a verification
+//! or malformed-credential failure → 402 + a fresh re-challenge; a transport
+//! failure to reach the mint → 503; a malformed request frame or a non-"cashu"
+//! method → 400. Every error body is RFC-9457 `application/problem+json`
+//! carrying the absolute `draft-cashu-charge-01` problem-type URI. Every 402
+//! carries `Cache-Control: no-store`; the 200 carries `Cache-Control: private`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Request, State},
@@ -26,16 +32,19 @@ use axum::{
 };
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use http::{header::HeaderValue, StatusCode};
 use crate::charge::ChargeError;
 use serde::Serialize;
-use uuid::Uuid;
 
+use crate::binding::{
+    issue_challenge, validate_challenge_echo, BindingKey, DEFAULT_CHALLENGE_TTL,
+};
 use crate::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use crate::cdk_mint_client::CdkMintClient;
 use crate::http_status::charge_error_status;
 use crate::challenge::{encode_charge_request, CashuRequirement};
+use crate::problem::{Problem, PROBLEM_JSON};
 use crate::redeemer::{Redeemed, Redeemer};
 use crate::envelope::{
     parse_payment_authorization, AuthParseError, EchoedChallenge, CASHU_METHOD, PAYMENT_SCHEME,
@@ -49,8 +58,9 @@ pub const DEFAULT_REALM: &str = "pops-core-verify";
 /// as a one-shot charge (transfer-on-use).
 pub const INTENT_CHARGE: &str = "charge";
 
-/// Request-time state: the [`CashuRequirement`] to advertise on 402 and the
-/// [`Redeemer`] that verifies + redeems on retry.
+/// Request-time state: the [`CashuRequirement`] to advertise on 402, the
+/// [`Redeemer`] that verifies + redeems on retry, and the challenge-binding
+/// facts (server key + TTL).
 ///
 /// Generic over `C` so a second ecash method slots in with no middleware change;
 /// constructed once at router-build time and shared (`Arc`).
@@ -60,24 +70,62 @@ pub struct ChargeMiddlewareState<C: Redeemer> {
     pub requirement: CashuRequirement,
     /// The credential the middleware delegates to on retry.
     pub credential: Arc<C>,
+    /// The server secret challenge ids are HMAC-bound under. Defaults to a
+    /// fresh per-boot key ([`BindingKey::generate`]); an operator supplies a
+    /// configured key via [`Self::with_binding_key`] to keep challenges valid
+    /// across restarts.
+    pub binding_key: BindingKey,
+    /// Challenge lifetime stamped into `expires` (default
+    /// [`DEFAULT_CHALLENGE_TTL`], 300 s).
+    pub challenge_ttl: Duration,
 }
 
 impl<C: Redeemer> ChargeMiddlewareState<C> {
-    /// Wraps `credential` in an [`Arc`] and pairs it with the requirement.
+    /// Wraps `credential` in an [`Arc`] and pairs it with the requirement,
+    /// generating a per-boot [`BindingKey`] and the default challenge TTL.
     pub fn new(requirement: CashuRequirement, credential: C) -> Self {
         Self {
             requirement,
             credential: Arc::new(credential),
+            binding_key: BindingKey::generate(),
+            challenge_ttl: DEFAULT_CHALLENGE_TTL,
         }
+    }
+
+    /// Use an operator-configured binding key instead of the per-boot one
+    /// (outstanding challenges then survive a restart).
+    pub fn with_binding_key(mut self, key: BindingKey) -> Self {
+        self.binding_key = key;
+        self
+    }
+
+    /// Override the challenge TTL stamped into `expires`.
+    pub fn with_challenge_ttl(mut self, ttl: Duration) -> Self {
+        self.challenge_ttl = ttl;
+        self
     }
 }
 
 /// Build a native [`ChargeMiddlewareState`] for the default
-/// `CashuCredential<CdkMintClient>`.
+/// `CashuCredential<CdkMintClient>` (mint HTTP bounded by
+/// [`crate::cdk_mint_client::DEFAULT_MINT_HTTP_TIMEOUT`]).
 pub fn require_charge_state(
     requirement: CashuRequirement,
 ) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>> {
     ChargeMiddlewareState::new(requirement, CashuCredential::new(CdkMintClient::new()))
+}
+
+/// As [`require_charge_state`] with an explicit per-call mint HTTP timeout. A
+/// mint that stops answering then surfaces as the 503 mint-unavailable path
+/// within the bound instead of hanging the request.
+pub fn require_charge_state_with_mint_timeout(
+    requirement: CashuRequirement,
+    mint_http_timeout: Duration,
+) -> ChargeMiddlewareState<CashuCredential<CdkMintClient>> {
+    ChargeMiddlewareState::new(
+        requirement,
+        CashuCredential::new(CdkMintClient::with_timeout(mint_http_timeout)),
+    )
 }
 
 /// Axum middleware entry point enforcing the Payment Authentication envelope.
@@ -91,9 +139,20 @@ pub async fn require_charge<C>(
 where
     C: Redeemer + Send + Sync + 'static,
 {
+    // More than one `Authorization: Payment` credential is a malformed REQUEST
+    // frame → 400 per the framework (clients MUST send exactly one).
+    if count_payment_credentials(req.headers()) > 1 {
+        return charge_error_to_response(
+            ChargeError::MalformedRequest(
+                "request bears more than one Authorization: Payment credential".to_string(),
+            ),
+            &ctx,
+        );
+    }
+
     // A missing header or any non-`Payment` scheme is "no payment attempt" → 402.
     let Some(header_raw) = req.headers().get(http::header::AUTHORIZATION) else {
-        return challenge_response(&ctx.requirement, None);
+        return challenge_response(&ctx, None);
     };
 
     let header_value = match header_raw.to_str() {
@@ -103,32 +162,36 @@ where
                 ChargeError::MalformedCredential(
                     "invalid Authorization header encoding".to_string(),
                 ),
-                &ctx.requirement,
+                &ctx,
             );
         }
     };
 
     // `UnknownScheme` (Basic/Bearer/…) is control-flow-identical to no header at
-    // all; every OTHER parse error is a malformed credential → 402 re-challenge.
+    // all; a non-"cashu" method is the framework's method-unsupported (400);
+    // every OTHER parse error is a malformed credential → 402 re-challenge.
     let credentials = match parse_payment_authorization(header_value) {
         Ok(c) => c,
         Err(AuthParseError::UnknownScheme) => {
-            return challenge_response(&ctx.requirement, None);
+            return challenge_response(&ctx, None);
+        }
+        Err(AuthParseError::WrongMethod(method)) => {
+            return charge_error_to_response(ChargeError::MethodUnsupported { method }, &ctx)
         }
         Err(e) => {
             return charge_error_to_response(
                 ChargeError::MalformedCredential(e.to_string()),
-                &ctx.requirement,
+                &ctx,
             )
         }
     };
 
-    // An echoed `challenge.expires` in the PAST is a `payment-expired`, caught
-    // BEFORE any swap.
-    if let Some(expires) = &credentials.challenge.expires {
-        if challenge_is_expired(expires) {
-            return charge_error_to_response(ChargeError::ChallengeExpired, &ctx.requirement);
-        }
+    // Spec verification step 3, BEFORE any swap: authenticate the echoed
+    // challenge (recompute the id-HMAC over every echoed param — tampered /
+    // inconsistent / expires-less → invalid-challenge), then check `expires`
+    // freshness (stale → payment-expired).
+    if let Err(e) = validate_challenge_echo(&ctx.binding_key, &credentials.challenge) {
+        return charge_error_to_response(e, &ctx);
     }
 
     // Verify + redeem via the generic seam; the `ChargeError` variant decides the
@@ -136,11 +199,11 @@ where
     let charge_req = charge_requirement_from_cashu(&ctx.requirement);
     let redeemed = match ctx
         .credential
-        .verify_and_redeem(&credentials.payload.cashu_token, &charge_req)
+        .verify_and_redeem(&credentials.payload.token, &charge_req)
         .await
     {
         Ok(r) => r,
-        Err(e) => return charge_error_to_response(e, &ctx.requirement),
+        Err(e) => return charge_error_to_response(e, &ctx),
     };
 
     // The receipt facts come from the redeemed proofs + the echoed challenge id;
@@ -155,26 +218,44 @@ where
     req.extensions_mut().insert(redeemed);
     let mut response = next.run(req).await;
 
-    // `Payment-Receipt` + `Cache-Control: private` ride the settled response.
+    // `Payment-Receipt` + `Cache-Control: private` ride the settled SUCCESS
+    // response only — the spec's receipt § forbids the receipt on error
+    // responses (a downstream 4xx/5xx after settlement carries neither).
     // `from_str`/`from_static` are guarded: a header that won't build is dropped
     // rather than failing the served route.
-    if let Ok(value) = HeaderValue::from_str(&receipt_header) {
-        response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, value);
+    if response.status().is_success() {
+        if let Ok(value) = HeaderValue::from_str(&receipt_header) {
+            response.headers_mut().insert(PAYMENT_RECEIPT_HEADER, value);
+        }
+        response.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("private"),
+        );
     }
-    response.headers_mut().insert(
-        http::header::CACHE_CONTROL,
-        HeaderValue::from_static("private"),
-    );
     response
 }
 
 /// The `Payment-Receipt` response-header name.
-const PAYMENT_RECEIPT_HEADER: http::header::HeaderName =
+pub const PAYMENT_RECEIPT_HEADER: http::header::HeaderName =
     http::header::HeaderName::from_static("payment-receipt");
 
-/// The problem-type URI prefix for the `draft-cashu-charge-01` cashu
-/// problem-types.
-const PROBLEM_TYPE_PREFIX: &str = "cashu/";
+/// Count the `Authorization` values whose scheme token is `Payment` —
+/// the framework allows at most one Payment credential per request (more is a
+/// malformed request frame → 400). Shared by every axum-facing host (this
+/// middleware and `pops-gateway`) so the counting rule cannot drift.
+pub fn count_payment_credentials(headers: &http::HeaderMap) -> usize {
+    headers
+        .get_all(http::header::AUTHORIZATION)
+        .iter()
+        .filter(|v| {
+            v.to_str().is_ok_and(|s| {
+                s.split_whitespace()
+                    .next()
+                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PAYMENT_SCHEME))
+            })
+        })
+        .count()
+}
 
 /// The `Payment-Receipt` JSON. `reference` is the redeemed `token_hash` (a
 /// settlement id exposing no secret); `externalId` is omitted when absent.
@@ -190,20 +271,13 @@ struct PaymentReceipt<'a> {
     external_id: Option<&'a str>,
 }
 
-/// An RFC-9457 `application/problem+json` body.
-#[derive(Debug, Serialize)]
-struct Problem {
-    #[serde(rename = "type")]
-    type_uri: String,
-    title: String,
-    status: u16,
-    detail: String,
-}
-
-/// Build the `Payment-Receipt` header value: base64url-nopad over the receipt
-/// JSON. `challenge_id` echoes the credential's challenge `id`; `external_id`
-/// rides the receipt iff the issuance carried a correlation id.
-fn payment_receipt_header(
+/// Build the `Payment-Receipt` header value: base64url-nopad over the
+/// JCS-canonical (RFC 8785) receipt JSON, per the spec's Encoding § (the same
+/// canonicalization the request object and credential blob use). `challenge_id`
+/// echoes the credential's challenge `id`; `external_id` rides the receipt iff
+/// the issuance carried a correlation id. Shared by both Rust hosts (this
+/// middleware and `pops-gateway`).
+pub fn payment_receipt_header(
     redeemed: &Redeemed,
     challenge_id: &str,
     external_id: Option<&str>,
@@ -216,83 +290,48 @@ fn payment_receipt_header(
         timestamp: Utc::now().to_rfc3339(),
         external_id,
     };
-    let json = serde_json::to_string(&receipt).expect("PaymentReceipt always serializes");
+    let json = serde_jcs::to_string(&receipt).expect("PaymentReceipt always serializes");
     URL_SAFE_NO_PAD.encode(json.as_bytes())
 }
 
-/// Whether an echoed RFC-3339 `expires` is in the past against the wall clock.
-/// An UNPARSEABLE timestamp is treated as expired — a malformed echo is not a
-/// faithful challenge echo.
-fn challenge_is_expired(expires: &str) -> bool {
-    match DateTime::parse_from_rfc3339(expires) {
-        Ok(ts) => ts.with_timezone(&Utc) <= Utc::now(),
-        Err(_) => true,
-    }
-}
-
-/// The spec problem-type slug and RFC-9457 `title` for a [`ChargeError`]
-/// (`draft-cashu-charge-01` §Errors — the per-variant docs on `ChargeError`
-/// name these). The slug is bare (no `cashu/`); `problem_for` prepends the
-/// prefix. The HTTP status is NOT decided here — it comes from the shared
-/// [`charge_error_status`] so the gateway and this middleware cannot drift.
-fn problem_parts(e: &ChargeError) -> (&'static str, &'static str) {
-    match e {
-        ChargeError::MintUnreachable { .. } => ("mint-unavailable", "Mint unavailable"),
-        ChargeError::AmountMismatch { .. } => ("amount-mismatch", "Amount mismatch"),
-        ChargeError::WrongUnit { .. }
-        | ChargeError::MintNotAllowed { .. }
-        | ChargeError::MultiMintOrUnit
-        | ChargeError::LockedToken
-        | ChargeError::DleqInvalid
-        | ChargeError::ShortKeysetIdUnresolved { .. }
-        | ChargeError::DoubleSpend => ("verification-failed", "Verification failed"),
-        ChargeError::Expired | ChargeError::ChallengeExpired => {
-            ("payment-expired", "Payment expired")
-        }
-        ChargeError::InvalidChallenge => ("invalid-challenge", "Invalid challenge"),
-        ChargeError::MalformedCredential(_) | ChargeError::TooManyProofs { .. } => {
-            ("malformed-credential", "Malformed credential")
-        }
-        ChargeError::MalformedRequest(_) => ("invalid-challenge", "Malformed request"),
-    }
-}
-
-/// Build the RFC-9457 [`Problem`] + its status for a [`ChargeError`]. The status
-/// is the single-sourced [`charge_error_status`] trichotomy.
-fn problem_for(e: &ChargeError) -> (Problem, StatusCode) {
-    let (slug, title) = problem_parts(e);
-    let status = charge_error_status(e);
-    let problem = Problem {
-        type_uri: format!("{PROBLEM_TYPE_PREFIX}{slug}"),
-        title: title.to_string(),
-        status: status.as_u16(),
-        detail: e.to_string(),
-    };
-    (problem, status)
-}
-
 /// Build a 402 carrying a fresh challenge (always `Cache-Control: no-store`).
-/// `problem`, when set, is the RFC-9457 `application/problem+json` body naming
-/// why the previous attempt failed; a bare "no attempt yet" 402 has an empty
-/// body.
-fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>) -> Response {
-    // A random UUIDv4 `id` suffices; the challenge is not cryptographically
-    // bound to its params (no HMAC over them).
-    let id = Uuid::new_v4().to_string();
-
-    let request = encode_charge_request(requirement);
+/// The challenge `id` is the framework's stateless HMAC binding over the
+/// issued params under the state's [`BindingKey`], and `expires` is stamped
+/// `now + challenge_ttl` (MUST under stateless operation). `problem`, when
+/// set, is the RFC-9457 `application/problem+json` body naming why the
+/// previous attempt failed; a bare "no attempt yet" 402 has an empty body.
+fn challenge_response<C: Redeemer>(
+    ctx: &ChargeMiddlewareState<C>,
+    problem: Option<&Problem>,
+) -> Response {
+    // The one encode failure is a requirement naming no mints — server
+    // misconfiguration, never the client's fault → 500, not a payment status.
+    let request = match encode_charge_request(&ctx.requirement) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to encode challenge request object: {e}"),
+            )
+                .into_response();
+        }
+    };
 
     // TODO: wire `realm` through middleware state.
     let realm = DEFAULT_REALM;
 
-    let header = format!(
-        r#"{} id="{}", realm="{}", method="cashu", intent="{}", request="{}""#,
-        PAYMENT_SCHEME, id, realm, INTENT_CHARGE, request,
+    let issued = issue_challenge(
+        &ctx.binding_key,
+        realm,
+        CASHU_METHOD,
+        INTENT_CHARGE,
+        &request,
+        ctx.challenge_ttl,
     );
 
     // Values are all ASCII-printable; the `from_str` validation is a
     // belt-and-braces guard against a future encoder regression.
-    let www_auth = match HeaderValue::from_str(&header) {
+    let www_auth = match HeaderValue::from_str(&issued.header_value) {
         Ok(hv) => hv,
         Err(_) => {
             return (
@@ -306,22 +345,19 @@ fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>)
     let cache_control = HeaderValue::from_static("no-store");
 
     match problem {
-        Some(p) => {
-            let body = serde_json::to_string(p).expect("Problem always serializes");
-            (
-                StatusCode::PAYMENT_REQUIRED,
-                [
-                    (http::header::WWW_AUTHENTICATE, www_auth),
-                    (http::header::CACHE_CONTROL, cache_control),
-                    (
-                        http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/problem+json"),
-                    ),
-                ],
-                body,
-            )
-                .into_response()
-        }
+        Some(p) => (
+            StatusCode::PAYMENT_REQUIRED,
+            [
+                (http::header::WWW_AUTHENTICATE, www_auth),
+                (http::header::CACHE_CONTROL, cache_control),
+                (
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static(PROBLEM_JSON),
+                ),
+            ],
+            p.to_json(),
+        )
+            .into_response(),
         None => (
             StatusCode::PAYMENT_REQUIRED,
             [
@@ -335,34 +371,46 @@ fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>)
 }
 
 /// Map a [`ChargeError`] to an HTTP response with an RFC-9457
-/// `application/problem+json` body (`draft-cashu-charge-01` §Errors). The three
+/// `application/problem+json` body from the single-sourced
+/// [`crate::problem`] map (`draft-cashu-charge-01` §Errors). The three
 /// non-collapsing concerns drive the status: `MintUnreachable` is 503 (transport,
-/// token NOT consumed, NEVER a 402); `MalformedRequest` is 400 (not a well-formed
-/// payment attempt); everything else (verification / malformed-credential) is a
-/// 402 with a fresh re-challenge. The 402 carries the problem body alongside the
-/// fresh `WWW-Authenticate`; a 503/400 carries the problem body with
+/// token NOT consumed, NEVER a 402) and carries `Retry-After`;
+/// `MalformedRequest`/`MethodUnsupported` are 400 (not a well-formed payment
+/// attempt); everything else (verification / malformed-credential) is a 402 with
+/// a fresh re-challenge. The 402 carries the problem body alongside the fresh
+/// `WWW-Authenticate`; a 503/400 carries the problem body with
 /// `Cache-Control: no-store`.
-fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
-    let (problem, status) = problem_for(&e);
+fn charge_error_to_response<C: Redeemer>(
+    e: ChargeError,
+    ctx: &ChargeMiddlewareState<C>,
+) -> Response {
+    let problem = Problem::for_error(&e);
+    let status = charge_error_status(&e);
     if status == StatusCode::PAYMENT_REQUIRED {
-        return challenge_response(requirement, Some(&problem));
+        return challenge_response(ctx, Some(&problem));
     }
-    let body = serde_json::to_string(&problem).expect("Problem always serializes");
-    (
+    let mut response = (
         status,
         [
             (
                 http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/problem+json"),
+                HeaderValue::from_static(PROBLEM_JSON),
             ),
             (
                 http::header::CACHE_CONTROL,
                 HeaderValue::from_static("no-store"),
             ),
         ],
-        body,
+        problem.to_json(),
     )
-        .into_response()
+        .into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_static("2"),
+        );
+    }
+    response
 }
 
 /// Pluck the echoed challenge fields out of a parsed credentials blob — for test
@@ -397,7 +445,7 @@ mod tests {
     use crate::challenge::CashuRequirement;
     use crate::redeemer::Redeemed;
     use crate::envelope::{encode_payment_credentials, CashuPayload, PaymentCredentials};
-    use crate::mint_client::{MintClient, MintClientError};
+    use crate::mint_client::{MintClient, MintClientError, SwapOutcome};
 
     // ---- Mock MintClient (mirrors the validator's test helper) -------
 
@@ -407,8 +455,14 @@ mod tests {
         /// Post-submit (indeterminate) failure → exercises the 503 mapping.
         UnreachableIndeterminate,
         RejectedSwap,
-        /// Swap-output DLEQ gate rejected the mint's blind signatures →
-        /// money-safety path: 402 + re-challenge, resource NOT served.
+        /// The mint typed the rejection as already-spent → exercises the
+        /// double-spend detail.
+        AlreadySpent,
+        /// Keyset-class rejection (retired / final_expiry passed) → exercises
+        /// the payment-expired mapping.
+        KeysetRetiredOrExpired,
+        /// Swap-output DLEQ verdict failed → serve-and-flag path: the swap
+        /// SUCCEEDED, the response is the success path, `dleq_ok` is false.
         DleqInvalid,
     }
 
@@ -435,9 +489,12 @@ mod tests {
             &self,
             _mint_url: &MintUrl,
             proofs: Proofs,
-        ) -> Result<Proofs, MintClientError> {
+        ) -> Result<SwapOutcome, MintClientError> {
             match self.swap_response {
-                SwapResponse::Echo => Ok(proofs),
+                SwapResponse::Echo => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: true,
+                }),
                 SwapResponse::Unreachable => Err(MintClientError::Unreachable(
                     "mock unreachable".into(),
                 )),
@@ -447,9 +504,16 @@ mod tests {
                 SwapResponse::RejectedSwap => {
                     Err(MintClientError::RejectedSwap("mock rejected".into()))
                 }
-                SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
-                    "mock swap-output DLEQ invalid".into(),
-                )),
+                SwapResponse::AlreadySpent => {
+                    Err(MintClientError::AlreadySpent("mock already spent".into()))
+                }
+                SwapResponse::KeysetRetiredOrExpired => Err(
+                    MintClientError::KeysetRetiredOrExpired("mock keyset retired".into()),
+                ),
+                SwapResponse::DleqInvalid => Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: false,
+                }),
             }
         }
     }
@@ -564,10 +628,11 @@ mod tests {
             .expect("build request with header")
     }
 
-    /// Wrap a raw `cashuB…` token in the Payment envelope with a fake-but-shapely
-    /// echoed challenge. The middleware does not validate `challenge.id`, so any
-    /// well-formed echo works.
-    fn payment_header_with_token(token: &str) -> String {
+    /// Wrap a raw `cashuB…` token in the Payment envelope around an UNISSUED
+    /// (never-challenged) echo — fails the stateless binding by construction.
+    /// For the pre-binding paths (>1-credential 400) and the
+    /// unissued-echo-rejection test itself.
+    fn unissued_echo_header(token: &str) -> String {
         let creds = PaymentCredentials {
             challenge: EchoedChallenge {
                 id: "test-challenge-id".into(),
@@ -578,19 +643,62 @@ mod tests {
                 digest: None,
                 opaque: None,
                 expires: None,
+                description: None,
             },
             payload: CashuPayload {
-                cashu_token: token.into(),
+                token: token.into(),
             },
             source: None,
         };
         format!("Payment {}", encode_payment_credentials(&creds))
     }
 
-    /// Build a GET /gated request whose `Authorization` header is the
-    /// Payment Authentication envelope around `token`.
-    fn request_with_token(token: &str) -> HttpRequest<Body> {
-        request_with_authorization(&payment_header_with_token(token))
+    /// Fetch a REAL challenge off the router (bare request → 402) and parse
+    /// its auth-params — the first half of the client dance.
+    async fn fetch_challenge(app: &Router) -> crate::envelope::PaymentParams {
+        let response = app
+            .clone()
+            .oneshot(bare_request())
+            .await
+            .expect("challenge fetch");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let header = www_authenticate(&response);
+        crate::envelope::parse_payment_params(&header).expect("challenge params parse")
+    }
+
+    /// Echo issued params verbatim into the credential's challenge object.
+    fn echo_of(params: &crate::envelope::PaymentParams) -> EchoedChallenge {
+        EchoedChallenge {
+            id: params.id.clone(),
+            realm: params.realm.clone(),
+            method: params.method.clone(),
+            intent: params.intent.clone(),
+            request: params.request.clone(),
+            digest: params.digest.clone(),
+            opaque: params.opaque.clone(),
+            expires: params.expires.clone(),
+            description: params.description.clone(),
+        }
+    }
+
+    /// The `Authorization: Payment …` header value for `echo` + `token`.
+    fn header_for_echo(echo: EchoedChallenge, token: &str) -> String {
+        let creds = PaymentCredentials {
+            challenge: echo,
+            payload: CashuPayload {
+                token: token.into(),
+            },
+            source: None,
+        };
+        format!("Payment {}", encode_payment_credentials(&creds))
+    }
+
+    /// The full client dance: fetch a real challenge from `app`, echo its
+    /// params faithfully, and build the authenticated retry request carrying
+    /// `token`.
+    async fn request_with_token(app: &Router, token: &str) -> HttpRequest<Body> {
+        let params = fetch_challenge(app).await;
+        request_with_authorization(&header_for_echo(echo_of(&params), token))
     }
 
     /// GET /gated with raw header bytes (for the non-utf8 case). `header()`
@@ -732,10 +840,8 @@ mod tests {
         let encoded = token.to_string();
 
         let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_token(&encoded))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::OK);
 
         let body_bytes = to_bytes(response.into_body(), 1024)
@@ -744,36 +850,207 @@ mod tests {
         assert_eq!(&body_bytes[..], b"ok:10");
     }
 
+    // ---- Challenge binding (stateless HMAC id + expires) --------------
+
+    /// Read the problem body of a response as JSON.
+    async fn problem_body(response: Response) -> serde_json::Value {
+        let bytes = to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("collect body");
+        serde_json::from_slice(&bytes).expect("problem+json body")
+    }
+
     #[tokio::test]
-    async fn authorization_blob_echoes_challenge_id() {
-        // challenge-id binding is not enforced, but the round-trip must still 200.
+    async fn challenge_emits_hmac_id_and_future_expires() {
+        let app = router_with(state_with(SwapResponse::Echo));
+        let params = fetch_challenge(&app).await;
+        // The id is base64url-nopad over 32 HMAC-SHA256 bytes — not a UUID.
+        let id_bytes = URL_SAFE_NO_PAD
+            .decode(&params.id)
+            .expect("id is base64url-nopad");
+        assert_eq!(id_bytes.len(), 32, "id is an HMAC-SHA256 output");
+        // expires is REQUIRED under stateless operation, RFC 3339, future.
+        let expires = params.expires.as_deref().expect("challenge carries expires");
+        let ts = chrono::DateTime::parse_from_rfc3339(expires).expect("expires is RFC 3339");
+        assert!(ts.with_timezone(&Utc) > Utc::now(), "expires is in the future");
+    }
+
+    #[tokio::test]
+    async fn faithful_echo_of_issued_challenge_passes() {
+        // The fresh-challenge happy path: fetch → echo verbatim → 200.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
-        let encoded = token.to_string();
+        let app = router_with(state_with(SwapResponse::Echo));
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 
-        let creds = PaymentCredentials {
-            challenge: EchoedChallenge {
-                id: "echoed-id-from-client".into(),
-                realm: DEFAULT_REALM.into(),
-                method: "cashu".into(),
-                intent: INTENT_CHARGE.into(),
-                request: "echoed-request".into(),
-                digest: None,
-                opaque: None,
-                expires: None,
-            },
-            payload: CashuPayload {
-                cashu_token: encoded,
-            },
-            source: None,
-        };
-        let header = format!("Payment {}", encode_payment_credentials(&creds));
-
+    #[tokio::test]
+    async fn unissued_challenge_echo_returns_invalid_challenge() {
+        // An echo this server never issued (the old fake-fixture shape) fails
+        // the id recomputation → invalid-challenge 402 + fresh challenge.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
+            .oneshot(request_with_authorization(&unissued_echo_header(
+                &token.to_string(),
+            )))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .is_some());
+        let problem = problem_body(response).await;
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/invalid-challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn tampering_each_echoed_slot_returns_invalid_challenge() {
+        // Per HMAC slot reachable through this host: realm, intent, request,
+        // expires (value), digest (injected), opaque (injected), and the id
+        // itself. (`method` is covered separately: a non-"cashu" method is the
+        // framework's method-unsupported 400 at parse time.)
+        type Tamper = (&'static str, fn(&mut EchoedChallenge));
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let tampers: Vec<Tamper> = vec![
+            ("realm", |e| e.realm = "evil.example".into()),
+            ("intent", |e| e.intent = "authorize".into()),
+            ("request", |e| e.request.push('x')),
+            ("expires", |e| {
+                e.expires = Some("2999-01-01T00:00:00Z".into())
+            }),
+            ("digest", |e| e.digest = Some("sha-256=:forged:".into())),
+            ("opaque", |e| e.opaque = Some("Zm9yZ2Vk".into())),
+            ("id", |e| e.id = "QQ".repeat(22)),
+        ];
+        for (slot, tamper) in tampers {
+            let app = router_with(state_with(SwapResponse::Echo));
+            let params = fetch_challenge(&app).await;
+            let mut echo = echo_of(&params);
+            tamper(&mut echo);
+            let response = app
+                .oneshot(request_with_authorization(&header_for_echo(
+                    echo,
+                    &token.to_string(),
+                )))
+                .await
+                .expect("oneshot");
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYMENT_REQUIRED,
+                "tampered {slot} must 402"
+            );
+            let problem = problem_body(response).await;
+            assert_eq!(
+                problem["type"], "https://paymentauth.org/problems/invalid-challenge",
+                "tampered {slot} must be invalid-challenge"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn echo_missing_expires_returns_invalid_challenge() {
+        // Every stateless challenge is issued WITH expires; an echo without it
+        // is not a faithful echo (and payment-expired would be wrong: nothing
+        // authentic has expired).
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::Echo));
+        let params = fetch_challenge(&app).await;
+        let mut echo = echo_of(&params);
+        echo.expires = None;
+        let response = app
+            .oneshot(request_with_authorization(&header_for_echo(
+                echo,
+                &token.to_string(),
+            )))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let problem = problem_body(response).await;
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/invalid-challenge"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_expires_returns_payment_expired_before_any_redeem() {
+        // TTL zero: the issued challenge is authentic but instantly stale —
+        // payment-expired (NOT invalid-challenge); the redeemer is never
+        // reached.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let state = Arc::new(
+            ChargeMiddlewareState::new(
+                requirement(pop_unit(), vec![mint_a()], 10),
+                CashuCredential::new(MockMintClient::new(SwapResponse::Echo)),
+            )
+            .with_challenge_ttl(std::time::Duration::ZERO),
+        );
+        let app = router_with(state);
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(response
+            .headers()
+            .get(http::header::WWW_AUTHENTICATE)
+            .is_some());
+        let problem = problem_body(response).await;
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/payment-expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_binding_key_survives_state_rebuild() {
+        // Two states sharing one configured key accept each other's
+        // challenges (the restart-with-configured-key story); a state with a
+        // different (generated) key rejects them.
+        let key_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+
+        let issuing = router_with(Arc::new(
+            ChargeMiddlewareState::new(
+                requirement(pop_unit(), vec![mint_a()], 10),
+                CashuCredential::new(MockMintClient::new(SwapResponse::Echo)),
+            )
+            .with_binding_key(BindingKey::from_hex(key_hex).expect("hex key")),
+        ));
+        let params = fetch_challenge(&issuing).await;
+        let header = header_for_echo(echo_of(&params), &token.to_string());
+
+        let same_key = router_with(Arc::new(
+            ChargeMiddlewareState::new(
+                requirement(pop_unit(), vec![mint_a()], 10),
+                CashuCredential::new(MockMintClient::new(SwapResponse::Echo)),
+            )
+            .with_binding_key(BindingKey::from_hex(key_hex).expect("hex key")),
+        ));
+        let response = same_key
             .oneshot(request_with_authorization(&header))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a configured key honors challenges across instances"
+        );
+
+        let other_key = router_with(state_with(SwapResponse::Echo));
+        let response = other_key
+            .oneshot(request_with_authorization(&header))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "a different key rejects the foreign challenge"
+        );
     }
 
     // ---- Validation-failure mapping (all → 402 + re-challenge) -------
@@ -795,10 +1072,8 @@ mod tests {
     #[tokio::test]
     async fn malformed_token_returns_402() {
         let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_token("cashuB!!!notbase64!!!"))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, "cashuB!!!notbase64!!!").await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
@@ -817,10 +1092,8 @@ mod tests {
         let encoded = token.to_string();
 
         let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_token(&encoded))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let header = www_authenticate(&response);
         assert!(header.contains(r#"method="cashu""#));
@@ -850,10 +1123,8 @@ mod tests {
         let encoded = token.to_string();
 
         let app = router_with(state_with(SwapResponse::Unreachable));
-        let response = app
-            .oneshot(request_with_token(&encoded))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
@@ -865,17 +1136,111 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hung_mint_returns_503_mint_unavailable_within_timeout() {
+        // END-TO-END through the REAL CdkMintClient: a mint that accepts TCP
+        // but never answers must produce the 503 mint-unavailable path within
+        // the configured mint HTTP timeout plus margin — never hang the
+        // request. (The token is NOT consumed: the hang is on the pre-swap
+        // keysets GET, the determinate arm.)
+        use crate::cdk_mint_client::CdkMintClient;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hung mint");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let _held_open = socket;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let hung_mint =
+            MintUrl::from_str(&format!("http://127.0.0.1:{port}")).expect("local mint url");
+        let token = make_token(hung_mint.clone(), pop_unit(), vec![make_proof(10, 0)]);
+
+        type CdkCredential = CashuCredential<CdkMintClient>;
+        let state: Arc<ChargeMiddlewareState<CdkCredential>> =
+            Arc::new(ChargeMiddlewareState::new(
+                requirement(pop_unit(), vec![hung_mint], 10),
+                CashuCredential::new(CdkMintClient::with_timeout(
+                    std::time::Duration::from_millis(250),
+                )),
+            ));
+        async fn echo(Extension(redeemed): Extension<Redeemed>) -> String {
+            format!("ok:{}", redeemed.amount)
+        }
+        let app = Router::new()
+            .route("/gated", get(echo))
+            .layer(from_fn_with_state(state, require_charge::<CdkCredential>));
+
+        let request = request_with_token(&app, &token.to_string()).await;
+        let started = std::time::Instant::now();
+        let response = app.oneshot(request).await.expect("oneshot");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a hung mint is the mint-unavailable path"
+        );
+        assert!(
+            response.headers().get(http::header::RETRY_AFTER).is_some(),
+            "the 503 carries Retry-After"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must answer within the 250ms mint timeout plus margin, took {elapsed:?}"
+        );
+    }
+
     #[tokio::test]
-    async fn mint_rejected_returns_402() {
-        // A rejected swap is a verification failure → 402 + re-challenge.
+    async fn mint_rejected_returns_402_with_neutral_detail() {
+        // A non-keyset swap rejection the mint did NOT type as already-spent is
+        // the spec's step-9 else-branch → verification-failed 402 with a
+        // neutral detail (no double-spend claim the mint never made).
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
         let app = router_with(state_with(SwapResponse::RejectedSwap));
-        let response = app
-            .oneshot(request_with_token(&encoded))
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        let body_bytes = to_bytes(response.into_body(), 1024)
             .await
-            .expect("oneshot");
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        assert!(
+            body.contains("the mint rejected the swap"),
+            "expected the neutral rejected-swap detail, got: {body}"
+        );
+        assert!(
+            !body.contains("double-spend"),
+            "an untyped rejection must not claim a double-spend, got: {body}"
+        );
+        assert!(
+            body.contains("https://paymentauth.org/problems/verification-failed"),
+            "a swap rejection answers with the verification-failed type, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_spent_rejection_returns_402_with_double_spend_detail() {
+        // The mint typed the rejection as already-spent (NUT 11001 /
+        // cdk TokenAlreadySpent) → the spent-specific detail; same
+        // verification-failed 402.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let encoded = token.to_string();
+
+        let app = router_with(state_with(SwapResponse::AlreadySpent));
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
@@ -883,42 +1248,87 @@ mod tests {
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
         assert!(
             body.contains("double-spend"),
-            "expected double-spend (SAFE interim for any swap rejection) message, got: {body}"
+            "expected the double-spend detail, got: {body}"
+        );
+        assert!(
+            body.contains("https://paymentauth.org/problems/verification-failed"),
+            "an already-spent rejection answers with the verification-failed type, got: {body}"
         );
     }
 
     #[tokio::test]
-    async fn swap_output_dleq_invalid_returns_402_and_does_not_serve_resource() {
-        // Money-safety end-to-end: a missing/invalid swap-output DLEQ maps to
-        // ChargeError::DleqInvalid → 402 + re-challenge, and the gated handler
-        // MUST NOT run, so a malicious/buggy mint never gets the resource served
-        // against unsigned ecash.
+    async fn keyset_retired_swap_rejection_returns_402_payment_expired() {
+        // Spec step 9 + Keyset Rotation §: a swap rejected for keyset
+        // retirement or passed final_expiry answers payment-expired (with a
+        // fresh challenge), NOT verification-failed — the client re-presents
+        // the same token once against the fresh challenge.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let encoded = token.to_string();
 
-        let app = router_with(state_with(SwapResponse::DleqInvalid));
-        let response = app
-            .oneshot(request_with_token(&encoded))
-            .await
-            .expect("oneshot");
-
+        let app = router_with(state_with(SwapResponse::KeysetRetiredOrExpired));
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(response
-            .headers()
-            .get(http::header::WWW_AUTHENTICATE)
-            .is_some());
-
+        let header = www_authenticate(&response);
+        assert!(
+            header.starts_with("Payment "),
+            "a fresh challenge must accompany the 402: {header}"
+        );
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
         let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
         assert!(
-            !body.starts_with("ok:"),
-            "gated resource must NOT be served on a DLEQ failure, got: {body}"
+            body.contains("https://paymentauth.org/problems/payment-expired"),
+            "a keyset-class rejection answers with the payment-expired type, got: {body}"
         );
         assert!(
-            body.to_ascii_lowercase().contains("dleq"),
-            "expected a DLEQ failure message, got: {body}"
+            !body.contains("verification-failed"),
+            "must not collapse into verification-failed, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_output_dleq_failure_serves_resource_with_flag_in_extension() {
+        // Spec step 9: "a failed or missing DLEQ proof after a successful swap
+        // is a mint-trust incident, not a payment failure" — the HTTP response
+        // is the NORMAL success path (200 + receipt), the gated handler runs,
+        // and the false verdict rides `Extension<Redeemed>.dleq_ok` for the
+        // operator surface.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let encoded = token.to_string();
+
+        async fn echo_flag(Extension(redeemed): Extension<Redeemed>) -> String {
+            format!("ok:{}:dleq_ok={}", redeemed.amount, redeemed.dleq_ok)
+        }
+        let app = Router::new()
+            .route("/gated", get(echo_flag))
+            .layer(from_fn_with_state(
+                state_with(SwapResponse::DleqInvalid),
+                require_charge::<TestCredential>,
+            ));
+
+        let request = request_with_token(&app, &encoded).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the payment settled; §security-dleq forbids failing it (MUST NOT \
+             respond with a payment-failure status after a successful swap)"
+        );
+        assert!(
+            response.headers().get("payment-receipt").is_some(),
+            "a settled payment carries its receipt"
+        );
+
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        assert_eq!(
+            body, "ok:10:dleq_ok=false",
+            "the resource is served and the extension carries the false verdict"
         );
     }
 
@@ -928,10 +1338,8 @@ mod tests {
         // handler never runs.
         let token = make_token(mint_a(), pop_unit(), vec![p2pk_locked_proof(10, 0)]);
         let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_token(&token.to_string()))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         assert!(response
             .headers()
@@ -958,10 +1366,8 @@ mod tests {
             vec![make_proof(2, 0), make_proof(4, 1), make_proof(4, 2)],
         );
         let app = router_with(state_with_max_proofs(SwapResponse::Echo, 2));
-        let response = app
-            .oneshot(request_with_token(&token.to_string()))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
@@ -980,10 +1386,8 @@ mod tests {
         // changes status, only the operator's checkstate obligation.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
         let app = router_with(state_with(SwapResponse::UnreachableIndeterminate));
-        let response = app
-            .oneshot(request_with_token(&token.to_string()))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(
             response.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1071,7 +1475,7 @@ mod tests {
     async fn json_missing_challenge_field_returns_402() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
-        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"cashu_token":"cashuBabc"}}"#);
+        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"token":"cashuBabc"}}"#);
         let header = format!("Payment {blob}");
 
         let app = router_with(state_with(SwapResponse::Echo));
@@ -1100,8 +1504,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_method_returns_402() {
-        // Valid envelope but `method="tempo"` → validation failure → 402.
+    async fn non_cashu_method_returns_400_method_unsupported() {
+        // Valid envelope but `method="tempo"` → the framework's
+        // method-unsupported (HTTP 400), NOT a 402 malformed-credential.
         let creds = PaymentCredentials {
             challenge: EchoedChallenge {
                 id: "id".into(),
@@ -1112,9 +1517,10 @@ mod tests {
                 digest: None,
                 opaque: None,
                 expires: None,
+                description: None,
             },
             payload: CashuPayload {
-                cashu_token: "cashuBabc".into(),
+                token: "cashuBabc".into(),
             },
             source: None,
         };
@@ -1125,15 +1531,80 @@ mod tests {
             .oneshot(request_with_authorization(&header))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8>");
-        assert!(
-            body.contains("must be 'cashu'"),
-            "expected wrong-method message, got: {body}"
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/method-unsupported"
         );
+        assert_eq!(problem["status"], 400);
+        assert!(
+            problem["detail"].as_str().unwrap_or("").contains("tempo"),
+            "detail names the offending method: {problem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_payment_credentials_return_400_bad_request() {
+        // Framework: clients MUST send only one Authorization: Payment
+        // credential; two of them are a malformed request frame → 400 with the
+        // about:blank type (no registered slug), never the invalid-challenge 402.
+        // The frame check precedes the binding check, so an unissued echo works.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let header = unissued_echo_header(&token.to_string());
+        let mut req = HttpRequest::builder()
+            .uri("/gated")
+            .body(Body::empty())
+            .expect("build request");
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_str(&header).expect("ascii"),
+        );
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_str(&header).expect("ascii"),
+        );
+
+        let app = router_with(state_with(SwapResponse::Echo));
+        let response = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(problem["type"], "about:blank");
+        assert_eq!(problem["status"], 400);
+    }
+
+    #[tokio::test]
+    async fn one_payment_credential_among_other_schemes_still_verifies() {
+        // The >1 rule counts PAYMENT credentials only; a Basic header alongside
+        // the one Payment credential is not a malformed frame. (The Payment
+        // value must come first for the single-get parse to see it.)
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::Echo));
+        let params = fetch_challenge(&app).await;
+        let header = header_for_echo(echo_of(&params), &token.to_string());
+        let mut req = HttpRequest::builder()
+            .uri("/gated")
+            .body(Body::empty())
+            .expect("build request");
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_str(&header).expect("ascii"),
+        );
+        req.headers_mut().append(
+            AUTHORIZATION,
+            http::HeaderValue::from_static("Basic dXNlcjpwdw=="),
+        );
+
+        let response = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1146,7 +1617,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     }
 
-    // ---- Exact-amount enforcement ------------------------------------
+    // ---- Value-coverage enforcement ------------------------------------
 
     #[tokio::test]
     async fn exact_amount_presentation_passes_through() {
@@ -1157,10 +1628,8 @@ mod tests {
             vec![make_proof(8, 0), make_proof(2, 1)],
         );
         let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_token(&token.to_string()))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::OK);
 
         let body_bytes = to_bytes(response.into_body(), 1024)
@@ -1174,50 +1643,121 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overfunded_presentation_returns_402() {
-        // Exact-amount: a 20-against-10 over-funded token is rejected, NOT
-        // change-made — the holder splits to 10 locally before presenting.
+    async fn overfunded_presentation_is_accepted_and_excess_retained() {
+        // Spec step 8: value above `amount + swap_fee` is accepted and
+        // retained — a 20-against-10 token redeems whole and serves the
+        // resource; the handler sees the full redeemed value.
         let token = make_token(
             mint_a(),
             pop_unit(),
             vec![make_proof(16, 0), make_proof(4, 1)],
         );
         let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_token(&token.to_string()))
-            .await
-            .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(response
-            .headers()
-            .get(http::header::WWW_AUTHENTICATE)
-            .is_some());
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::OK);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        assert!(
-            body.contains("amount mismatch"),
-            "expected amount-mismatch body, got: {body}"
+        assert_eq!(
+            &body_bytes[..],
+            b"ok:20",
+            "the WHOLE over-funded value is redeemed and retained"
         );
     }
 
     #[tokio::test]
-    async fn underfunded_presentation_returns_402() {
+    async fn underfunded_presentation_returns_402_payment_insufficient() {
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(8, 0)]);
         let app = router_with(state_with(SwapResponse::Echo));
-        let response = app
-            .oneshot(request_with_token(&token.to_string()))
-            .await
-            .expect("oneshot");
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        assert!(
-            body.contains("amount mismatch"),
-            "expected amount-mismatch body, got: {body}"
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/payment-insufficient",
+            "an under-funded token is the framework's payment-insufficient"
         );
+        assert_eq!(problem["status"], 402);
+    }
+
+    #[tokio::test]
+    async fn mint_unreachable_503_carries_retry_after_and_no_custom_type() {
+        // Spec Errors §: mint unreachability carries no problem type — plain
+        // 503 + Retry-After, body about:blank.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::Unreachable));
+        let request = request_with_token(&app, &token.to_string()).await;
+        let response = app.oneshot(request).await.expect("oneshot");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().get(http::header::RETRY_AFTER).is_some(),
+            "a 503 SHOULD carry Retry-After"
+        );
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(
+            problem["type"], "about:blank",
+            "mint unreachability has no custom problem-type URI"
+        );
+    }
+
+    // ---- Payment-Receipt encoding (spec Encoding §: JCS before base64url) --
+
+    #[test]
+    fn payment_receipt_bytes_are_jcs_canonical() {
+        // Hand-derived from RFC 8785: keys sort lexicographically —
+        // challengeId < externalId < method < reference < status < timestamp —
+        // matching the spec's decoded receipt example, NOT the struct's
+        // declaration order.
+        let receipt = PaymentReceipt {
+            method: CASHU_METHOD,
+            challenge_id: "kM9xPqWvT2nJrHsY4aDfEb",
+            reference: "9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7",
+            status: "success",
+            timestamp: "2026-03-10T21:00:00Z".to_string(),
+            external_id: Some("order_12345"),
+        };
+        let json = serde_jcs::to_string(&receipt).expect("receipt serializes");
+        assert_eq!(
+            json,
+            r#"{"challengeId":"kM9xPqWvT2nJrHsY4aDfEb","externalId":"order_12345","method":"cashu","reference":"9b71d224bd62f3785d96d46ad3ea3d73319bfbc2890caadae2dff72519673ca7","status":"success","timestamp":"2026-03-10T21:00:00Z"}"#
+        );
+    }
+
+    #[test]
+    fn payment_receipt_header_is_base64url_nopad_of_jcs_bytes() {
+        let redeemed = Redeemed {
+            unit: "pop_1700000000".into(),
+            amount: 10,
+            proofs: crate::charge::RedeemedProofs {
+                fresh_proofs: "cashuBfresh".into(),
+                amount: 10,
+                unit: "pop_1700000000".into(),
+                active_keyset_id: "009a1f293253e41e".into(),
+                token_hash: "ref-hash".into(),
+            },
+            dleq_ok: true,
+        };
+        let header = payment_receipt_header(&redeemed, "ch-1", Some("inv-7"));
+        let bytes = URL_SAFE_NO_PAD.decode(&header).expect("base64url-nopad");
+        let json = std::str::from_utf8(&bytes).expect("utf8");
+        // The timestamp is stamped at build time; everything around it is the
+        // pinned JCS order with the supplied facts.
+        assert!(
+            json.starts_with(
+                r#"{"challengeId":"ch-1","externalId":"inv-7","method":"cashu","reference":"ref-hash","status":"success","timestamp":""#
+            ),
+            "receipt bytes must be JCS-ordered, got: {json}"
+        );
+        assert!(json.ends_with(r#""}"#), "got: {json}");
     }
 }

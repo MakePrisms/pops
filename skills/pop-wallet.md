@@ -64,7 +64,7 @@ CONTRACT below and `pop-wallet.schema.json` for the schema.
 - **Failure**: `{ "schema_version": 1, "error": { "code", "retriable",
   "message", "details"? } }` on **stdout**, with a **non-zero exit (1)**. Two
   failure signals: the `error` key AND the non-zero exit.
-  - `code` — stable lower_snake_case enum (the 31 codes below). **Branch on
+  - `code` — stable lower_snake_case enum (the 33 codes below). **Branch on
     `code`, never on `message`.**
   - `retriable` — bool; `true` ⟺ the failure is transient (safe to retry the
     same call as-is).
@@ -445,10 +445,11 @@ print as a readable totals-plus-per-state table.
 
 Append one JSON object per line to `~/.pop-wallet/agent-activity.jsonl` for
 **every** wallet action you take. This is your memory of *when* and *why*; the
-wallet's `pop list --json` is the source of truth for current *state*. (Note: the
-wallet's `list/status --json` exposes `ts_expiry` and `recover_after_utc` but NOT
-the deposit's creation time — so your log's `at` timestamp is what lets you
-answer "the bitcoin I locked last Tuesday".)
+wallet's `pop list --json` is the source of truth for current *state*. (The
+deposit JSON exposes the creation time too — `created_at` (unix seconds) and
+`created_at_utc` — alongside `ts_expiry` / `recover_after_utc`, so "the bitcoin
+I locked last Tuesday" is answerable from `list` alone; your log's `at` adds
+the *why* and the human context.)
 
 **Line format** (compact JSON, one per line):
 
@@ -540,7 +541,7 @@ Schema: `pop-wallet.schema.json` (next to this file). Filled example
 
 ---
 
-## ERROR CONTRACT — the 31 codes (FROZEN, additive-only)
+## ERROR CONTRACT — the 33 codes (FROZEN, additive-only)
 
 On failure, `pop` writes `{ "schema_version": 1, "error": { "code", "retriable",
 "message", "details"? } }` to **stdout** and exits **1**. Branch on `code` +
@@ -563,17 +564,19 @@ from them.
 | `quote_expired` | false | needs_input | `{quote_id, expired_at}` REQ | STOP polling + re-`quote`; funds sent are recoverable after CLTV |
 | `amount_mismatch` | false | needs_input | `{expected_sats, funded_sats}` REQ | PoP is exact-amount; funds are safe on-chain — `recover` that deposit |
 | `value_below_fee` | false | needs_input | `{value_sats, fee_sats}` REQ | UTXO uneconomical to sweep — lower `--fee` or wait for feerate |
+| `fee_too_high` | false | needs_input | `{fee_sats, value_sats, max_percent}` REQ | (`recover`) the AUTO-estimated sweep fee would eat ≥ `max_percent`% of the UTXO — refused BEFORE broadcast. Pass an explicit `--fee <sats>` if intentional, `--no-broadcast` to inspect, or wait for the feerate to drop |
 | `not_402` | false | terminal | `{url, status_got}` REQ | (`pay`) the URL answered neither 2xx nor 402 — it isn't gating with payment; check the URL |
 | `payment_rejected` | false | terminal/needs_input | `{required_amount?, unit?, reason?}` REQ when the 402 told us | (`pay`) service rejected the payment |
 | `no_payment_challenge` | false | terminal | `{url, reason}` REQ | (`pay`) the 402 had no parseable `WWW-Authenticate: Payment` challenge; nothing to satisfy |
-| `challenge_parse_failed` | false | terminal | `{reason}` REQ | (`pay`) the challenge didn't decode into a charge (bad request envelope/`creqA`, or missing amount) |
+| `challenge_parse_failed` | false | terminal | `{reason}` REQ | (`pay`) the challenge didn't decode into a charge (bad request object/`creqA`, or missing amount) |
+| `challenge_expired` | false | needs_input | `{url, expires}` REQ | (`pay`) the 402 challenge's `expires` is already past — a credential must NOT be submitted against it, so NOTHING was sent and the held token is intact. Re-request the resource for a fresh challenge, then pay that |
 | `token_unit_mismatch` | false | needs_input | `{required, got}` REQ | (`pay`) `--token` unit ≠ the charge's unit; present a token in `required` — SENT NOTHING |
 | `token_mint_mismatch` | false | needs_input | `{token_mint, accepted_mints}` REQ | (`pay`) `--token`'s mint isn't accepted by the charge (or the charge named no mints); use an accepted-mint token — SENT NOTHING |
 | `insufficient_token_value` | false | needs_input | `{have, need}` REQ | (`pay`) `--token` is worth less than the charge (+ any swap fee, folded into `need`); present a bigger token — SENT NOTHING |
 | `amount_exceeds_cap` | false | needs_input | `{amount, cap}` REQ | (`pay`) the charge exceeds `--max-amount`; raise the cap only if you trust the charge — SENT NOTHING |
 | `swap_failed` | false | terminal | `{reason}` REQ | (`pay`) the NUT-03 swap-to-exact failed; the token may be unspent (verify) — nothing presented to the gateway |
 | `exact_amount_assertion_failed` | false | terminal | `{required, got}` REQ | (`pay`) INTERNAL money-safety abort — the send set didn't equal the charge; SENT NOTHING. Must never happen — report it |
-| `gateway_rejected_payment` | false | terminal | `{status, body, send_token, change_token?}` REQ(status, body, send_token) | (`pay`) the gateway answered non-2xx after a valid payment; surface `body`. The gateway did NOT redeem, so **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH** (the pop's input was spent by the swap). `--human` mode prints both tokens to stderr |
+| `gateway_rejected_payment` | false | terminal | `{status, body, send_token, change_token?}` REQ(status, body, send_token) | (`pay`) the gateway answered non-2xx after the token was sent; surface `body`. On a **4xx** (verification rejection) the gateway did NOT redeem — `send_token` (worth the charge) AND any `change_token` are unspent ecash; RECOVER BOTH (the pop's input was spent by the swap). On a **5xx** the error can FOLLOW a successful swap, so `send_token`'s redemption state is UNKNOWN — hold it and verify before assuming it is spendable (or spent); `change_token` was never sent and stays unspent. `--human` mode prints both tokens to stderr |
 | `gateway_retry_failed` | false | terminal | `{reason, send_token, change_token?}` REQ(reason, send_token) | (`pay`) the payment-retry HTTP call failed at the transport layer AFTER the swap spent the input — the retry never reached the gateway. **`send_token` (worth the charge) AND any `change_token` are unspent ecash — RECOVER BOTH and present `send_token` to the gateway directly; do NOT retry with the original `--token` (it is spent).** `--human` prints both to stderr |
 | `token_encode_failed` | false | terminal | `{reason, send_proofs?, change_proofs?}` REQ(reason) | (`pay`/`mint`) INTERNAL: the ecash was issued (`mint`) or swapped (`pay`) but a proof set could not be encoded to a `cashuB` string. The raw proofs are in `details.send_proofs`/`details.change_proofs` (and printed in `--human`) — they ARE your ecash; re-encode to recover. On `mint` only `send_proofs` is present (the freshly-issued token). Must never happen — report it |
 | `address_mismatch` | false | terminal (security) | `{expected, got}` REQ | mint's address ≠ our reconstruction — do NOT fund; tell the human |
@@ -599,14 +602,15 @@ Notes:
 - `cltv_not_expired` is the **single**-`--deposit` immature signal; a `--all`
   sweep instead returns a per-deposit `"status":"immature"` row (see recover).
 - **`pay`-path codes** (`not_402`, `payment_rejected`, `no_payment_challenge`,
-  `challenge_parse_failed`, `token_unit_mismatch`, `token_mint_mismatch`,
-  `insufficient_token_value`, `amount_exceeds_cap`, `swap_failed`,
-  `exact_amount_assertion_failed`, `gateway_rejected_payment`,
+  `challenge_parse_failed`, `challenge_expired`, `token_unit_mismatch`,
+  `token_mint_mismatch`, `insufficient_token_value`, `amount_exceeds_cap`,
+  `swap_failed`, `exact_amount_assertion_failed`, `gateway_rejected_payment`,
   `gateway_retry_failed`, `token_encode_failed`) all belong to `pop pay` —
   EXCEPT `token_encode_failed`, which `pop mint` ALSO emits if a freshly-issued
   token cannot be encoded to its `cashuB` string (then only `send_proofs` is
   present; the issued ecash is recoverable from them). The
-  validation codes (`token_*`, `insufficient_token_value`, `amount_exceeds_cap`)
+  validation codes (`challenge_expired`, `token_*`,
+  `insufficient_token_value`, `amount_exceeds_cap`)
   and `swap_failed` are raised BEFORE / without a completed swap — when you see
   them, **no token was sent and the held pop is intact** (verify on `swap_failed`).
   `exact_amount_assertion_failed` also sends nothing (it fires before the gateway).

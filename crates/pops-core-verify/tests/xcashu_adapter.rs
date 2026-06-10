@@ -1,10 +1,11 @@
 //! Black-box integration tests for the NUT-24 `X-Cashu` HTTP transport,
 //! driving the public [`require_charge_xcashu`] middleware through an
 //! `axum::Router` over a mock [`MintClient`]. Covers the value-safety matrix:
-//! the `402` challenge shape, the happy path, exact-amount rejection (over- and
-//! under-pay), unit/mint/DLEQ/double-spend rejections (resource never served),
-//! the cashuB-only rule, malformed input, and the load-bearing
-//! mint-unreachable → `503` (token NOT consumed) rule.
+//! the `402` challenge shape, the happy path, the under-funded rejection,
+//! unit/mint/double-spend rejections (resource never served), the DLEQ
+//! serve-and-flag path (resource served, `dleq_ok: false`), the cashuB-only
+//! rule, malformed input, and the load-bearing mint-unreachable → `503`
+//! (token NOT consumed) rule.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,7 +30,7 @@ use pops_core_verify::cashu_credential::CashuCredential;
 use pops_core_verify::challenge::CashuRequirement;
 use pops_core_verify::middleware::ChargeMiddlewareState;
 use pops_core_verify::middleware_xcashu::require_charge_xcashu;
-use pops_core_verify::mint_client::{MintClient, MintClientError};
+use pops_core_verify::mint_client::{MintClient, MintClientError, SwapOutcome};
 use pops_core_verify::redeemer::Redeemed;
 use pops_core_verify::xcashu::X_CASHU;
 
@@ -39,9 +40,10 @@ enum SwapResponse {
     Echo,
     /// DETERMINATE unreachable: the token was NOT consumed.
     Unreachable,
-    /// Mint refused the swap (double-spent / expired).
-    RejectedSwap,
-    /// Swap-output DLEQ verification failed (money-safety path).
+    /// Mint typed the rejection as already-spent (the double-spend case).
+    AlreadySpent,
+    /// Swap SUCCEEDS (consumes the token) but the returned signatures fail
+    /// the NUT-12 verdict → serve-and-flag (`dleq_ok: false`).
     DleqInvalid,
 }
 
@@ -71,21 +73,33 @@ impl MintClient for MockMintClient {
         Ok(Vec::new())
     }
 
-    async fn swap(&self, _mint_url: &MintUrl, proofs: Proofs) -> Result<Proofs, MintClientError> {
+    async fn swap(
+        &self,
+        _mint_url: &MintUrl,
+        proofs: Proofs,
+    ) -> Result<SwapOutcome, MintClientError> {
         match self.swap_response {
             SwapResponse::Echo => {
                 self.swaps_succeeded.fetch_add(1, Ordering::SeqCst);
-                Ok(proofs)
+                Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: true,
+                })
             }
             SwapResponse::Unreachable => {
                 Err(MintClientError::Unreachable("mock unreachable".into()))
             }
-            SwapResponse::RejectedSwap => {
-                Err(MintClientError::RejectedSwap("mock rejected".into()))
+            SwapResponse::AlreadySpent => {
+                Err(MintClientError::AlreadySpent("mock already spent".into()))
             }
-            SwapResponse::DleqInvalid => Err(MintClientError::SwapOutputDleqInvalid(
-                "mock swap-output DLEQ invalid".into(),
-            )),
+            SwapResponse::DleqInvalid => {
+                // The swap itself SUCCEEDED — the token is consumed.
+                self.swaps_succeeded.fetch_add(1, Ordering::SeqCst);
+                Ok(SwapOutcome {
+                    proofs,
+                    dleq_ok: false,
+                })
+            }
         }
     }
 }
@@ -220,27 +234,25 @@ async fn valid_cashub_returns_200_and_serves_resource() {
     );
 }
 
-// ---- exact amount: overpay → reject, underpay → reject -------------
+// ---- value coverage: overpay → accepted, underpay → reject ----------
 
 #[tokio::test]
-async fn overpay_is_rejected_and_resource_not_served() {
-    // 20 against a required 10: EXACT-amount rejects, never captures the overage.
+async fn overpay_is_accepted_and_excess_retained() {
+    // 20 against a required 10: value above the requirement is accepted and
+    // retained (spec step 8) — the whole token swaps and the resource serves.
     let token = make_token(mint_a(), pop_unit(), vec![make_proof(16, 0), make_proof(4, 1)]);
     let (app, swaps) = router_for(SwapResponse::Echo);
     let response = app
         .oneshot(request_with_xcashu(&token.to_string()))
         .await
         .expect("oneshot");
-    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    assert!(x_cashu_header(&response).is_some(), "overpay re-challenges");
-    let body = body_string(response).await;
-    assert!(!body.starts_with("ok:"), "resource must NOT be served on overpay");
-    assert!(body.contains("amount mismatch"), "expected amount-mismatch body, got: {body}");
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        swaps.load(Ordering::SeqCst),
-        0,
-        "an over-funded token is rejected pre-swap (no overage capture)"
+        body_string(response).await,
+        "ok:20",
+        "the WHOLE over-funded value is redeemed and retained"
     );
+    assert_eq!(swaps.load(Ordering::SeqCst), 1, "the over-funded accept path swaps once");
 }
 
 #[tokio::test]
@@ -254,7 +266,10 @@ async fn underpay_is_rejected_and_resource_not_served() {
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     let body = body_string(response).await;
     assert!(!body.starts_with("ok:"), "resource must NOT be served on underpay");
-    assert!(body.contains("amount mismatch"), "expected amount-mismatch body, got: {body}");
+    assert!(
+        body.contains("payment-insufficient"),
+        "expected the payment-insufficient problem body, got: {body}"
+    );
     assert_eq!(swaps.load(Ordering::SeqCst), 0, "under-funded token rejected pre-swap");
 }
 
@@ -291,24 +306,49 @@ async fn wrong_mint_is_rejected_and_resource_not_served() {
     );
 }
 
-// ---- DLEQ-invalid → non-serving (resource NOT served) --------------
+// ---- DLEQ failure → serve-and-flag (spec step 9 + §security-dleq) ----
 
 #[tokio::test]
-async fn dleq_invalid_does_not_serve_resource() {
+async fn dleq_failure_serves_resource_and_flags_redeemed_extension() {
+    // "a failed or missing DLEQ proof after a successful swap is a mint-trust
+    // incident, not a payment failure" — the token WAS consumed, so the
+    // resource is served and the verdict rides `Redeemed.dleq_ok`.
     let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
-    let (app, _swaps) = router_for(SwapResponse::DleqInvalid);
+
+    let (mock, swaps) = MockMintClient::new(SwapResponse::DleqInvalid);
+    let state = Arc::new(ChargeMiddlewareState::new(
+        requirement(pop_unit(), vec![mint_a()], 10),
+        CashuCredential::new(mock),
+    ));
+    async fn echo_flag(Extension(redeemed): Extension<Redeemed>) -> String {
+        format!("ok:{}:dleq_ok={}", redeemed.amount, redeemed.dleq_ok)
+    }
+    let app = Router::new()
+        .route("/gated", get(echo_flag))
+        .layer(from_fn_with_state(
+            state,
+            require_charge_xcashu::<TestCredential>,
+        ));
+
     let response = app
         .oneshot(request_with_xcashu(&token.to_string()))
         .await
         .expect("oneshot");
-    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    assert!(x_cashu_header(&response).is_some(), "DLEQ failure re-challenges");
-    let body = body_string(response).await;
-    assert!(
-        !body.starts_with("ok:"),
-        "a malicious/buggy mint must NOT get the resource served against unsigned ecash"
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the payment settled; it must not be answered with a payment failure"
     );
-    assert!(body.to_ascii_lowercase().contains("dleq"), "expected DLEQ body, got: {body}");
+    let body = body_string(response).await;
+    assert_eq!(
+        body, "ok:10:dleq_ok=false",
+        "value redeemed, resource served, verdict carried"
+    );
+    assert_eq!(
+        swaps.load(Ordering::SeqCst),
+        1,
+        "the swap completed (the token was consumed)"
+    );
 }
 
 // ---- double-spend → reject -----------------------------------------
@@ -316,7 +356,7 @@ async fn dleq_invalid_does_not_serve_resource() {
 #[tokio::test]
 async fn double_spend_is_rejected_and_resource_not_served() {
     let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
-    let (app, _swaps) = router_for(SwapResponse::RejectedSwap);
+    let (app, _swaps) = router_for(SwapResponse::AlreadySpent);
     let response = app
         .oneshot(request_with_xcashu(&token.to_string()))
         .await

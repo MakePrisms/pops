@@ -9,8 +9,9 @@
 //! so the impl stays self-contained. A real impl performs the actual redeem
 //! (for cashu, the atomic NUT-03 swap with NUT-12 output-DLEQ verification); the
 //! ledger stands in for that source of truth while preserving every observable
-//! guarantee: atomic single-use redemption, exact-amount enforcement,
-//! double-spend rejection, unit/mint matching, and no value-loss on error.
+//! guarantee: atomic single-use redemption, value-coverage enforcement (under
+//! rejected, excess retained), double-spend rejection, unit/mint matching, and
+//! no value-loss on error.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -78,9 +79,10 @@ impl Redeemer for VoucherRedeemer {
             });
         }
 
-        // Exact amount: overpay and underpay are both rejected (contract 3).
-        if voucher.amount != req.amount {
-            return Err(ChargeError::AmountMismatch {
+        // Value coverage (contract 3): an under-funded voucher is rejected;
+        // value above the requirement is accepted and retained whole.
+        if voucher.amount < req.amount {
+            return Err(ChargeError::PaymentInsufficient {
                 required: req.amount,
                 presented: voucher.amount,
                 amount: req.amount,
@@ -115,6 +117,9 @@ impl Redeemer for VoucherRedeemer {
             unit: voucher.unit.clone(),
             amount: voucher.amount,
             proofs,
+            // The ledger has no output-integrity check (contract 2): an impl
+            // without one reports a clean verdict.
+            dleq_ok: true,
         })
     }
 }
@@ -188,19 +193,19 @@ async fn custom_redeemer_honors_the_contract() {
 }
 
 #[tokio::test]
-async fn custom_redeemer_rejects_amount_mismatch_without_spending() {
+async fn custom_redeemer_rejects_underfunded_without_spending() {
     let redeemer = sample_ledger();
     let mut req = sample_requirement();
-    req.amount = 9; // voucher carries 10 → mismatch with the requirement
+    req.amount = 11; // voucher carries 10 → under-funded
 
-    // Exact-amount enforcement (contract 3): rejected, not silently accepted.
+    // Value-coverage enforcement (contract 3): under-funded is rejected.
     let err = redeemer
         .verify_and_redeem("voucher-abc", &req)
         .await
-        .expect_err("an amount mismatch must be rejected");
+        .expect_err("an under-funded voucher must be rejected");
     assert!(
-        matches!(err, ChargeError::AmountMismatch { .. }),
-        "expected AmountMismatch, got {err:?}"
+        matches!(err, ChargeError::PaymentInsufficient { .. }),
+        "expected PaymentInsufficient, got {err:?}"
     );
 
     // No value-loss on the error path (contracts 1 + 6): the voucher is still
@@ -210,4 +215,20 @@ async fn custom_redeemer_rejects_amount_mismatch_without_spending() {
         .verify_and_redeem("voucher-abc", &ok_req)
         .await
         .expect("the voucher remained unspent after the rejected attempt");
+}
+
+#[tokio::test]
+async fn custom_redeemer_accepts_overfunded_and_retains_excess() {
+    let redeemer = sample_ledger();
+    let mut req = sample_requirement();
+    req.amount = 9; // voucher carries 10 → over-funded, accepted whole
+
+    let redeemed = redeemer
+        .verify_and_redeem("voucher-abc", &req)
+        .await
+        .expect("an over-funded voucher redeems (excess retained)");
+    assert_eq!(
+        redeemed.amount, 10,
+        "the full voucher value is redeemed and retained"
+    );
 }

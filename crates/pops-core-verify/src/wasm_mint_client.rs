@@ -19,6 +19,13 @@
 //! [`MintClientError::Unreachable`] (retryable); a 4xx (the mint refused) is
 //! [`MintClientError::RejectedSwap`]. A 2xx whose body fails to deserialize is
 //! a definitive `RejectedSwap` (the mint answered with something we can't use).
+//!
+//! Unlike [`CdkMintClient`][crate::cdk_mint_client::CdkMintClient], this
+//! client does not parse NUT error codes out of rejection bodies: a swap the
+//! mint refused for keyset retirement or expiry surfaces as `RejectedSwap`
+//! and therefore `verification-failed`, where the native host answers
+//! `payment-expired` — wasm consumers do not receive the spec's
+//! re-present-once signal for that case.
 
 use async_trait::async_trait;
 use cashu::nuts::nut02::{Id, KeySet, KeySetInfo, KeysetResponse};
@@ -29,7 +36,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-use crate::mint_client::{MintClient, MintClientError};
+use crate::mint_client::{MintClient, MintClientError, SwapOutcome};
 use crate::swap_ceremony::{swap_to_redeem, MintHttp};
 
 /// `fetch`-backed [`MintClient`] for wasm32.
@@ -221,7 +228,7 @@ impl MintClient for WasmMintClient {
         &self,
         mint_url: &MintUrl,
         proofs: Proofs,
-    ) -> Result<Proofs, MintClientError> {
+    ) -> Result<SwapOutcome, MintClientError> {
         // Same shared ceremony as the native client — only the transport below
         // it differs.
         swap_to_redeem(self, mint_url, proofs).await

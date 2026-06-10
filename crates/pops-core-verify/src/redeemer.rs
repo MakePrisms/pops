@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 /// What the verifier requires from a holder for a single charge, decoupled
 /// from any ecash type (the cashu-typed sibling is
 /// [`CashuRequirement`][crate::challenge::CashuRequirement], used only to
-/// build the `creqA`). All fields are plain data.
+/// build the `creqA`). All fields are plain data. `amount` is the minimum
+/// net value a credential must cover; excess is retained.
 ///
 /// `Serialize`/`Deserialize` so the wasm `verify_and_redeem` export can accept
 /// the requirement as a JSON string from the JS route (the cross-slice seam
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// `#[serde(default)]` so a route may omit them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChargeRequirement {
-    /// Exact amount of value required (net the server must receive).
+    /// Amount of value required (the minimum net the server must receive).
     pub amount: u64,
     /// Currency unit the presented credential must carry. For PoP this is
     /// `pop_<unix_ts>`.
@@ -56,11 +57,20 @@ pub struct ChargeRequirement {
 pub struct Redeemed {
     /// Unit of the redeemed value (echoes the requirement's `unit`).
     pub unit: String,
-    /// Net value the operator received (the requested `amount`).
+    /// Net value the operator received: at least the requirement's `amount`
+    /// (excess presented value is retained, so this MAY exceed it).
     pub amount: u64,
     /// The cross-slice redeemed-proofs payload (fresh proofs, active keyset,
     /// token hash) — `crate::charge::RedeemedProofs`.
     pub proofs: RedeemedProofs,
+    /// Verdict of the redemption-output integrity check (for cashu: NUT-12
+    /// DLEQ on the swap-RETURNED blind signatures). `false` is a SOURCE-trust
+    /// incident, not a payment failure (`draft-cashu-charge-01`
+    /// §security-dleq): the payment settled and the resource is served; hosts
+    /// surface this flag (it rides the middleware's `Extension<Redeemed>`) so
+    /// the operator can alert and quarantine the source. Implementations
+    /// without such a check report `true`.
+    pub dleq_ok: bool,
 }
 
 /// Verify a presented credential against a [`ChargeRequirement`] and, on
@@ -88,12 +98,17 @@ pub trait Redeemer {
     /// 1. **Atomic redeem** — the value is redeemed in one atomic operation;
     ///    partial redemption is impossible. On any failure the credential is
     ///    left unspent at its source (no value-loss).
-    /// 2. **Output-DLEQ verified** — the returned proofs are verified (NUT-12
-    ///    DLEQ for cashu) before being treated as value: a malicious or buggy
-    ///    source cannot make the redeemer accept unsigned outputs.
-    /// 3. **Exact amount** — `Redeemed.amount` is the net value received AND
-    ///    equals `req.amount`. Both overpay and underpay return a
-    ///    [`ChargeError`]; neither is silently accepted.
+    /// 2. **Output integrity verified and REPORTED** — the returned proofs'
+    ///    integrity check (NUT-12 DLEQ for cashu) always RUNS, and its verdict
+    ///    is returned as [`Redeemed::dleq_ok`]. A failed verdict MUST NOT fail
+    ///    the redemption (`draft-cashu-charge-01` §security-dleq: the
+    ///    credential was already consumed by the successful redemption, so
+    ///    erroring would both destroy the value and fail a settled payment);
+    ///    it is surfaced to the operator instead (flag + WARN log).
+    /// 3. **Value covered** — `Redeemed.amount` is the net value received and
+    ///    is at least `req.amount`. An under-funded credential returns a
+    ///    [`ChargeError`]; value above the requirement is accepted and
+    ///    retained (the spec's no-change model), surfaced in `Redeemed.amount`.
     /// 4. **Double-spend caught** — an already-spent or replayed credential
     ///    returns a [`ChargeError`].
     /// 5. **Unit + mint match** — the credential's unit and source satisfy

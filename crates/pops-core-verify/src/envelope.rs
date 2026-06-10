@@ -13,21 +13,21 @@
 //!     "intent":  "<echo of intent, e.g. \"charge\">",
 //!     "request": "<echo of request param>"
 //!   },
-//!   "payload": { "cashu_token": "cashuB..." }
+//!   "payload": { "token": "cashuB..." }
 //! }
 //! ```
 //!
 //! The credential blob is JCS-canonical (RFC 8785); the inner `request` echo and
-//! `cashu_token` strings are opaque (not re-canonicalized). The echoed
+//! `token` strings are opaque (not re-canonicalized). The echoed
 //! `challenge` carries optional `digest`/`opaque`/`expires` (present iff the 402
 //! carried them) and an optional top-level `source`; the parser tolerates these
 //! and any further unknown fields.
 //!
 //! Request object (`request="…"`): a base64url-nopad encoding of the JCS-canonical
 //! bytes of the `draft-cashu-charge-01` request schema —
-//! `{ amount, currency, description?, externalId?, methodDetails: { request, mints } }`
-//! — where `methodDetails.request` is the opaque `creqA…` and `methodDetails.mints`
-//! is the non-empty superset of the `creqA`'s accepted mints.
+//! `{ amount, currency, description?, externalId?, methodDetails: { paymentRequest } }`
+//! — where `methodDetails.paymentRequest` is the opaque `creqA…`, the
+//! authoritative source of all payment parameters (amount, unit, accepted mints).
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -70,14 +70,20 @@ pub struct EchoedChallenge {
     /// carried it. The verifier rejects an echo whose `expires` is in the past.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+    /// Echo of the optional human-readable description, present iff the 402
+    /// carried it. Display-only: the framework excludes it from the challenge
+    /// binding, so it is echoed but never authenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Cashu-method `payload`. This struct just carries the token string out of the
 /// JSON; its structural validation is the validator's job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CashuPayload {
-    /// The `cashuB…` token, forwarded as-is to [`crate::challenge::decode_token`].
-    pub cashu_token: String,
+    /// The `cashuB…` token (the spec's `payload.token`), forwarded as-is to
+    /// [`crate::challenge::decode_token`].
+    pub token: String,
 }
 
 /// Full `draft-cashu-charge-01` credentials object. The top-level `source` is
@@ -87,7 +93,7 @@ pub struct CashuPayload {
 pub struct PaymentCredentials {
     /// Echo of the WWW-Authenticate auth-params.
     pub challenge: EchoedChallenge,
-    /// Method-specific payload (cashu = `{ "cashu_token": "..." }`).
+    /// Method-specific payload (cashu = `{ "token": "..." }`).
     pub payload: CashuPayload,
     /// Optional client-supplied source identifier; absent on the wire when
     /// `None`.
@@ -127,7 +133,7 @@ pub enum AuthParseError {
 
 /// Parse an `Authorization: Payment <base64url-nopad-blob>` header into the
 /// structured credentials. `WrongMethod` is surfaced here for a non-`cashu`
-/// method; the caller still decodes `payload.cashu_token` via
+/// method; the caller still decodes `payload.token` via
 /// [`crate::challenge::decode_token`].
 pub fn parse_payment_authorization(
     header_value: &str,
@@ -182,8 +188,12 @@ pub fn encode_payment_credentials(credentials: &PaymentCredentials) -> String {
 }
 
 /// The `WWW-Authenticate: Payment …` auth-params a client receives on a 402.
-/// Cashu-free: `request` stays the raw base64url envelope (the client unwraps it
-/// via [`decode_request_envelope`]).
+/// Cashu-free: `request` stays the raw base64url request object (the client
+/// decodes it via [`decode_request_object`] or the cashu-coupled
+/// [`crate::challenge::decode_charge_request`]). The optional params
+/// (`expires`/`digest`/`opaque`/`description`) are captured when present
+/// because a client MUST echo each issued param unchanged in its credential
+/// (spec Credential Schema + Challenge Binding).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentParams {
     /// Server-issued challenge id.
@@ -196,6 +206,18 @@ pub struct PaymentParams {
     pub intent: String,
     /// The base64url-nopad request envelope (wraps the `creqA…`).
     pub request: String,
+    /// Optional RFC 3339 challenge expiry, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+    /// Optional request-body digest, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Optional server correlation opaque, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque: Option<String>,
+    /// Optional human-readable description, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Strip exactly ONE matched pair of surrounding double-quotes, or `None` (a
@@ -233,6 +255,10 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
     let mut method = None;
     let mut intent = None;
     let mut request = None;
+    let mut expires = None;
+    let mut digest = None;
+    let mut opaque = None;
+    let mut description = None;
 
     // Commas never appear in our values, so a naive split is safe.
     for piece in params_str.split(',') {
@@ -244,7 +270,17 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
             continue;
         };
         let key = key.trim();
-        if !matches!(key, "id" | "realm" | "method" | "intent" | "request") {
+        if !matches!(
+            key,
+            "id" | "realm"
+                | "method"
+                | "intent"
+                | "request"
+                | "expires"
+                | "digest"
+                | "opaque"
+                | "description"
+        ) {
             continue;
         }
         // Strict quoted-string (see `strip_quoted` / the fn doc).
@@ -262,6 +298,10 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
             "method" => method = Some(val.to_string()),
             "intent" => intent = Some(val.to_string()),
             "request" => request = Some(val.to_string()),
+            "expires" => expires = Some(val.to_string()),
+            "digest" => digest = Some(val.to_string()),
+            "opaque" => opaque = Some(val.to_string()),
+            "description" => description = Some(val.to_string()),
             _ => {}
         }
     }
@@ -276,17 +316,22 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
         method: method.ok_or_else(|| missing("method"))?,
         intent: intent.ok_or_else(|| missing("intent"))?,
         request: request.ok_or_else(|| missing("request"))?,
+        expires,
+        digest,
+        opaque,
+        description,
     })
 }
 
-/// Cashu method-details of the `draft-cashu-charge-01` request object: the
-/// opaque `creqA…` and the non-empty superset of the `creqA`'s accepted mints.
+/// Cashu method-details of the `draft-cashu-charge-01` request object. Exactly
+/// ONE field: the opaque payment request, the authoritative source of all
+/// payment parameters (amount, unit, accepted mints, spending-condition kind,
+/// single-use flag).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MethodDetails {
-    /// The opaque `creqA…` payment-request string.
-    pub request: String,
-    /// Mints the verifier accepts — a non-empty superset of the creqA's mints.
-    pub mints: Vec<String>,
+    /// The opaque Cashu payment-request string (`creqA…`).
+    #[serde(rename = "paymentRequest")]
+    pub payment_request: String,
 }
 
 /// The `draft-cashu-charge-01` `request` auth-param object. `amount` is the
@@ -304,7 +349,7 @@ pub struct RequestObject {
     /// Optional external correlation id; absent on the wire when `None`.
     #[serde(default, rename = "externalId", skip_serializing_if = "Option::is_none")]
     pub external_id: Option<String>,
-    /// Cashu method-specific details (the creqA + accepted mints).
+    /// Cashu method-specific details (the authoritative `paymentRequest`).
     #[serde(rename = "methodDetails")]
     pub method_details: MethodDetails,
 }
@@ -318,47 +363,18 @@ pub fn encode_request_object(object: &RequestObject) -> String {
 }
 
 /// Decode the `request="…"` auth-param into a [`RequestObject`]. Errors on bad
-/// base64 / JSON or a missing/wrong-shaped field (the cashu-semantic
-/// mints-superset check is the caller's, via the cashu-coupled
-/// [`crate::challenge`] layer).
+/// base64 / JSON or a missing/wrong-shaped field. The base64url MUST be
+/// unpadded — a padded value is malformed under the framework's grammar
+/// (the artifacts INSIDE the JSON, `creqA…`/`cashuB…`, carry their own
+/// padding-tolerant encodings). The cashu-semantic checks (creqA `a`/`u`/`m`
+/// presence + consistency) are the caller's, via the cashu-coupled
+/// [`crate::challenge`] layer.
 pub fn decode_request_object(b64: &str) -> Result<RequestObject, Error> {
     let bytes = URL_SAFE_NO_PAD
         .decode(b64.trim())
         .map_err(|e| Error::DecodeFailed(format!("request object base64: {e}")))?;
     serde_json::from_slice(&bytes)
         .map_err(|e| Error::DecodeFailed(format!("request object json: {e}")))
-}
-
-/// The JSON object inside the `pops-gateway` binary's `request` auth-param,
-/// holding the `creqA…` under a single `cashu_request` field. The gateway
-/// (`gateway.rs`) is a separate call-site with its own flat codec; the
-/// `draft-cashu-charge-01` request codec is [`RequestObject`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RequestEnvelope {
-    cashu_request: String,
-}
-
-/// Wrap a `creqA…` in the gateway's flat `request` envelope, base64url-nopad-
-/// encoded. Cannot fail. (The spec request codec is [`encode_request_object`].)
-pub fn encode_request_envelope(creq_a: &str) -> String {
-    let envelope = RequestEnvelope {
-        cashu_request: creq_a.to_string(),
-    };
-    let json = serde_json::to_string(&envelope)
-        .expect("RequestEnvelope always serializes");
-    URL_SAFE_NO_PAD.encode(json.as_bytes())
-}
-
-/// Unwrap the gateway's flat `request` envelope, returning the inner
-/// `cashu_request` (`creqA…`). Errors on bad base64 / JSON or a missing
-/// `cashu_request`. (The spec request codec is [`decode_request_object`].)
-pub fn decode_request_envelope(b64: &str) -> Result<String, Error> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(b64.trim())
-        .map_err(|e| Error::DecodeFailed(format!("request envelope base64: {e}")))?;
-    let envelope: RequestEnvelope = serde_json::from_slice(&bytes)
-        .map_err(|e| Error::DecodeFailed(format!("request envelope json: {e}")))?;
-    Ok(envelope.cashu_request)
 }
 
 #[cfg(test)]
@@ -376,9 +392,10 @@ mod tests {
                 digest: None,
                 opaque: None,
                 expires: None,
+                description: None,
             },
             payload: CashuPayload {
-                cashu_token: token.into(),
+                token: token.into(),
             },
             source: None,
         }
@@ -397,7 +414,7 @@ mod tests {
         assert_eq!(parsed.challenge.realm, "pops-core-verify");
         assert_eq!(parsed.challenge.method, "cashu");
         assert_eq!(parsed.challenge.intent, "charge");
-        assert_eq!(parsed.payload.cashu_token, "cashuBabc");
+        assert_eq!(parsed.payload.token, "cashuBabc");
     }
 
     #[test]
@@ -488,7 +505,7 @@ mod tests {
 
     #[test]
     fn json_missing_challenge_returns_json_parse() {
-        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"cashu_token":"x"}}"#);
+        let blob = URL_SAFE_NO_PAD.encode(br#"{"payload":{"token":"x"}}"#);
         let header = format!("Payment {blob}");
         let err = parse_payment_authorization(&header).expect_err("no challenge");
         assert!(
@@ -511,12 +528,28 @@ mod tests {
     }
 
     #[test]
-    fn payload_missing_cashu_token_returns_json_parse() {
+    fn payload_missing_token_returns_json_parse() {
         let blob = URL_SAFE_NO_PAD.encode(
             br#"{"challenge":{"id":"a","realm":"b","method":"cashu","intent":"charge","request":"r"},"payload":{}}"#,
         );
         let header = format!("Payment {blob}");
-        let err = parse_payment_authorization(&header).expect_err("no cashu_token");
+        let err = parse_payment_authorization(&header).expect_err("no token");
+        assert!(
+            matches!(err, AuthParseError::JsonParse(_)),
+            "expected JsonParse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn payload_with_only_legacy_cashu_token_field_returns_json_parse() {
+        // The spec names the payload field `token`; the pre-spec `cashu_token`
+        // spelling no longer satisfies the required field.
+        let blob = URL_SAFE_NO_PAD.encode(
+            br#"{"challenge":{"id":"a","realm":"b","method":"cashu","intent":"charge","request":"r"},"payload":{"cashu_token":"cashuBabc"}}"#,
+        );
+        let header = format!("Payment {blob}");
+        let err = parse_payment_authorization(&header)
+            .expect_err("legacy cashu_token field must not satisfy payload.token");
         assert!(
             matches!(err, AuthParseError::JsonParse(_)),
             "expected JsonParse, got {err:?}"
@@ -548,14 +581,14 @@ mod tests {
             },
             "source": "did:example:123",
             "payload": {
-                "cashu_token": "cashuBxyz",
+                "token": "cashuBxyz",
                 "extra": "ignored"
             }
         });
         let blob = URL_SAFE_NO_PAD.encode(json.to_string().as_bytes());
         let header = format!("Payment {blob}");
         let parsed = parse_payment_authorization(&header).expect("optional fields ok");
-        assert_eq!(parsed.payload.cashu_token, "cashuBxyz");
+        assert_eq!(parsed.payload.token, "cashuBxyz");
     }
 
     #[test]
@@ -567,59 +600,20 @@ mod tests {
     }
 
     #[test]
-    fn request_envelope_roundtrips() {
-        let creq = "creqAsomepayload";
-        let envelope = encode_request_envelope(creq);
-        let unwrapped = decode_request_envelope(&envelope)
-            .expect("request envelope round-trips");
-        assert_eq!(unwrapped, creq);
-    }
-
-    #[test]
-    fn request_envelope_is_base64url_nopad() {
-        let envelope = encode_request_envelope("creqAdummy");
-        // base64url-nopad excludes '+', '/', '='.
-        for c in envelope.chars() {
-            assert!(
-                c.is_ascii_alphanumeric() || c == '-' || c == '_',
-                "envelope contains non-base64url char {c:?}: {envelope}"
-            );
-        }
-    }
-
-    #[test]
-    fn decode_request_envelope_rejects_bad_base64() {
-        let err = decode_request_envelope("!!!notbase64!!!")
-            .expect_err("bad base64");
-        assert!(matches!(err, Error::DecodeFailed(_)));
-    }
-
-    #[test]
-    fn decode_request_envelope_rejects_missing_field() {
-        // Valid base64 + valid JSON, but no `cashu_request`.
-        let bad = URL_SAFE_NO_PAD.encode(br#"{"other":"x"}"#);
-        let err = decode_request_envelope(&bad)
-            .expect_err("missing cashu_request");
-        assert!(matches!(err, Error::DecodeFailed(_)));
-    }
-
-    #[test]
     fn parse_payment_params_extracts_all_five_fields() {
-        let creq_envelope = encode_request_envelope("creqAsomepayload");
+        let request_object = encode_request_object(&sample_request_object());
         let header = format!(
-            r#"Payment id="ch-1", realm="pops-core-verify", method="cashu", intent="charge", request="{creq_envelope}""#
+            r#"Payment id="ch-1", realm="pops-core-verify", method="cashu", intent="charge", request="{request_object}""#
         );
         let params = parse_payment_params(&header).expect("parses Payment params");
         assert_eq!(params.id, "ch-1");
         assert_eq!(params.realm, "pops-core-verify");
         assert_eq!(params.method, "cashu");
         assert_eq!(params.intent, "charge");
-        assert_eq!(params.request, creq_envelope);
-        // And the request unwraps back to the creqA.
-        assert_eq!(
-            decode_request_envelope(&params.request).expect("unwrap"),
-            "creqAsomepayload"
-        );
+        assert_eq!(params.request, request_object);
+        // And the request decodes back to the spec request object.
+        let decoded = decode_request_object(&params.request).expect("decodes");
+        assert_eq!(decoded, sample_request_object());
     }
 
     #[test]
@@ -707,8 +701,7 @@ mod tests {
             description: Some("read access".into()),
             external_id: Some("inv-7".into()),
             method_details: MethodDetails {
-                request: "creqAsomepayload".into(),
-                mints: vec!["https://mint.example".into()],
+                payment_request: "creqAsomepayload".into(),
             },
         }
     }
@@ -734,15 +727,16 @@ mod tests {
 
     #[test]
     fn request_object_bytes_are_jcs_canonical() {
-        // JCS sorts object keys lexicographically; the decoded base64 is exactly
-        // those canonical bytes, key-sorted at both levels (amount < currency <
-        // description < externalId < methodDetails; request < mints).
+        // Expected bytes hand-derived from the spec (Request Schema + Method
+        // Details + Encoding): JCS sorts keys lexicographically (amount <
+        // currency < description < externalId < methodDetails) and
+        // methodDetails carries exactly ONE field, `paymentRequest`.
         let encoded = encode_request_object(&sample_request_object());
         let bytes = URL_SAFE_NO_PAD.decode(&encoded).expect("decodes");
         let json = std::str::from_utf8(&bytes).expect("utf8");
         assert_eq!(
             json,
-            r#"{"amount":"100","currency":"pop_1782668279","description":"read access","externalId":"inv-7","methodDetails":{"mints":["https://mint.example"],"request":"creqAsomepayload"}}"#
+            r#"{"amount":"100","currency":"pop_1782668279","description":"read access","externalId":"inv-7","methodDetails":{"paymentRequest":"creqAsomepayload"}}"#
         );
     }
 
@@ -754,8 +748,7 @@ mod tests {
             description: None,
             external_id: None,
             method_details: MethodDetails {
-                request: "creqAx".into(),
-                mints: vec!["https://m.example".into()],
+                payment_request: "creqAx".into(),
             },
         };
         let bytes = URL_SAFE_NO_PAD
@@ -764,7 +757,20 @@ mod tests {
         let json = std::str::from_utf8(&bytes).expect("utf8");
         assert_eq!(
             json,
-            r#"{"amount":"1","currency":"pop_1700000000","methodDetails":{"mints":["https://m.example"],"request":"creqAx"}}"#
+            r#"{"amount":"1","currency":"pop_1700000000","methodDetails":{"paymentRequest":"creqAx"}}"#
+        );
+    }
+
+    #[test]
+    fn request_object_never_carries_a_mints_field() {
+        // The deleted `methodDetails.mints` must not reappear on the wire; the
+        // mint set lives only inside the creqA.
+        let encoded = encode_request_object(&sample_request_object());
+        let bytes = URL_SAFE_NO_PAD.decode(&encoded).expect("decodes");
+        let json = std::str::from_utf8(&bytes).expect("utf8");
+        assert!(
+            !json.contains("\"mints\""),
+            "emitted request object must not carry methodDetails.mints: {json}"
         );
     }
 
@@ -776,8 +782,41 @@ mod tests {
     }
 
     #[test]
+    fn decode_request_object_rejects_legacy_request_field_name() {
+        // The pre-spec wire named the creqA `methodDetails.request` (with a
+        // sibling `mints`); only `paymentRequest` parses now.
+        let bad = URL_SAFE_NO_PAD.encode(
+            br#"{"amount":"1","currency":"pop_1","methodDetails":{"mints":["https://m.example"],"request":"creqAx"}}"#,
+        );
+        let err = decode_request_object(&bad).expect_err("legacy field names must not parse");
+        assert!(matches!(err, Error::DecodeFailed(_)));
+    }
+
+    #[test]
     fn decode_request_object_rejects_bad_base64() {
         let err = decode_request_object("!!!notbase64!!!").expect_err("bad base64");
+        assert!(matches!(err, Error::DecodeFailed(_)));
+    }
+
+    #[test]
+    fn decode_request_object_rejects_padded_base64() {
+        // Header values are base64url WITHOUT padding (spec Encoding §); a padded
+        // value is malformed under the framework's grammar. Pick a description
+        // length whose unpadded encoding is not a 4-multiple, so CANONICAL `=`
+        // padding exists to append (the reject is then about padding, not length).
+        let (unpadded, pad) = (0..4usize)
+            .map(|n| {
+                let mut obj = sample_request_object();
+                obj.description = Some("x".repeat(n));
+                let enc = encode_request_object(&obj);
+                let pad = (4 - enc.len() % 4) % 4;
+                (enc, pad)
+            })
+            .find(|(_, pad)| *pad > 0)
+            .expect("some description length yields a non-4-multiple encoding");
+        decode_request_object(&unpadded).expect("unpadded form decodes");
+        let padded = format!("{unpadded}{}", "=".repeat(pad));
+        let err = decode_request_object(&padded).expect_err("padded request object must reject");
         assert!(matches!(err, Error::DecodeFailed(_)));
     }
 
@@ -787,14 +826,38 @@ mod tests {
     fn credential_blob_bytes_are_jcs_canonical() {
         // The credential blob is JCS-canonical (challenge < payload < source;
         // within challenge: id < intent < method < realm < request, plus the
-        // optional digest/opaque/expires when present).
+        // optional digest/opaque/expires when present). The payload field is
+        // the spec's `token` (Credential Schema).
         let creds = make_credentials("cashu", "cashuBabc");
         let blob = encode_payment_credentials(&creds);
         let bytes = URL_SAFE_NO_PAD.decode(&blob).expect("decodes");
         let json = std::str::from_utf8(&bytes).expect("utf8");
         assert_eq!(
             json,
-            r#"{"challenge":{"id":"challenge-1","intent":"charge","method":"cashu","realm":"pops-core-verify","request":"ZHVtbXkK"},"payload":{"cashu_token":"cashuBabc"}}"#
+            r#"{"challenge":{"id":"challenge-1","intent":"charge","method":"cashu","realm":"pops-core-verify","request":"ZHVtbXkK"},"payload":{"token":"cashuBabc"}}"#
+        );
+    }
+
+    #[test]
+    fn padded_credential_blob_is_rejected() {
+        // The Authorization blob is a header value: base64url WITHOUT padding
+        // (spec Encoding §). Canonical `=` padding makes it malformed.
+        let (unpadded, pad) = (0..4usize)
+            .map(|n| {
+                let creds = make_credentials("cashu", &format!("cashuB{}", "a".repeat(n)));
+                let blob = encode_payment_credentials(&creds);
+                let pad = (4 - blob.len() % 4) % 4;
+                (blob, pad)
+            })
+            .find(|(_, pad)| *pad > 0)
+            .expect("some token length yields a non-4-multiple blob");
+        parse_payment_authorization(&format!("Payment {unpadded}"))
+            .expect("unpadded blob parses");
+        let err = parse_payment_authorization(&format!("Payment {unpadded}{}", "=".repeat(pad)))
+            .expect_err("padded credential blob must reject");
+        assert!(
+            matches!(err, AuthParseError::Base64Decode(_)),
+            "expected Base64Decode, got {err:?}"
         );
     }
 
@@ -810,9 +873,10 @@ mod tests {
                 digest: Some("d".into()),
                 opaque: Some("o".into()),
                 expires: Some("2999-01-01T00:00:00Z".into()),
+                description: Some("a memo".into()),
             },
             payload: CashuPayload {
-                cashu_token: "cashuBz".into(),
+                token: "cashuBz".into(),
             },
             source: Some("did:example:1".into()),
         };
@@ -824,6 +888,32 @@ mod tests {
             parsed.challenge.expires.as_deref(),
             Some("2999-01-01T00:00:00Z")
         );
+        assert_eq!(parsed.challenge.description.as_deref(), Some("a memo"));
         assert_eq!(parsed.source.as_deref(), Some("did:example:1"));
+    }
+
+    #[test]
+    fn parse_payment_params_captures_optional_params() {
+        // A client MUST echo every issued param, so the parser captures the
+        // optionals (expires/digest/opaque/description) when present.
+        let header = r#"Payment id="x", realm="r", method="cashu", intent="charge", request="e", expires="2026-03-15T12:05:00Z", digest="sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:", opaque="b3BhcXVl", description="weather report""#;
+        let params = parse_payment_params(header).expect("parses with optionals");
+        assert_eq!(params.expires.as_deref(), Some("2026-03-15T12:05:00Z"));
+        assert_eq!(
+            params.digest.as_deref(),
+            Some("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:")
+        );
+        assert_eq!(params.opaque.as_deref(), Some("b3BhcXVl"));
+        assert_eq!(params.description.as_deref(), Some("weather report"));
+    }
+
+    #[test]
+    fn parse_payment_params_leaves_absent_optionals_none() {
+        let header = r#"Payment id="x", realm="r", method="cashu", intent="charge", request="e""#;
+        let params = parse_payment_params(header).expect("parses without optionals");
+        assert_eq!(params.expires, None);
+        assert_eq!(params.digest, None);
+        assert_eq!(params.opaque, None);
+        assert_eq!(params.description, None);
     }
 }

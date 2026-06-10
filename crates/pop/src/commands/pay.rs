@@ -153,7 +153,14 @@ pub async fn run(
         reason: format!("WWW-Authenticate Payment params did not parse: {e}"),
     })?;
 
-    // ---- 3b/3c. Unwrap the request envelope → creqA → the concrete charge. ----
+    // A credential MUST NOT be submitted against an expired challenge
+    // (framework `expires`), so check freshness FIRST — before the charge is
+    // even decoded, and long before any token is read or swapped.
+    if let Some(e) = expired_challenge_error(&params, &args.url) {
+        return Err(e.into());
+    }
+
+    // ---- 3b/3c. Decode the request object → creqA → the concrete charge. ----
     let charge = decode_charge_from_params(&params)?;
     eprintln!(
         "Charge: {} sat of {} (mints: {})",
@@ -302,8 +309,11 @@ async fn finish_payment(
         )?;
         Ok(())
     } else {
-        // Gateway rejected (did NOT redeem) → send set AND any change are unspent
-        // ecash; surface BOTH.
+        // Non-2xx after the token was sent. A 4xx is a determinate rejection
+        // (did NOT redeem → both tokens unspent); a 5xx can follow a
+        // SUCCESSFUL swap (persist/upstream failure after settlement), so the
+        // send token's state is unknown. The error's message branches on the
+        // status; both tokens are surfaced either way.
         Err(PopError::GatewayRejectedPayment {
             status: retry_status.as_u16(),
             body: retry_body,
@@ -466,9 +476,11 @@ async fn build_exact_payment(
 }
 
 /// Decodes the concrete [`Charge`] from parsed 402 params: read the
-/// `draft-cashu-charge-01` request object (`amount`/`currency`/`methodDetails`),
-/// enforcing its mints-superset over the inner creqA. A 0-sat charge is rejected
-/// before any spend (an exact 0-sat charge is meaningless).
+/// `draft-cashu-charge-01` request object, deriving amount/unit/mints from the
+/// authoritative `methodDetails.paymentRequest` (the shared codec rejects a
+/// creqA missing `a`/`u`/`m` or disagreeing with the top-level
+/// `amount`/`currency`). A 0-sat charge is rejected before any spend (an exact
+/// 0-sat charge is meaningless).
 fn decode_charge_from_params(params: &PaymentParams) -> Result<Charge, Box<dyn std::error::Error>> {
     let decoded =
         decode_charge_request(&params.request).map_err(|e| PopError::ChallengeParseFailed {
@@ -488,6 +500,24 @@ fn decode_charge_from_params(params: &PaymentParams) -> Result<Charge, Box<dyn s
     })
 }
 
+
+/// The expired-challenge refusal, when the 402's `expires` forbids paying it:
+/// a challenge whose RFC 3339 `expires` is in the past (or unparseable, which
+/// equally fails to establish freshness) MUST NOT have a credential submitted
+/// against it — the server would only answer `payment-expired` after the
+/// client did the work. A challenge without `expires` carries no expiry
+/// signal and proceeds.
+pub fn expired_challenge_error(params: &PaymentParams, url: &str) -> Option<PopError> {
+    let expires = params.expires.as_deref()?;
+    let is_past = match chrono::DateTime::parse_from_rfc3339(expires) {
+        Ok(ts) => ts.with_timezone(&chrono::Utc) <= chrono::Utc::now(),
+        Err(_) => true,
+    };
+    is_past.then(|| PopError::ChallengeExpired {
+        url: url.to_string(),
+        expires: expires.to_string(),
+    })
+}
 
 /// Validates the held token against the charge BEFORE any spend: matching unit,
 /// an accepted mint, and enough value. Any mismatch → a structured error and
@@ -584,11 +614,14 @@ fn build_premint(
     .map_err(|e| format!("failed to build premint secrets for {amount} sat: {e}").into())
 }
 
-/// Builds the `Authorization: Payment` credentials: a VERBATIM echo of the
-/// parsed challenge params, plus the exact-amount token as the cashu payload. The
-/// 402 carries no `digest`/`opaque`/`expires` (binding is server-deferred), so
-/// those echo fields and the optional `source` are `None`.
-pub fn build_credentials(params: &PaymentParams, cashu_token: &str) -> PaymentCredentials {
+/// Builds the `Authorization: Payment` credentials: a VERBATIM echo of EVERY
+/// parsed challenge param — required and optional alike — plus the
+/// exact-amount token as the cashu payload. The server's stateless binding
+/// recomputes its id-HMAC over the echo, so a dropped or altered param
+/// (`expires` included) makes the credential `invalid-challenge`; an optional
+/// the 402 did not carry stays absent. `source` is `None` (bearer tokens carry
+/// no payer identity).
+pub fn build_credentials(params: &PaymentParams, token: &str) -> PaymentCredentials {
     PaymentCredentials {
         challenge: EchoedChallenge {
             id: params.id.clone(),
@@ -596,12 +629,13 @@ pub fn build_credentials(params: &PaymentParams, cashu_token: &str) -> PaymentCr
             method: params.method.clone(),
             intent: params.intent.clone(),
             request: params.request.clone(),
-            digest: None,
-            opaque: None,
-            expires: None,
+            digest: params.digest.clone(),
+            opaque: params.opaque.clone(),
+            expires: params.expires.clone(),
+            description: params.description.clone(),
         },
         payload: CashuPayload {
-            cashu_token: cashu_token.to_string(),
+            token: token.to_string(),
         },
         source: None,
     }
@@ -841,6 +875,74 @@ mod tests {
         assert_eq!(d["need"], serde_json::json!(600));
     }
 
+    // ---- the expired-challenge refusal (no credential against a past expires) -
+
+    /// Params carrying the supplied `expires` (other fields don't matter to
+    /// the freshness check).
+    fn params_with_expires(expires: Option<&str>) -> PaymentParams {
+        PaymentParams {
+            id: "ch-1".into(),
+            realm: "pops".into(),
+            method: "cashu".into(),
+            intent: "charge".into(),
+            request: "cmVxdWVzdA".into(),
+            expires: expires.map(str::to_string),
+            digest: None,
+            opaque: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn expired_challenge_is_refused_before_any_spend() {
+        let err = expired_challenge_error(
+            &params_with_expires(Some("2020-01-01T00:00:00Z")),
+            "https://app.example/r",
+        )
+        .expect("a past expires must refuse");
+        assert_eq!(err.code(), "challenge_expired");
+        let d = err.details().expect("details required");
+        assert_eq!(d["url"], serde_json::json!("https://app.example/r"));
+        assert_eq!(d["expires"], serde_json::json!("2020-01-01T00:00:00Z"));
+        assert!(!err.retriable(), "re-fetch the challenge, don't retry as-is");
+    }
+
+    #[test]
+    fn fresh_challenge_passes_the_expiry_check() {
+        assert!(
+            expired_challenge_error(
+                &params_with_expires(Some("2999-01-01T00:00:00Z")),
+                "https://app.example/r",
+            )
+            .is_none(),
+            "a future expires must proceed"
+        );
+    }
+
+    #[test]
+    fn challenge_without_expires_passes_the_expiry_check() {
+        assert!(
+            expired_challenge_error(&params_with_expires(None), "https://app.example/r")
+                .is_none(),
+            "no expires ⇒ no expiry signal to refuse on"
+        );
+    }
+
+    #[test]
+    fn unparseable_expires_is_refused_like_a_past_one() {
+        let err = expired_challenge_error(
+            &params_with_expires(Some("not-a-timestamp")),
+            "https://app.example/r",
+        )
+        .expect("freshness cannot be established ⇒ refuse");
+        assert_eq!(err.code(), "challenge_expired");
+        assert_eq!(
+            err.details().expect("details")["expires"],
+            serde_json::json!("not-a-timestamp"),
+            "the verbatim value is surfaced for diagnosis"
+        );
+    }
+
     // ---- request-object decode (the client's 402 parse surface) ----------
 
     /// Build the parsed `PaymentParams` for a charge of `amount`, as the client
@@ -854,7 +956,7 @@ mod tests {
             description: None,
             single_use: true,
         };
-        let request = encode_charge_request(&req);
+        let request = encode_charge_request(&req).expect("requirement encodes");
         let header = format!(
             r#"Payment id="ch-1", realm="pops", method="cashu", intent="charge", request="{request}""#
         );
@@ -867,6 +969,33 @@ mod tests {
         assert_eq!(c.amount, 777);
         assert_eq!(c.unit, pop_unit());
         assert_eq!(c.mints, vec![mint_a()]);
+    }
+
+    #[test]
+    fn decode_charge_from_params_rejects_legacy_request_shape() {
+        // The pre-spec wire carried `methodDetails.request` + `methodDetails.mints`;
+        // the client parses ONLY the `paymentRequest` shape.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let legacy = URL_SAFE_NO_PAD.encode(
+            br#"{"amount":"777","currency":"pop_1782668279","methodDetails":{"mints":["https://mint.example"],"request":"creqAx"}}"#,
+        );
+        let params = PaymentParams {
+            id: "ch-1".into(),
+            realm: "pops".into(),
+            method: "cashu".into(),
+            intent: "charge".into(),
+            request: legacy,
+            expires: None,
+            digest: None,
+            opaque: None,
+            description: None,
+        };
+        let err = decode_charge_from_params(&params).expect_err("legacy shape must not parse");
+        assert_eq!(
+            crate::error::from_boxed(err).code(),
+            "challenge_parse_failed"
+        );
     }
 
     #[test]
@@ -892,7 +1021,7 @@ mod tests {
             description: None,
             single_use: true,
         };
-        let request = encode_charge_request(&req);
+        let request = encode_charge_request(&req).expect("requirement encodes");
         let header = format!(
             r#"Payment id="ch-42", realm="pops", method="cashu", intent="charge", request="{request}""#
         );
@@ -913,7 +1042,7 @@ mod tests {
         assert_eq!(creds.challenge.method, "cashu");
         assert_eq!(creds.challenge.intent, "charge");
         assert_eq!(creds.challenge.request, request, "request echoed verbatim");
-        assert_eq!(creds.payload.cashu_token, "cashuBexampletoken");
+        assert_eq!(creds.payload.token, "cashuBexampletoken");
 
         // Parse the blob as the GATEWAY would (proves the wire round-trips
         // through the real verifier codec).
@@ -921,6 +1050,41 @@ mod tests {
         let auth = format!("Payment {blob}");
         let parsed = parse_payment_authorization(&auth).expect("gateway parses our credentials");
         assert_eq!(parsed.challenge.id, "ch-42");
-        assert_eq!(parsed.payload.cashu_token, "cashuBexampletoken");
+        assert_eq!(parsed.payload.token, "cashuBexampletoken");
+    }
+
+    #[test]
+    fn build_credentials_echoes_every_issued_optional_param_verbatim() {
+        // A stateless-binding server recomputes its id-HMAC over the echo, so
+        // the client MUST return every issued param byte-for-byte — expires
+        // above all (a dropped expires makes the credential invalid-challenge).
+        let header = r#"Payment id="hmacid", realm="pops", method="cashu", intent="charge", request="cmVxdWVzdA", expires="2026-03-15T12:05:00Z", digest="sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:", opaque="b3BhcXVl", description="weather report""#;
+        let params = parse_payment_params(header).expect("parses params");
+        let creds = build_credentials(&params, "cashuBtok");
+        assert_eq!(
+            creds.challenge.expires.as_deref(),
+            Some("2026-03-15T12:05:00Z")
+        );
+        assert_eq!(
+            creds.challenge.digest.as_deref(),
+            Some("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:")
+        );
+        assert_eq!(creds.challenge.opaque.as_deref(), Some("b3BhcXVl"));
+        assert_eq!(
+            creds.challenge.description.as_deref(),
+            Some("weather report")
+        );
+
+        // And an optional the 402 did NOT carry stays absent (an invented one
+        // would equally break the byte-exact echo).
+        let bare = r#"Payment id="hmacid", realm="pops", method="cashu", intent="charge", request="cmVxdWVzdA""#;
+        let creds = build_credentials(
+            &parse_payment_params(bare).expect("parses"),
+            "cashuBtok",
+        );
+        assert_eq!(creds.challenge.expires, None);
+        assert_eq!(creds.challenge.digest, None);
+        assert_eq!(creds.challenge.opaque, None);
+        assert_eq!(creds.challenge.description, None);
     }
 }
