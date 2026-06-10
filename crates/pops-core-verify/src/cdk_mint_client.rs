@@ -156,7 +156,9 @@ fn map_cdk_err(e: cdk::Error) -> MintClientError {
 /// `ErrorResponse` (`code: 12003, detail: ...`). Match the registered code, not
 /// the human detail text, which the mint controls and may localize.
 fn is_keyset_expired_12003(e: &cdk::Error) -> bool {
-    matches!(e, cdk::Error::UnknownErrorResponse(msg) if msg.contains("12003"))
+    // Anchored to the code position of cdk's `code: {code}, detail: {detail}`
+    // rendering; a bare "12003" would also match inside the detail text.
+    matches!(e, cdk::Error::UnknownErrorResponse(msg) if msg.contains("code: 12003,"))
 }
 
 /// The raw mint HTTP, via cdk's [`HttpClient`]/[`MintConnector`]. These three
@@ -290,6 +292,14 @@ mod tests {
         assert!(
             matches!(map_cdk_err(e), MintClientError::Unreachable(_)),
             "a non-12003 unknown-code response must stay Unreachable"
+        );
+        // The code match must not scan the mint-controlled detail text: a
+        // different code whose detail happens to mention 12003 is still an
+        // ambiguous outcome, never a definitive keyset-expiry rejection.
+        let e = cdk::Error::UnknownErrorResponse("code: 50000, detail: stale ref 12003".into());
+        assert!(
+            matches!(map_cdk_err(e), MintClientError::Unreachable(_)),
+            "12003 inside the detail of another code must stay Unreachable"
         );
     }
 
