@@ -40,7 +40,7 @@ pub struct ValidatedCharge {
 }
 
 /// Errors a [`ChargeValidator`] can return. The pre-swap arms (`UnitMismatch`,
-/// `MintNotAllowed`, `AmountMismatch`, `TokenEmpty`, `LockedToken`,
+/// `MintNotAllowed`, `PaymentInsufficient`, `TokenEmpty`, `LockedToken`,
 /// `MultiMintOrUnit`, `TooManyProofs`) are raised BEFORE the swap is ever
 /// attempted; the rest are raised at/after it. [`CashuCredential`] maps these
 /// onto [`crate::charge::ChargeError`].
@@ -86,12 +86,12 @@ pub enum ValidationError {
         allowed: Vec<MintUrl>,
     },
 
-    /// Total proof amount is not EXACTLY the requirement. The charge is
-    /// exact-amount: the verifier makes no change, so an over-funded token is
-    /// rejected just like an under-funded one (the holder splits locally,
-    /// non-custodially, before presenting).
-    #[error("token amount {got} does not equal required {required}")]
-    AmountMismatch {
+    /// Total proof amount is LESS than the requirement (spec verification
+    /// step 8: value must be at least `amount + expected_swap_fee`). The
+    /// verifier makes no change; value ABOVE the requirement is accepted and
+    /// retained, so only an under-funded token is rejected.
+    #[error("token amount {got} is less than required {required}")]
+    PaymentInsufficient {
         /// Amount required.
         required: Amount,
         /// Total presented.
@@ -284,13 +284,15 @@ impl<M: MintClient> ChargeValidator<M> {
             return Err(ValidationError::MultiMintOrUnit);
         }
 
-        // Exact-amount (see `AmountMismatch`). Summed directly rather than via
-        // `Token::value()` so an off-amount token short-circuits before swap.
+        // Value check (see `PaymentInsufficient`): at least the requirement
+        // (the fee-free profile's `expected_swap_fee` is 0, so the requirement
+        // is the bare amount). Summed directly rather than via `Token::value()`
+        // so an under-funded token short-circuits before swap.
         let token_amount = proofs
             .total_amount()
             .map_err(|e| ValidationError::MalformedToken(e.to_string()))?;
-        if token_amount != requirement.amount {
-            return Err(ValidationError::AmountMismatch {
+        if token_amount < requirement.amount {
+            return Err(ValidationError::PaymentInsufficient {
                 required: requirement.amount,
                 got: token_amount,
             });
@@ -421,12 +423,14 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
         ValidationError::LockedToken => ChargeError::LockedToken,
         ValidationError::MultiMintOrUnit => ChargeError::MultiMintOrUnit,
         ValidationError::TooManyProofs { got, max } => ChargeError::TooManyProofs { got, max },
-        ValidationError::AmountMismatch { required, got } => ChargeError::AmountMismatch {
-            required: u64::from(required),
-            presented: u64::from(got),
-            amount: u64::from(required),
-            expected_swap_fee: 0,
-        },
+        ValidationError::PaymentInsufficient { required, got } => {
+            ChargeError::PaymentInsufficient {
+                required: u64::from(required),
+                presented: u64::from(got),
+                amount: u64::from(required),
+                expected_swap_fee: 0,
+            }
+        }
         ValidationError::UnitMismatch { expected, got } => ChargeError::WrongUnit {
             expected: expected.to_string(),
             got: got.to_string(),
@@ -879,37 +883,39 @@ mod tests {
             .await
             .expect_err("underfunded amount must fail");
         assert!(
-            matches!(err, ValidationError::AmountMismatch { .. }),
-            "expected AmountMismatch, got {err:?}"
+            matches!(err, ValidationError::PaymentInsufficient { .. }),
+            "expected PaymentInsufficient, got {err:?}"
         );
         assert_eq!(
             counters.swap.load(Ordering::SeqCst),
             0,
-            "swap must NOT be called on amount mismatch"
+            "swap must NOT be called on an insufficient token"
         );
     }
 
     #[tokio::test]
-    async fn validate_rejects_overfunded_amount() {
-        // Exact-amount: an over-funded token is rejected, NOT charged with change.
+    async fn validate_accepts_overfunded_amount_and_retains_excess() {
+        // Spec step 8: value ABOVE `amount + expected_swap_fee` is accepted and
+        // retained — the whole 20 is swapped against a 10 requirement.
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(16, 0), make_proof(4, 1)]);
         let req = requirement(pop_unit(), vec![mint_a()], 10);
 
         let (mock, counters) = MockMintClient::with_swap(SwapResponse::Echo);
         let validator = ChargeValidator::new(mock);
 
-        let err = validator
+        let validated = validator
             .validate(&token, &req)
             .await
-            .expect_err("overfunded amount must fail (no verifier-side change)");
-        assert!(
-            matches!(err, ValidationError::AmountMismatch { .. }),
-            "expected AmountMismatch, got {err:?}"
+            .expect("an over-funded token must validate");
+        assert_eq!(
+            validated.amount,
+            Amount::from(20),
+            "the WHOLE presented value is redeemed (excess retained, no change)"
         );
         assert_eq!(
             counters.swap.load(Ordering::SeqCst),
-            0,
-            "swap must NOT be called on amount mismatch"
+            1,
+            "swap runs once on the over-funded accept path"
         );
     }
 
@@ -1406,7 +1412,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_and_redeem_maps_amount_mismatch_with_zero_fee() {
+    async fn verify_and_redeem_maps_underfunded_to_payment_insufficient() {
+        let presented =
+            make_token(mint_a(), pop_unit(), vec![make_proof(8, 0)]).to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, _c) = MockMintClient::with_swap(SwapResponse::Echo);
+        let cred = CashuCredential::new(mock);
+
+        let err = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect_err("an under-funded token must map to PaymentInsufficient");
+        match err {
+            ChargeError::PaymentInsufficient {
+                required,
+                presented,
+                amount,
+                expected_swap_fee,
+            } => {
+                assert_eq!(required, 10);
+                assert_eq!(presented, 8);
+                assert_eq!(amount, 10);
+                assert_eq!(expected_swap_fee, 0, "fee-free profile: fee is 0");
+            }
+            other => panic!("expected PaymentInsufficient, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_accepts_overfunded_and_reports_full_value() {
+        // Over-funded accept path through the Redeemer seam: the excess is
+        // retained, so the redeemed amount is the FULL presented value.
         let presented = make_token(
             mint_a(),
             pop_unit(),
@@ -1418,24 +1455,12 @@ mod tests {
         let (mock, _c) = MockMintClient::with_swap(SwapResponse::Echo);
         let cred = CashuCredential::new(mock);
 
-        let err = cred
+        let redeemed = cred
             .verify_and_redeem(&presented, &req)
             .await
-            .expect_err("amount mismatch must map to AmountMismatch");
-        match err {
-            ChargeError::AmountMismatch {
-                required,
-                presented,
-                amount,
-                expected_swap_fee,
-            } => {
-                assert_eq!(required, 10);
-                assert_eq!(presented, 20);
-                assert_eq!(amount, 10);
-                assert_eq!(expected_swap_fee, 0, "fee forced 0 in Step 1");
-            }
-            other => panic!("expected AmountMismatch, got {other:?}"),
-        }
+            .expect("an over-funded token must redeem");
+        assert_eq!(redeemed.amount, 20, "full presented value redeemed");
+        assert_eq!(redeemed.proofs.amount, 20);
     }
 
     #[tokio::test]
@@ -1524,7 +1549,10 @@ mod tests {
                 ..
             } => {
                 assert!(!mint_url.is_empty(), "mint_url must be threaded through");
-                assert!(!indeterminate, "Step 1 never sets indeterminate");
+                assert!(
+                    !indeterminate,
+                    "a determinate connect failure never sets indeterminate"
+                );
             }
             other => panic!("expected MintUnreachable, got {other:?}"),
         }

@@ -220,27 +220,25 @@ async fn valid_cashub_returns_200_and_serves_resource() {
     );
 }
 
-// ---- exact amount: overpay → reject, underpay → reject -------------
+// ---- value coverage: overpay → accepted, underpay → reject ----------
 
 #[tokio::test]
-async fn overpay_is_rejected_and_resource_not_served() {
-    // 20 against a required 10: EXACT-amount rejects, never captures the overage.
+async fn overpay_is_accepted_and_excess_retained() {
+    // 20 against a required 10: value above the requirement is accepted and
+    // retained (spec step 8) — the whole token swaps and the resource serves.
     let token = make_token(mint_a(), pop_unit(), vec![make_proof(16, 0), make_proof(4, 1)]);
     let (app, swaps) = router_for(SwapResponse::Echo);
     let response = app
         .oneshot(request_with_xcashu(&token.to_string()))
         .await
         .expect("oneshot");
-    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    assert!(x_cashu_header(&response).is_some(), "overpay re-challenges");
-    let body = body_string(response).await;
-    assert!(!body.starts_with("ok:"), "resource must NOT be served on overpay");
-    assert!(body.contains("amount mismatch"), "expected amount-mismatch body, got: {body}");
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        swaps.load(Ordering::SeqCst),
-        0,
-        "an over-funded token is rejected pre-swap (no overage capture)"
+        body_string(response).await,
+        "ok:20",
+        "the WHOLE over-funded value is redeemed and retained"
     );
+    assert_eq!(swaps.load(Ordering::SeqCst), 1, "the over-funded accept path swaps once");
 }
 
 #[tokio::test]
@@ -254,7 +252,10 @@ async fn underpay_is_rejected_and_resource_not_served() {
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     let body = body_string(response).await;
     assert!(!body.starts_with("ok:"), "resource must NOT be served on underpay");
-    assert!(body.contains("amount mismatch"), "expected amount-mismatch body, got: {body}");
+    assert!(
+        body.contains("payment-insufficient"),
+        "expected the payment-insufficient problem body, got: {body}"
+    );
     assert_eq!(swaps.load(Ordering::SeqCst), 0, "under-funded token rejected pre-swap");
 }
 

@@ -10,10 +10,10 @@
 //! into `http::StatusCode`.
 //!
 //! URIs per `draft-cashu-charge-01` Errors § and the framework's problem
-//! registry: the framework-registered types live under
-//! `https://paymentauth.org/problems/<slug>`; ONLY the two genuinely
-//! method-specific conditions (`amount-mismatch`, `mint-unavailable`) live
-//! under the `cashu/` namespace. No relative URIs anywhere.
+//! registry: the method defines NO problem types of its own — every 402 type
+//! is a framework-registered `https://paymentauth.org/problems/<slug>`, and
+//! mint unreachability carries no problem type at all (a plain 503 +
+//! `Retry-After`, body `about:blank`). No relative URIs anywhere.
 
 use serde::Serialize;
 
@@ -23,7 +23,7 @@ use crate::charge::ChargeError;
 /// fallback) plus the HTTP status a host MUST answer with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProblemMapping {
-    /// The registered slug (`verification-failed`, `cashu/amount-mismatch`, …),
+    /// The registered slug (`verification-failed`, `payment-insufficient`, …),
     /// or `None` where no problem type is registered (the `about:blank` rows).
     pub slug: Option<&'static str>,
     /// The ABSOLUTE `type` URI for the problem body.
@@ -69,33 +69,34 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
     }
 
     match e {
-        // Method-specific (cashu/ namespace): infrastructure, not a payment
-        // outcome. 503 + Retry-After; the token may still be good.
-        ChargeError::MintUnreachable { .. } => framework(
-            "cashu/mint-unavailable",
-            "https://paymentauth.org/problems/cashu/mint-unavailable",
-            503,
-            "Mint Unavailable",
-        ),
+        // Mint unreachability is an infrastructure failure, not a
+        // payment-verification outcome, and carries NO problem type (spec
+        // Errors §): a plain 503 + Retry-After with an about:blank body; the
+        // token may still be good.
+        ChargeError::MintUnreachable { .. } => ProblemMapping {
+            slug: None,
+            type_uri: "about:blank",
+            status: 503,
+            title: "Service Unavailable",
+        },
 
-        // Method-specific (cashu/ namespace): covers BOTH over- and under-funded
-        // (the framework's payment-insufficient names only underpayment and is
-        // not used by this method).
-        ChargeError::AmountMismatch { .. } => framework(
-            "cashu/amount-mismatch",
-            "https://paymentauth.org/problems/cashu/amount-mismatch",
+        // The framework's payment-insufficient: the token's total value is
+        // less than `amount + swap_fee` (spec step 8). There is no
+        // over-payment counterpart — excess is accepted and retained.
+        ChargeError::PaymentInsufficient { .. } => framework(
+            "payment-insufficient",
+            "https://paymentauth.org/problems/payment-insufficient",
             402,
-            "Amount Mismatch",
+            "Payment Insufficient",
         ),
 
         // Non-amount, non-expiry verification failures, per the spec's Errors §
-        // list: unit mismatch, disallowed mint, multi-mint/unit, NUT-10 lock,
-        // DLEQ failure, unresolvable short keyset id, swap rejection
-        // (double-spend), and the policy-disallowed fee-bearing keyset ("unit
-        // otherwise disallowed by server policy").
+        // list: unit mismatch, disallowed mint, NUT-10 lock, DLEQ failure,
+        // unresolvable short keyset id, swap rejection (double-spend, step 9),
+        // and the policy-disallowed fee-bearing keyset ("unit otherwise
+        // disallowed by server policy").
         ChargeError::WrongUnit { .. }
         | ChargeError::MintNotAllowed { .. }
-        | ChargeError::MultiMintOrUnit
         | ChargeError::LockedToken
         | ChargeError::DleqInvalid
         | ChargeError::ShortKeysetIdUnresolved { .. }
@@ -124,8 +125,13 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
         ),
 
         // A bad credential is still a payment attempt → 402 + re-challenge
-        // (the framework's status table), never a 400.
-        ChargeError::MalformedCredential(_) | ChargeError::TooManyProofs { .. } => framework(
+        // (the framework's status table), never a 400. The spec treats a
+        // multi-mint/multi-unit token as a parse-level fault of the credential
+        // (a valid TokenV4 structurally carries exactly one mint and unit), so
+        // MultiMintOrUnit lands here rather than under verification-failed.
+        ChargeError::MalformedCredential(_)
+        | ChargeError::MultiMintOrUnit
+        | ChargeError::TooManyProofs { .. } => framework(
             "malformed-credential",
             "https://paymentauth.org/problems/malformed-credential",
             402,
@@ -220,27 +226,31 @@ mod tests {
     }
 
     #[test]
-    fn mint_unreachable_is_cashu_mint_unavailable_503() {
-        // Spec: infrastructure failure, not a payment-verification outcome;
-        // one of the two cashu/-namespaced types.
+    fn mint_unreachable_is_plain_503_with_no_problem_type() {
+        // Spec Errors §: mint unreachability is an infrastructure failure and
+        // carries no problem type — a plain 503 (+ Retry-After at the hosts),
+        // body about:blank. No cashu/ URI exists.
         let m = problem_mapping(&mint_unreachable());
-        assert_eq!(m.slug, Some("cashu/mint-unavailable"));
-        assert_eq!(m.type_uri, "https://paymentauth.org/problems/cashu/mint-unavailable");
+        assert_eq!(m.slug, None);
+        assert_eq!(m.type_uri, "about:blank");
         assert_eq!(m.status, 503);
     }
 
     #[test]
-    fn amount_mismatch_is_cashu_amount_mismatch_402() {
-        // Spec: method-specific type covering BOTH over- and under-funded;
-        // the framework's payment-insufficient is NOT used by this method.
-        let m = problem_mapping(&ChargeError::AmountMismatch {
+    fn payment_insufficient_is_the_framework_type_402() {
+        // Spec step 8 + Errors §: an under-funded token is the framework's
+        // payment-insufficient. Over-funding has no counterpart (accepted).
+        let m = problem_mapping(&ChargeError::PaymentInsufficient {
             required: 10,
-            presented: 20,
+            presented: 8,
             amount: 10,
             expected_swap_fee: 0,
         });
-        assert_eq!(m.slug, Some("cashu/amount-mismatch"));
-        assert_eq!(m.type_uri, "https://paymentauth.org/problems/cashu/amount-mismatch");
+        assert_eq!(m.slug, Some("payment-insufficient"));
+        assert_eq!(
+            m.type_uri,
+            "https://paymentauth.org/problems/payment-insufficient"
+        );
         assert_eq!(m.status, 402);
     }
 
@@ -248,7 +258,7 @@ mod tests {
     fn verification_failures_share_the_framework_type_402() {
         // Spec Errors §: every non-amount, non-expiry verification check —
         // including the fee-policy reject ("unit otherwise disallowed by
-        // server policy") and a swap-rejected double-spend.
+        // server policy") and a swap-rejected double-spend (step 9).
         for e in [
             ChargeError::WrongUnit {
                 expected: "pop_1".into(),
@@ -258,7 +268,6 @@ mod tests {
                 got: "https://evil.example".into(),
                 allowed: vec!["https://m.example".into()],
             },
-            ChargeError::MultiMintOrUnit,
             ChargeError::LockedToken,
             ChargeError::DleqInvalid,
             ChargeError::ShortKeysetIdUnresolved {
@@ -323,12 +332,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_credential_and_proof_cap_are_402_not_400() {
+    fn malformed_credential_proof_cap_and_multi_mint_are_402_not_400() {
         // Framework status table: a malformed CREDENTIAL is a 402 (it is still
         // a payment attempt, answered with a fresh challenge); the spec folds
-        // the proof-count DoS bound into the same type.
+        // the proof-count DoS bound AND the multi-mint/unit parse-level fault
+        // into the same type (a valid TokenV4 carries exactly one mint/unit).
         for e in [
             ChargeError::MalformedCredential("bad base64".into()),
+            ChargeError::MultiMintOrUnit,
             ChargeError::TooManyProofs { got: 99, max: 8 },
         ] {
             let m = problem_mapping(&e);
@@ -378,21 +389,23 @@ mod tests {
     }
 
     #[test]
-    fn every_type_uri_is_absolute() {
+    fn every_type_uri_is_absolute_and_no_cashu_namespace_remains() {
         // RFC 9457 `type` is a URI reference; the spec demands ABSOLUTE URIs
-        // (about:blank included — it has a scheme).
+        // (about:blank included — it has a scheme). The method defines no
+        // problem types of its own, so no cashu/-namespaced URI may exist.
         let all = [
             problem_mapping(&mint_unreachable()),
             problem_mapping(&ChargeError::DoubleSpend),
             problem_mapping(&ChargeError::Expired),
             problem_mapping(&ChargeError::InvalidChallenge),
             problem_mapping(&ChargeError::MalformedCredential("x".into())),
+            problem_mapping(&ChargeError::MultiMintOrUnit),
             problem_mapping(&ChargeError::MethodUnsupported { method: "x".into() }),
             problem_mapping(&ChargeError::MalformedRequest("x".into())),
-            problem_mapping(&ChargeError::AmountMismatch {
-                required: 1,
-                presented: 2,
-                amount: 1,
+            problem_mapping(&ChargeError::PaymentInsufficient {
+                required: 2,
+                presented: 1,
+                amount: 2,
                 expected_swap_fee: 0,
             }),
             PAYMENT_REQUIRED,
@@ -402,6 +415,11 @@ mod tests {
                 m.type_uri.starts_with("https://paymentauth.org/problems/")
                     || m.type_uri == "about:blank",
                 "non-absolute or off-registry type URI: {}",
+                m.type_uri
+            );
+            assert!(
+                !m.type_uri.contains("/problems/cashu/"),
+                "no cashu/-namespaced problem type may remain: {}",
                 m.type_uri
             );
         }

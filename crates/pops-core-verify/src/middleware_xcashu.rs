@@ -14,15 +14,16 @@
 //!
 //! Status mapping (stricter and safer than NUT-24's bare `400`) — the
 //! single-sourced [`crate::problem`] map, shared with every other host:
-//! `MintUnreachable` → `503` (transport blip, token NOT consumed — never a
-//! `400`/`402` that says "re-pay" against a valid token); `MalformedRequest` →
-//! `400` (server-side requirement is misconfigured); every other validation
-//! failure → `402` + a fresh `X-Cashu: <creqA>` re-challenge. Amount is EXACT:
-//! an over- or under-funded token is an `AmountMismatch` rejection, never
-//! silent overage capture. Every `402` carries `Cache-Control: no-store`, and
-//! every failure body is RFC-9457 `application/problem+json` with the absolute
-//! problem-type URI (NUT-24 leaves the body unspecified, so the richer body is
-//! compatible).
+//! `MintUnreachable` → `503` + `Retry-After` (transport blip, token NOT
+//! consumed — never a `400`/`402` that says "re-pay" against a valid token);
+//! `MalformedRequest` → `400` (server-side requirement is misconfigured); every
+//! other validation failure → `402` + a fresh `X-Cashu: <creqA>` re-challenge.
+//! Value follows the spec's step-8 rule: an under-funded token is a
+//! `PaymentInsufficient` rejection; value above the requirement is accepted
+//! and retained (the server makes no change). Every `402` carries
+//! `Cache-Control: no-store`, and every failure body is RFC-9457
+//! `application/problem+json` with the absolute problem-type URI (NUT-24
+//! leaves the body unspecified, so the richer body is compatible).
 //!
 //! [`Redeemer`]: crate::redeemer::Redeemer
 
@@ -155,18 +156,18 @@ fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>)
 
 /// Map a [`ChargeError`] to an HTTP response from the single-sourced
 /// [`crate::problem`] map (every failure body is `application/problem+json`):
-/// `MintUnreachable` → `503` (transport, token NOT consumed, NEVER a `402`),
-/// `MalformedRequest`/`MethodUnsupported` → `400`, everything else
-/// (verification / malformed-credential / amount mismatch) → `402` + a fresh
-/// `X-Cashu: <creqA>` re-challenge. A non-402 carries NO re-challenge — on a
-/// 503 re-presenting the SAME token is correct.
+/// `MintUnreachable` → `503` + `Retry-After` (transport, token NOT consumed,
+/// NEVER a `402`), `MalformedRequest`/`MethodUnsupported` → `400`, everything
+/// else (verification / malformed-credential / insufficient value) → `402` + a
+/// fresh `X-Cashu: <creqA>` re-challenge. A non-402 carries NO re-challenge —
+/// on a 503 re-presenting the SAME token is correct.
 fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
     let problem = Problem::for_error(&e);
     let status = charge_error_status(&e);
     if status == StatusCode::PAYMENT_REQUIRED {
         return challenge_response(requirement, Some(&problem));
     }
-    (
+    let mut response = (
         status,
         [
             (
@@ -180,7 +181,14 @@ fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> R
         ],
         problem.to_json(),
     )
-        .into_response()
+        .into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_static("2"),
+        );
+    }
+    response
 }
 
 #[cfg(test)]

@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 /// What the verifier requires from a holder for a single charge, decoupled
 /// from any ecash type (the cashu-typed sibling is
 /// [`CashuRequirement`][crate::challenge::CashuRequirement], used only to
-/// build the `creqA`). All fields are plain data.
+/// build the `creqA`). All fields are plain data. `amount` is the minimum
+/// net value a credential must cover; excess is retained.
 ///
 /// `Serialize`/`Deserialize` so the wasm `verify_and_redeem` export can accept
 /// the requirement as a JSON string from the JS route (the cross-slice seam
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// `#[serde(default)]` so a route may omit them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChargeRequirement {
-    /// Exact amount of value required (net the server must receive).
+    /// Amount of value required (the minimum net the server must receive).
     pub amount: u64,
     /// Currency unit the presented credential must carry. For PoP this is
     /// `pop_<unix_ts>`.
@@ -91,9 +92,10 @@ pub trait Redeemer {
     /// 2. **Output-DLEQ verified** — the returned proofs are verified (NUT-12
     ///    DLEQ for cashu) before being treated as value: a malicious or buggy
     ///    source cannot make the redeemer accept unsigned outputs.
-    /// 3. **Exact amount** — `Redeemed.amount` is the net value received AND
-    ///    equals `req.amount`. Both overpay and underpay return a
-    ///    [`ChargeError`]; neither is silently accepted.
+    /// 3. **Value covered** — `Redeemed.amount` is the net value received and
+    ///    is at least `req.amount`. An under-funded credential returns a
+    ///    [`ChargeError`]; value above the requirement is accepted and
+    ///    retained (the spec's no-change model), surfaced in `Redeemed.amount`.
     /// 4. **Double-spend caught** — an already-spent or replayed credential
     ///    returns a [`ChargeError`].
     /// 5. **Unit + mint match** — the credential's unit and source satisfy

@@ -64,10 +64,10 @@ mod tests {
             ChargeError::DoubleSpend,
             ChargeError::MalformedCredential("bad base64".into()),
             ChargeError::TooManyProofs { got: 100, max: 64 },
-            ChargeError::AmountMismatch {
-                required: 1,
-                presented: 2,
-                amount: 1,
+            ChargeError::PaymentInsufficient {
+                required: 2,
+                presented: 1,
+                amount: 2,
                 expected_swap_fee: 0,
             },
             ChargeError::FeeTooHigh {

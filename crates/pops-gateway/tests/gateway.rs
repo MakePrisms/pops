@@ -647,9 +647,9 @@ async fn gateway_emits_the_shared_problem_mapping_for_every_charge_error() {
             transport_detail: "timeout".into(),
             indeterminate: false,
         },
-        || ChargeError::AmountMismatch {
+        || ChargeError::PaymentInsufficient {
             required: 10,
-            presented: 20,
+            presented: 8,
             amount: 10,
             expected_swap_fee: 0,
         },

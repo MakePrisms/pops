@@ -106,7 +106,7 @@ pub fn build_payment_credential(credentials_json: &str) -> Result<String, JsValu
 fn charge_error_code(e: &ChargeError) -> &'static str {
     match e {
         ChargeError::MintUnreachable { .. } => "mint-unreachable",
-        ChargeError::AmountMismatch { .. } => "amount-mismatch",
+        ChargeError::PaymentInsufficient { .. } => "payment-insufficient",
         ChargeError::WrongUnit { .. } => "wrong-unit",
         ChargeError::MintNotAllowed { .. } => "mint-not-allowed",
         ChargeError::MultiMintOrUnit => "multi-mint-or-unit",

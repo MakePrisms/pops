@@ -22,7 +22,8 @@ pub enum ChargeError {
     /// unresolved after a 5xx/timeout. Token NOT consumed; the caller MAY retry
     /// the same token.
     ///
-    /// HTTP 503 · `mint-unavailable` · RETRYABLE · SHOULD carry `Retry-After`.
+    /// HTTP 503 · no problem type (`about:blank` body) · RETRYABLE · SHOULD
+    /// carry `Retry-After`.
     #[error("mint unavailable at {mint_url}: {transport_detail}")]
     MintUnreachable {
         /// Mint endpoint that could not be reached.
@@ -37,12 +38,13 @@ pub enum ChargeError {
     },
 
     // (B) VERIFICATION — 402 + fresh re-challenge, terminal for this token.
-    /// Presented value ≠ `amount + expected_swap_fee` (over- or under-funded; the
-    /// server makes no change).
+    /// Presented value < `amount + expected_swap_fee` (spec verification step 8).
+    /// UNDER-funded only: value above the requirement is accepted and retained
+    /// by the server (the spec's Errors § has no over-payment counterpart).
     ///
-    /// HTTP 402 · `amount-mismatch` · terminal.
-    #[error("amount mismatch: presented {presented}, required {required} (= amount {amount} + swap_fee {expected_swap_fee})")]
-    AmountMismatch {
+    /// HTTP 402 · `payment-insufficient` · terminal.
+    #[error("payment insufficient: presented {presented}, required {required} (= amount {amount} + swap_fee {expected_swap_fee})")]
+    PaymentInsufficient {
         /// `amount + expected_swap_fee` the server requires.
         required: u64,
         /// Total value the presented token carried.
@@ -208,9 +210,9 @@ pub struct RedeemedProofs {
     /// keyset — a serialized `cashuB…` string the operator/wallet re-parses to
     /// spend.
     pub fresh_proofs: String,
-    /// Net value received = the requested `amount` exactly (the mint deducted the
-    /// swap fee). The caller asserts `amount == challenge.amount` to confirm
-    /// settlement.
+    /// Net value received: at least the requested `amount` (the mint deducted
+    /// the swap fee; value presented above the requirement is retained, so this
+    /// MAY exceed `challenge.amount`).
     pub amount: u64,
     /// Unit of the redeemed value (echoes the challenge `currency`).
     pub unit: String,
@@ -235,8 +237,8 @@ mod tests {
     }
 
     #[test]
-    fn amount_mismatch_display() {
-        let err = ChargeError::AmountMismatch {
+    fn payment_insufficient_display() {
+        let err = ChargeError::PaymentInsufficient {
             required: 1100,
             presented: 1000,
             amount: 1000,
@@ -244,7 +246,7 @@ mod tests {
         };
         assert_eq!(
             err.to_string(),
-            "amount mismatch: presented 1000, required 1100 (= amount 1000 + swap_fee 100)"
+            "payment insufficient: presented 1000, required 1100 (= amount 1000 + swap_fee 100)"
         );
     }
 

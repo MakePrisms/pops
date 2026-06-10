@@ -328,18 +328,19 @@ fn challenge_response(requirement: &CashuRequirement, problem: Option<&Problem>)
 /// `application/problem+json` body from the single-sourced
 /// [`crate::problem`] map (`draft-cashu-charge-01` §Errors). The three
 /// non-collapsing concerns drive the status: `MintUnreachable` is 503 (transport,
-/// token NOT consumed, NEVER a 402); `MalformedRequest`/`MethodUnsupported` are
-/// 400 (not a well-formed payment attempt); everything else (verification /
-/// malformed-credential) is a 402 with a fresh re-challenge. The 402 carries the
-/// problem body alongside the fresh `WWW-Authenticate`; a 503/400 carries the
-/// problem body with `Cache-Control: no-store`.
+/// token NOT consumed, NEVER a 402) and carries `Retry-After`;
+/// `MalformedRequest`/`MethodUnsupported` are 400 (not a well-formed payment
+/// attempt); everything else (verification / malformed-credential) is a 402 with
+/// a fresh re-challenge. The 402 carries the problem body alongside the fresh
+/// `WWW-Authenticate`; a 503/400 carries the problem body with
+/// `Cache-Control: no-store`.
 fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> Response {
     let problem = Problem::for_error(&e);
     let status = charge_error_status(&e);
     if status == StatusCode::PAYMENT_REQUIRED {
         return challenge_response(requirement, Some(&problem));
     }
-    (
+    let mut response = (
         status,
         [
             (
@@ -353,7 +354,14 @@ fn charge_error_to_response(e: ChargeError, requirement: &CashuRequirement) -> R
         ],
         problem.to_json(),
     )
-        .into_response()
+        .into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_static("2"),
+        );
+    }
+    response
 }
 
 /// Pluck the echoed challenge fields out of a parsed credentials blob — for test
@@ -1229,9 +1237,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overfunded_presentation_returns_402() {
-        // Exact-amount: a 20-against-10 over-funded token is rejected, NOT
-        // change-made — the holder splits to 10 locally before presenting.
+    async fn overfunded_presentation_is_accepted_and_excess_retained() {
+        // Spec step 8: value above `amount + swap_fee` is accepted and
+        // retained — a 20-against-10 token redeems whole and serves the
+        // resource; the handler sees the full redeemed value.
         let token = make_token(
             mint_a(),
             pop_unit(),
@@ -1242,23 +1251,19 @@ mod tests {
             .oneshot(request_with_token(&token.to_string()))
             .await
             .expect("oneshot");
-        assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert!(response
-            .headers()
-            .get(http::header::WWW_AUTHENTICATE)
-            .is_some());
+        assert_eq!(response.status(), StatusCode::OK);
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
-        assert!(
-            body.contains("amount mismatch"),
-            "expected amount-mismatch body, got: {body}"
+        assert_eq!(
+            &body_bytes[..],
+            b"ok:20",
+            "the WHOLE over-funded value is redeemed and retained"
         );
     }
 
     #[tokio::test]
-    async fn underfunded_presentation_returns_402() {
+    async fn underfunded_presentation_returns_402_payment_insufficient() {
         let token = make_token(mint_a(), pop_unit(), vec![make_proof(8, 0)]);
         let app = router_with(state_with(SwapResponse::Echo));
         let response = app
@@ -1269,10 +1274,39 @@ mod tests {
         let body_bytes = to_bytes(response.into_body(), 1024)
             .await
             .expect("collect body");
-        let body = std::str::from_utf8(&body_bytes).unwrap_or("<non-utf8 body>");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(
+            problem["type"],
+            "https://paymentauth.org/problems/payment-insufficient",
+            "an under-funded token is the framework's payment-insufficient"
+        );
+        assert_eq!(problem["status"], 402);
+    }
+
+    #[tokio::test]
+    async fn mint_unreachable_503_carries_retry_after_and_no_custom_type() {
+        // Spec Errors §: mint unreachability carries no problem type — plain
+        // 503 + Retry-After, body about:blank.
+        let token = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]);
+        let app = router_with(state_with(SwapResponse::Unreachable));
+        let response = app
+            .oneshot(request_with_token(&token.to_string()))
+            .await
+            .expect("oneshot");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
-            body.contains("amount mismatch"),
-            "expected amount-mismatch body, got: {body}"
+            response.headers().get(http::header::RETRY_AFTER).is_some(),
+            "a 503 SHOULD carry Retry-After"
+        );
+        let body_bytes = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("collect body");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("problem+json body");
+        assert_eq!(
+            problem["type"], "about:blank",
+            "mint unreachability has no custom problem-type URI"
         );
     }
 }

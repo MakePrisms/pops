@@ -479,7 +479,7 @@ fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
             transport_detail: "timeout".into(),
             indeterminate: false,
         },
-        || ChargeError::AmountMismatch {
+        || ChargeError::PaymentInsufficient {
             required: 100,
             presented: 90,
             amount: 100,
@@ -519,10 +519,12 @@ fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
 #[tokio::test]
 async fn charge_errors_map_to_spec_problem_types_and_statuses() {
     // (ABSOLUTE problem-type URI, HTTP status) per draft-cashu-charge-01
-    // §Errors + the framework's status table. Only amount-mismatch and
-    // mint-unavailable live under the cashu/ namespace; MalformedRequest is a
-    // 400 with NO registered type (about:blank), never the invalid-challenge
-    // slug; a non-"cashu" method is the framework's method-unsupported 400.
+    // §Errors + the framework's status table. The method defines NO problem
+    // types of its own: mint unreachability is a plain 503 (about:blank body,
+    // no custom URI) and an under-funded token is the framework's
+    // payment-insufficient; MalformedRequest is a 400 with NO registered type
+    // (about:blank), never the invalid-challenge slug; a non-"cashu" method is
+    // the framework's method-unsupported 400.
     type ErrorCase = (fn() -> ChargeError, &'static str, u16);
     let cases: Vec<ErrorCase> = vec![
         (
@@ -531,17 +533,17 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 transport_detail: "timeout".into(),
                 indeterminate: false,
             },
-            "https://paymentauth.org/problems/cashu/mint-unavailable",
+            "about:blank",
             503,
         ),
         (
-            || ChargeError::AmountMismatch {
+            || ChargeError::PaymentInsufficient {
                 required: 100,
                 presented: 90,
                 amount: 100,
                 expected_swap_fee: 0,
             },
-            "https://paymentauth.org/problems/cashu/amount-mismatch",
+            "https://paymentauth.org/problems/payment-insufficient",
             402,
         ),
         (
@@ -562,7 +564,7 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
         ),
         (
             || ChargeError::MultiMintOrUnit,
-            "https://paymentauth.org/problems/verification-failed",
+            "https://paymentauth.org/problems/malformed-credential",
             402,
         ),
         (
@@ -686,7 +688,8 @@ async fn payment_and_xcashu_surfaces_emit_identical_mappings() {
 #[tokio::test]
 async fn mint_unreachable_is_503_with_no_store_never_a_402() {
     // The load-bearing invariant: a transport failure is a 503 (token NOT
-    // consumed), NEVER collapsed into a 402.
+    // consumed), NEVER collapsed into a 402 — and per the spec's Errors § it
+    // carries NO problem type (about:blank body, no cashu/ URI).
     let (status, problem) = problem_for(|| ChargeError::MintUnreachable {
         mint_url: "https://mint.example".into(),
         transport_detail: "connect refused".into(),
@@ -694,10 +697,7 @@ async fn mint_unreachable_is_503_with_no_store_never_a_402() {
     })
     .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        problem["type"],
-        "https://paymentauth.org/problems/cashu/mint-unavailable"
-    );
+    assert_eq!(problem["type"], "about:blank");
 }
 
 // ─────────────────── bare 402 (no attempt) has no problem body ───────────────
