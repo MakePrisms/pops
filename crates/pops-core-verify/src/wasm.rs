@@ -114,7 +114,6 @@ fn charge_error_code(e: &ChargeError) -> &'static str {
         ChargeError::WrongUnit { .. } => "wrong-unit",
         ChargeError::MintNotAllowed { .. } => "mint-not-allowed",
         ChargeError::MintUrlUserinfo { .. } => "mint-url-userinfo",
-        ChargeError::MultiMintOrUnit => "multi-mint-or-unit",
         ChargeError::LockedToken => "locked-token",
         ChargeError::FeeTooHigh { .. } => "fee-too-high",
         ChargeError::ShortKeysetIdUnresolved { .. } => "short-keyset-id-unresolved",

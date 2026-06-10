@@ -852,7 +852,6 @@ async fn gateway_emits_the_shared_problem_mapping_for_every_charge_error() {
         || ChargeError::MintUrlUserinfo {
             url: "https://user@mint-a.example.com".into(),
         },
-        || ChargeError::MultiMintOrUnit,
         || ChargeError::LockedToken,
         || ChargeError::FeeTooHigh {
             keyset_id: "009a1f293253e41e".into(),

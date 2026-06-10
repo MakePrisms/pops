@@ -131,12 +131,9 @@ pub fn problem_mapping(e: &ChargeError) -> ProblemMapping {
         ),
 
         // A bad credential is still a payment attempt → 402 + re-challenge
-        // (the framework's status table), never a 400. The spec treats a
-        // multi-mint/multi-unit token as a parse-level fault of the credential
-        // (a valid TokenV4 structurally carries exactly one mint and unit), so
-        // MultiMintOrUnit lands here rather than under verification-failed.
+        // (the framework's status table), never a 400. The proof-count DoS
+        // bound is a credential-shape fault, so it shares this type.
         ChargeError::MalformedCredential(_)
-        | ChargeError::MultiMintOrUnit
         | ChargeError::TooManyProofs { .. } => framework(
             "malformed-credential",
             "https://paymentauth.org/problems/malformed-credential",
@@ -359,14 +356,12 @@ mod tests {
     }
 
     #[test]
-    fn malformed_credential_proof_cap_and_multi_mint_are_402_not_400() {
+    fn malformed_credential_and_proof_cap_are_402_not_400() {
         // Framework status table: a malformed CREDENTIAL is a 402 (it is still
-        // a payment attempt, answered with a fresh challenge); the spec folds
-        // the proof-count DoS bound AND the multi-mint/unit parse-level fault
-        // into the same type (a valid TokenV4 carries exactly one mint/unit).
+        // a payment attempt, answered with a fresh challenge); the proof-count
+        // DoS bound is a credential-shape fault folded into the same type.
         for e in [
             ChargeError::MalformedCredential("bad base64".into()),
-            ChargeError::MultiMintOrUnit,
             ChargeError::TooManyProofs { got: 99, max: 8 },
         ] {
             let m = problem_mapping(&e);
@@ -426,7 +421,6 @@ mod tests {
             problem_mapping(&ChargeError::Expired),
             problem_mapping(&ChargeError::InvalidChallenge),
             problem_mapping(&ChargeError::MalformedCredential("x".into())),
-            problem_mapping(&ChargeError::MultiMintOrUnit),
             problem_mapping(&ChargeError::MethodUnsupported { method: "x".into() }),
             problem_mapping(&ChargeError::MalformedRequest("x".into())),
             problem_mapping(&ChargeError::PaymentInsufficient {

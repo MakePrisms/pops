@@ -46,7 +46,7 @@ pub struct ValidatedCharge {
 
 /// Errors a [`ChargeValidator`] can return. The pre-swap arms (`UnitMismatch`,
 /// `ResolvedKeysetUnitMismatch`, `MintNotAllowed`, `PaymentInsufficient`,
-/// `TokenEmpty`, `LockedToken`, `MultiMintOrUnit`, `TooManyProofs`) are raised
+/// `TokenEmpty`, `LockedToken`, `TooManyProofs`) are raised
 /// BEFORE the swap is ever attempted; the rest are raised at/after it.
 /// [`CashuCredential`] maps these onto [`crate::charge::ChargeError`].
 #[derive(Debug, Error)]
@@ -85,13 +85,6 @@ pub enum ValidationError {
     /// verification-failed outcome, no mint round-trip).
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
-
-    /// Proofs reference more than one keyset id. Rejected before the swap so the
-    /// ceremony's `proofs[0]` output-keyset assumption holds: a cashu keyset is
-    /// mint-AND-unit-specific, so a single shared id is what guarantees a single
-    /// mint and unit across the whole set.
-    #[error("token references multiple keysets/units (must be a single keyset)")]
-    MultiMintOrUnit,
 
     /// More proofs than the configured cap — a pre-swap DoS guard.
     #[error("too many proofs: {got} exceeds max {max}")]
@@ -358,27 +351,25 @@ impl<M: MintClient> ChargeValidator<M> {
             return Err(ValidationError::TokenEmpty);
         }
 
-        // See `MultiMintOrUnit`: a single shared keyset id is what makes the
-        // ceremony's `proofs[0]` output-keyset resolution sound for the set.
-        let first_keyset = proofs[0].keyset_id;
-        if proofs.iter().any(|p| p.keyset_id != first_keyset) {
-            return Err(ValidationError::MultiMintOrUnit);
-        }
-
         // Spec verification step 6, BEFORE the step-7 value check and the swap:
-        // the resolved keyset's unit must equal the requirement's. The token's
+        // EVERY resolved keyset's unit must equal the requirement's. The token's
         // declared unit (checked above) is client-supplied data; the mint's
         // published keyset is the authority — without this, a sat-keyset proof
-        // under a token DECLARING the pop unit would reach the swap. A keyset
-        // id absent from the published list resolves nothing (no unit to
-        // assert); the swap rejects unknown keysets.
-        if let Some(resolved) = keysets.iter().find(|k| k.id == first_keyset) {
-            if resolved.unit != requirement.unit {
-                return Err(ValidationError::ResolvedKeysetUnitMismatch {
-                    keyset_id: first_keyset.to_string(),
-                    expected: requirement.unit.clone(),
-                    got: resolved.unit.clone(),
-                });
+        // under a token DECLARING the pop unit would reach the swap. Proofs may
+        // span several keysets (a TokenV4 groups proofs by keyset id; change
+        // accrued across a keyset rotation is exactly such a token), so check
+        // each distinct keyset, not just the first. A keyset id absent from the
+        // published list resolves nothing (no unit to assert); the swap rejects
+        // unknown keysets.
+        for proof in &proofs {
+            if let Some(resolved) = keysets.iter().find(|k| k.id == proof.keyset_id) {
+                if resolved.unit != requirement.unit {
+                    return Err(ValidationError::ResolvedKeysetUnitMismatch {
+                        keyset_id: proof.keyset_id.to_string(),
+                        expected: requirement.unit.clone(),
+                        got: resolved.unit.clone(),
+                    });
+                }
             }
         }
 
@@ -545,7 +536,6 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
             indeterminate: true,
         },
         ValidationError::LockedToken => ChargeError::LockedToken,
-        ValidationError::MultiMintOrUnit => ChargeError::MultiMintOrUnit,
         ValidationError::TooManyProofs { got, max } => ChargeError::TooManyProofs { got, max },
         ValidationError::PaymentInsufficient { required, got } => {
             ChargeError::PaymentInsufficient {
@@ -713,7 +703,7 @@ impl<M: MintClient> Redeemer for CashuCredential<M> {
 mod tests {
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use cashu::dhke::hash_to_curve;
@@ -758,12 +748,16 @@ mod tests {
         keysets_response: KeysetsResponse,
         swap_calls: Arc<AtomicUsize>,
         keysets_calls: Arc<AtomicUsize>,
+        /// The proofs handed to the most recent `swap` call, so a test can
+        /// assert the WHOLE presented set (every keyset) reaches the swap.
+        swapped_proofs: Arc<Mutex<Proofs>>,
     }
 
     #[derive(Clone)]
     struct MockCounters {
         swap: Arc<AtomicUsize>,
         keysets: Arc<AtomicUsize>,
+        swapped_proofs: Arc<Mutex<Proofs>>,
     }
 
     impl MockMintClient {
@@ -773,9 +767,11 @@ mod tests {
         ) -> (Self, MockCounters) {
             let swap_calls = Arc::new(AtomicUsize::new(0));
             let keysets_calls = Arc::new(AtomicUsize::new(0));
+            let swapped_proofs = Arc::new(Mutex::new(Vec::new()));
             let counters = MockCounters {
                 swap: swap_calls.clone(),
                 keysets: keysets_calls.clone(),
+                swapped_proofs: swapped_proofs.clone(),
             };
             (
                 Self {
@@ -783,6 +779,7 @@ mod tests {
                     keysets_response,
                     swap_calls,
                     keysets_calls,
+                    swapped_proofs,
                 },
                 counters,
             )
@@ -815,6 +812,7 @@ mod tests {
             proofs: Proofs,
         ) -> Result<SwapOutcome, MintClientError> {
             self.swap_calls.fetch_add(1, Ordering::SeqCst);
+            *self.swapped_proofs.lock().expect("swap capture lock") = proofs.clone();
             match self.swap_response {
                 SwapResponse::Echo => Ok(SwapOutcome {
                     proofs,
@@ -1505,13 +1503,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_rejects_mixed_keysets_before_swap() {
-        // Two proofs on DIFFERENT keyset ids. The V1 keyset is resolvable (we
-        // supply its KeySetInfo) so extraction succeeds and the homogeneity
-        // check is what fires — not an extraction error.
-        let v0 = make_proof(4, 0); // keyset 009a1f293253e41e
+    async fn validate_accepts_mixed_keysets_same_unit() {
+        // A TokenV4 carries one mint and one unit (both token-scalar) but groups
+        // proofs by keyset id, so proofs spanning several keysets of the same
+        // unit are well-formed (e.g. change accrued across a keyset rotation).
+        // Both keysets resolve to the requirement's unit, so structural
+        // validation passes and the WHOLE set reaches the swap.
+        let v0 = make_proof(4, 0); // keyset 009a1f293253e41e (V0)
         let v1_id = v1_keyset_id();
         let v1 = proof_with_keyset(6, 1, v1_id);
+        let v0_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
         let token_str = make_token(mint_a(), pop_unit(), vec![v0, v1]).to_string();
         let token = Token::from_str(&token_str).expect("mixed-keyset token round-trips");
 
@@ -1519,22 +1520,67 @@ mod tests {
 
         let (mock, counters) = MockMintClient::new(
             SwapResponse::Echo,
-            KeysetsResponse::Ok(vec![keyset_info(v1_id, pop_unit())]),
+            KeysetsResponse::Ok(vec![
+                keyset_info(v0_id, pop_unit()),
+                keyset_info(v1_id, pop_unit()),
+            ]),
+        );
+        let validator = ChargeValidator::new(mock);
+
+        let validated = validator
+            .validate(&token, &req)
+            .await
+            .expect("a same-unit mixed-keyset token must validate");
+        assert_eq!(
+            u64::from(validated.amount),
+            10,
+            "the whole multi-keyset value (4 + 6) is redeemed"
+        );
+        assert_eq!(
+            counters.swap.load(Ordering::SeqCst),
+            1,
+            "the mixed-keyset set reaches the swap exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_mixed_keysets_when_one_resolves_to_a_foreign_unit() {
+        // The step-6 check covers EVERY keyset, not just the first: a token
+        // whose second keyset the mint publishes under a DIFFERENT unit is
+        // rejected pre-swap, even though the first keyset matches.
+        let v0_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        let v1_id = v1_keyset_id();
+        let v0 = make_proof(4, 0); // keyset 009a1f293253e41e (matches the unit)
+        let v1 = proof_with_keyset(6, 1, v1_id); // foreign-unit keyset
+        let token_str = make_token(mint_a(), pop_unit(), vec![v0, v1]).to_string();
+        let token = Token::from_str(&token_str).expect("mixed-keyset token round-trips");
+
+        let req = requirement(pop_unit(), vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::new(
+            SwapResponse::Echo,
+            KeysetsResponse::Ok(vec![
+                keyset_info(v0_id, pop_unit()),
+                keyset_info(v1_id, CurrencyUnit::Sat),
+            ]),
         );
         let validator = ChargeValidator::new(mock);
 
         let err = validator
             .validate(&token, &req)
             .await
-            .expect_err("a token mixing keysets must be rejected");
-        assert!(
-            matches!(err, ValidationError::MultiMintOrUnit),
-            "expected MultiMintOrUnit, got {err:?}"
-        );
+            .expect_err("a foreign-unit keyset anywhere in the set must reject");
+        match err {
+            ValidationError::ResolvedKeysetUnitMismatch { keyset_id, got, .. } => {
+                assert_eq!(keyset_id, v1_id.to_string(), "names the foreign keyset");
+                assert_eq!(got, CurrencyUnit::Sat);
+            }
+            other => panic!("expected ResolvedKeysetUnitMismatch, got {other:?}"),
+        }
         assert_eq!(
             counters.swap.load(Ordering::SeqCst),
             0,
-            "swap must NOT be called on a mixed-keyset token"
+            "a foreign-unit keyset must reject BEFORE the swap"
         );
     }
 
@@ -1711,6 +1757,51 @@ mod tests {
         assert!(
             redeemed.dleq_ok,
             "a clean swap-output DLEQ verdict rides the success"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_and_redeem_mixed_keysets_swaps_all_proofs() {
+        // End-to-end through the Redeemer seam: a token whose proofs span two
+        // keysets of the same unit redeems, and the swap receives the WHOLE set
+        // (one NUT-03 request carrying every proof), not just the first keyset's.
+        let v0_id = Id::from_str("009a1f293253e41e").expect("valid v0 keyset id");
+        let v1_id = v1_keyset_id();
+        let v0 = make_proof(7, 0); // keyset 009a1f293253e41e (V0)
+        let v1 = proof_with_keyset(3, 1, v1_id);
+        let presented = make_token(mint_a(), pop_unit(), vec![v0, v1]).to_string();
+        let req = charge_req("pop_1700000000", vec![mint_a()], 10);
+
+        let (mock, counters) = MockMintClient::new(
+            SwapResponse::Echo,
+            KeysetsResponse::Ok(vec![
+                keyset_info(v0_id, pop_unit()),
+                keyset_info(v1_id, pop_unit()),
+            ]),
+        );
+        let cred = CashuCredential::new(mock);
+
+        let redeemed = cred
+            .verify_and_redeem(&presented, &req)
+            .await
+            .expect("a mixed-keyset token must redeem end-to-end");
+        assert_eq!(redeemed.amount, 10, "the whole 7 + 3 multi-keyset value");
+
+        let swapped = counters.swapped_proofs.lock().expect("swap capture lock");
+        assert_eq!(
+            swapped.len(),
+            2,
+            "both proofs (every keyset) must reach the one swap, got {}",
+            swapped.len()
+        );
+        let mut swapped_keysets: Vec<String> =
+            swapped.iter().map(|p| p.keyset_id.to_string()).collect();
+        swapped_keysets.sort();
+        let mut expected = vec![v0_id.to_string(), v1_id.to_string()];
+        expected.sort();
+        assert_eq!(
+            swapped_keysets, expected,
+            "the swap must carry proofs from BOTH keysets"
         );
     }
 
@@ -2108,5 +2199,61 @@ mod tests {
             }
             other => panic!("expected MintUnreachable {{ indeterminate: true }}, got {other:?}"),
         }
+    }
+
+    /// The exact `payload.token` from the Night Bazaar `spawn` credential that
+    /// the old multi-keyset guard rejected (one mint, one unit, proofs across
+    /// two keysets). A live regression fixture, asserted decode-only (no mint).
+    const BAZAAR_SPAWN_TOKEN: &str = "cashuBo2FteBtodHRwOi8vMTAwLjk2LjI1MS4xMTE6MjgzMzhhdW5wb3BfMTc4MTcxMzE1NmF0gqJhaUgBTdAqoYOS0mFwgaNhYQhhc3hANDQ4ZWUxMThlNWIzYjkxZDg5NmU4NWE3ZTEyZGI1MzJjN2QxNmRlYTE3MGMxZjFjOTIwY2Y5YmUzODUyMmYwZWFjWCEDICQ3pOMHpi9D_S7SZS4gGwOn5zeGVbjODUtChTPBDVeiYWlIARIH4yx54AFhcIGjYWECYXN4QGJkYWRmNzE5Yjc1NTJhNzFiMTJjMGRmNzliMjU4OGM3NGQxMzE1YjlhMmMyZDRlMThiYzM4MjJhNjRmYTA2OWRhY1ghA_TL14f_mM70kPXEA8HvjkEP8MOqacqKGXyCRcJDd0kV";
+
+    #[test]
+    fn bazaar_spawn_token_is_one_mint_one_unit_across_two_keysets() {
+        // The bazaar incident: pops 402'd this credential as malformed for
+        // "multiple mints or units". A TokenV4's mint and unit are token-scalar,
+        // and the `t` array groups proofs by keyset, so the token is well-formed
+        // multi-keyset ecash (change across a keyset rotation). Decode-only, so
+        // it regresses the structural verdict without reaching a mint.
+        let token = Token::from_str(BAZAAR_SPAWN_TOKEN).expect("the fixture decodes as a TokenV4");
+
+        assert!(
+            matches!(token, Token::TokenV4(_)),
+            "the fixture is a cashuB/TokenV4 token"
+        );
+        assert_eq!(
+            token.mint_url().expect("one scalar mint").to_string(),
+            "http://100.96.251.111:28338",
+            "exactly one mint (token-scalar)"
+        );
+        assert_eq!(
+            token.unit().expect("one scalar unit"),
+            CurrencyUnit::Custom("pop_1781713156".to_string()),
+            "exactly one unit (token-scalar)"
+        );
+
+        let Token::TokenV4(v4) = &token else {
+            unreachable!("asserted TokenV4 above")
+        };
+        let mut keysets: Vec<String> = v4
+            .token
+            .iter()
+            .map(|group| group.keyset_id.to_string())
+            .collect();
+        keysets.sort();
+        assert_eq!(
+            keysets.len(),
+            2,
+            "the token groups its proofs across two keysets"
+        );
+        assert!(
+            keysets[0].starts_with("01") && keysets[1].starts_with("01"),
+            "both are v1 short keyset ids, got {keysets:?}"
+        );
+        assert_ne!(keysets[0], keysets[1], "the two keysets are distinct");
+        // One proof per keyset group: the multiplicity is across keysets.
+        assert_eq!(
+            token.token_secrets().len(),
+            2,
+            "two proofs total, one per keyset"
+        );
     }
 }

@@ -104,12 +104,6 @@ pub enum ChargeError {
         input_fee_ppk: u64,
     },
 
-    /// Token's proofs reference more than one mint or unit.
-    ///
-    /// HTTP 402 · `verification-failed` · terminal.
-    #[error("token references multiple mints or units")]
-    MultiMintOrUnit,
-
     /// A proof carries a NUT-10 (P2PK/HTLC) spending condition. The spec permits
     /// conditions only when the challenge advertised them; this implementation
     /// advertises none, so a locked proof is unsatisfiable and rejected before
