@@ -214,6 +214,18 @@ pub enum PopError {
         /// What failed to decode.
         reason: String,
     },
+    /// The 402 challenge's `expires` is already in the past. The framework
+    /// forbids submitting a credential against an expired challenge, so
+    /// NOTHING was sent and no token was touched — re-request the resource
+    /// for a fresh challenge. (`challenge_expired`)
+    ChallengeExpired {
+        /// The URL whose challenge expired.
+        url: String,
+        /// The challenge's `expires` value verbatim (RFC 3339; an
+        /// unparseable value is refused the same way — freshness cannot be
+        /// established).
+        expires: String,
+    },
     /// The held token's unit differs from the charge's; paying would be
     /// wrong-currency. Send nothing. (`token_unit_mismatch`)
     TokenUnitMismatch {
@@ -332,6 +344,7 @@ impl PopError {
             PopError::PaymentRejected { .. } => "payment_rejected",
             PopError::NoPaymentChallenge { .. } => "no_payment_challenge",
             PopError::ChallengeParseFailed { .. } => "challenge_parse_failed",
+            PopError::ChallengeExpired { .. } => "challenge_expired",
             PopError::TokenUnitMismatch { .. } => "token_unit_mismatch",
             PopError::TokenMintMismatch { .. } => "token_mint_mismatch",
             PopError::InsufficientTokenValue { .. } => "insufficient_token_value",
@@ -507,6 +520,10 @@ impl PopError {
             })),
             PopError::ChallengeParseFailed { reason } => Some(json!({
                 "reason": reason,
+            })),
+            PopError::ChallengeExpired { url, expires } => Some(json!({
+                "url": url,
+                "expires": expires,
             })),
             PopError::TokenUnitMismatch { required, got } => Some(json!({
                 "required": required,
@@ -695,6 +712,11 @@ impl PopError {
             PopError::ChallengeParseFailed { reason } => {
                 format!("could not decode the 402 payment challenge into a charge: {reason}")
             }
+            PopError::ChallengeExpired { url, expires } => format!(
+                "the 402 challenge from {url} expired at {expires}; a credential must not be \
+                 submitted against an expired challenge, so nothing was sent (the held token is \
+                 untouched). Re-request the resource to get a fresh challenge, then pay that."
+            ),
             PopError::TokenUnitMismatch { required, got } => format!(
                 "the held token's unit `{got}` does not match the charge's required unit `{required}`; \
                  not paying (wrong currency). Present a token in `{required}`."
@@ -1074,6 +1096,28 @@ mod tests {
         assert!(e.recovery_tokens().is_none());
     }
 
+    /// `challenge_expired` is terminal-for-this-challenge (re-fetch, don't
+    /// retry as-is) and carries the url + verbatim expires so the caller can
+    /// see what lapsed. Nothing was sent.
+    #[test]
+    fn challenge_expired_carries_url_and_expires() {
+        let e = PopError::ChallengeExpired {
+            url: "https://app.example/resource".into(),
+            expires: "2026-03-15T12:05:00Z".into(),
+        };
+        let env = e.to_envelope();
+        assert_eq!(env["error"]["code"], json!("challenge_expired"));
+        assert_eq!(env["error"]["retriable"], json!(false));
+        assert_eq!(
+            env["error"]["details"]["url"],
+            json!("https://app.example/resource")
+        );
+        assert_eq!(
+            env["error"]["details"]["expires"],
+            json!("2026-03-15T12:05:00Z")
+        );
+    }
+
     /// Message-only codes carry no `details` key.
     #[test]
     fn message_only_codes_have_no_details() {
@@ -1196,6 +1240,10 @@ mod tests {
             },
             PopError::ChallengeParseFailed {
                 reason: "bad creqA".into(),
+            },
+            PopError::ChallengeExpired {
+                url: "https://x".into(),
+                expires: "2026-03-15T12:05:00Z".into(),
             },
             PopError::TokenUnitMismatch {
                 required: "pop_2".into(),

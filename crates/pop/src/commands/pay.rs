@@ -153,6 +153,13 @@ pub async fn run(
         reason: format!("WWW-Authenticate Payment params did not parse: {e}"),
     })?;
 
+    // A credential MUST NOT be submitted against an expired challenge
+    // (framework `expires`), so check freshness FIRST — before the charge is
+    // even decoded, and long before any token is read or swapped.
+    if let Some(e) = expired_challenge_error(&params, &args.url) {
+        return Err(e.into());
+    }
+
     // ---- 3b/3c. Decode the request object → creqA → the concrete charge. ----
     let charge = decode_charge_from_params(&params)?;
     eprintln!(
@@ -490,6 +497,24 @@ fn decode_charge_from_params(params: &PaymentParams) -> Result<Charge, Box<dyn s
     })
 }
 
+
+/// The expired-challenge refusal, when the 402's `expires` forbids paying it:
+/// a challenge whose RFC 3339 `expires` is in the past (or unparseable, which
+/// equally fails to establish freshness) MUST NOT have a credential submitted
+/// against it — the server would only answer `payment-expired` after the
+/// client did the work. A challenge without `expires` carries no expiry
+/// signal and proceeds.
+pub fn expired_challenge_error(params: &PaymentParams, url: &str) -> Option<PopError> {
+    let expires = params.expires.as_deref()?;
+    let is_past = match chrono::DateTime::parse_from_rfc3339(expires) {
+        Ok(ts) => ts.with_timezone(&chrono::Utc) <= chrono::Utc::now(),
+        Err(_) => true,
+    };
+    is_past.then(|| PopError::ChallengeExpired {
+        url: url.to_string(),
+        expires: expires.to_string(),
+    })
+}
 
 /// Validates the held token against the charge BEFORE any spend: matching unit,
 /// an accepted mint, and enough value. Any mismatch → a structured error and
@@ -845,6 +870,74 @@ mod tests {
         let d = pe.details().unwrap();
         assert_eq!(d["have"], serde_json::json!(599));
         assert_eq!(d["need"], serde_json::json!(600));
+    }
+
+    // ---- the expired-challenge refusal (no credential against a past expires) -
+
+    /// Params carrying the supplied `expires` (other fields don't matter to
+    /// the freshness check).
+    fn params_with_expires(expires: Option<&str>) -> PaymentParams {
+        PaymentParams {
+            id: "ch-1".into(),
+            realm: "pops".into(),
+            method: "cashu".into(),
+            intent: "charge".into(),
+            request: "cmVxdWVzdA".into(),
+            expires: expires.map(str::to_string),
+            digest: None,
+            opaque: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn expired_challenge_is_refused_before_any_spend() {
+        let err = expired_challenge_error(
+            &params_with_expires(Some("2020-01-01T00:00:00Z")),
+            "https://app.example/r",
+        )
+        .expect("a past expires must refuse");
+        assert_eq!(err.code(), "challenge_expired");
+        let d = err.details().expect("details required");
+        assert_eq!(d["url"], serde_json::json!("https://app.example/r"));
+        assert_eq!(d["expires"], serde_json::json!("2020-01-01T00:00:00Z"));
+        assert!(!err.retriable(), "re-fetch the challenge, don't retry as-is");
+    }
+
+    #[test]
+    fn fresh_challenge_passes_the_expiry_check() {
+        assert!(
+            expired_challenge_error(
+                &params_with_expires(Some("2999-01-01T00:00:00Z")),
+                "https://app.example/r",
+            )
+            .is_none(),
+            "a future expires must proceed"
+        );
+    }
+
+    #[test]
+    fn challenge_without_expires_passes_the_expiry_check() {
+        assert!(
+            expired_challenge_error(&params_with_expires(None), "https://app.example/r")
+                .is_none(),
+            "no expires ⇒ no expiry signal to refuse on"
+        );
+    }
+
+    #[test]
+    fn unparseable_expires_is_refused_like_a_past_one() {
+        let err = expired_challenge_error(
+            &params_with_expires(Some("not-a-timestamp")),
+            "https://app.example/r",
+        )
+        .expect("freshness cannot be established ⇒ refuse");
+        assert_eq!(err.code(), "challenge_expired");
+        assert_eq!(
+            err.details().expect("details")["expires"],
+            serde_json::json!("not-a-timestamp"),
+            "the verbatim value is surfaced for diagnosis"
+        );
     }
 
     // ---- request-object decode (the client's 402 parse surface) ----------
