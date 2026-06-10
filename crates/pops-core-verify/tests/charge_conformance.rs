@@ -593,7 +593,6 @@ fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
         || ChargeError::MintUrlUserinfo {
             url: "https://user@mint.example".into(),
         },
-        || ChargeError::MultiMintOrUnit,
         || ChargeError::LockedToken,
         || ChargeError::FeeTooHigh {
             keyset_id: "009a1f293253e41e".into(),
@@ -667,11 +666,6 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
                 url: "https://user@mint.example".into(),
             },
             "https://paymentauth.org/problems/verification-failed",
-            402,
-        ),
-        (
-            || ChargeError::MultiMintOrUnit,
-            "https://paymentauth.org/problems/malformed-credential",
             402,
         ),
         (
