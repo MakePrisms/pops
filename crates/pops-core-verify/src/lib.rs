@@ -23,8 +23,8 @@
 
 pub mod cashu_credential;
 pub mod challenge;
-// The committed charge contract (`ChargeError` / `RedeemedProofs` / `DleqLocation`)
-// and the `pop_<ts>` unit grammar. Plain data, thiserror only — wasm-clean.
+// The committed charge contract (`ChargeError` / `RedeemedProofs`) and the
+// `pop_<ts>` unit grammar. Plain data, thiserror only — wasm-clean.
 pub mod charge;
 pub mod envelope;
 pub mod error;

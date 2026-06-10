@@ -25,7 +25,7 @@ use cashu::{Amount, CurrencyUnit, MintUrl};
 use http::{header::AUTHORIZATION, Request, StatusCode};
 use tower::ServiceExt;
 
-use pops_core_verify::charge::{ChargeError, DleqLocation, RedeemedProofs};
+use pops_core_verify::charge::{ChargeError, RedeemedProofs};
 use pops_core_verify::challenge::{
     decode_charge_request, encode_challenge, encode_charge_request, CashuRequirement,
 };
@@ -426,9 +426,7 @@ async fn charge_errors_map_to_spec_problem_types_and_statuses() {
         (|| ChargeError::MultiMintOrUnit, "cashu/verification-failed", 402),
         (|| ChargeError::LockedToken, "cashu/verification-failed", 402),
         (
-            || ChargeError::DleqInvalid {
-                location: DleqLocation::SwapOutput,
-            },
+            || ChargeError::DleqInvalid,
             "cashu/verification-failed",
             402,
         ),

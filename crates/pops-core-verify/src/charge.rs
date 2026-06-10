@@ -1,6 +1,6 @@
-//! The charge contract: [`ChargeError`], [`DleqLocation`], and [`RedeemedProofs`]
-//! — the committed shape the verifier produces and its hosts (the gateway, the
-//! wasm/serverless SDK) map off.
+//! The charge contract: [`ChargeError`] and [`RedeemedProofs`] — the committed
+//! shape the verifier produces and its hosts (the gateway, the wasm/serverless
+//! SDK) map off.
 //!
 //! Plain data only (`RedeemedProofs.fresh_proofs` is a serialized `cashuB…`
 //! string, not `cashu::Proofs`), so it stays wasm-clean and is the canonical
@@ -89,17 +89,13 @@ pub enum ChargeError {
     #[error("token carries a NUT-10 spending condition (locked); bearer proofs only")]
     LockedToken,
 
-    /// A DLEQ proof (NUT-12) is INVALID — on a presented input proof, or
-    /// (security-critical) on a blind signature the swap RETURNED. Absence of an
-    /// input-proof DLEQ is NOT this error; a mint that OMITS output DLEQ IS.
+    /// A blind signature the swap RETURNED failed NUT-12 DLEQ — invalid or
+    /// omitted by the mint (a malicious mint reporting outputs it never validly
+    /// signed, which the server then could not spend). Security-critical.
     ///
     /// HTTP 402 · `verification-failed` · terminal.
-    #[error("DLEQ verification failed ({location})")]
-    DleqInvalid {
-        /// Distinguishes the lenient input case (present-but-invalid) from the
-        /// strict swap-output case (invalid or omitted — a mint-trust signal).
-        location: DleqLocation,
-    },
+    #[error("swap-output DLEQ verification failed")]
+    DleqInvalid,
 
     /// A proof's short (v1) keyset id does not resolve, or resolves ambiguously,
     /// against the mint's published keysets.
@@ -171,27 +167,6 @@ pub enum ChargeError {
     },
 }
 
-/// Where a DLEQ check failed — payload of `ChargeError::DleqInvalid`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DleqLocation {
-    /// On a presented INPUT proof (present-but-invalid). Lenient elsewhere:
-    /// ABSENCE of input DLEQ never produces an error.
-    InputProof,
-    /// On a blind signature the SWAP RETURNED — invalid OR omitted by the mint
-    /// (security-critical; a malicious mint reporting unsigned outputs).
-    SwapOutput,
-}
-
-impl std::fmt::Display for DleqLocation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            DleqLocation::InputProof => "input proof",
-            DleqLocation::SwapOutput => "swap output",
-        };
-        f.write_str(s)
-    }
-}
-
 /// The value the operator holds after a successful verify+redeem, plus what the
 /// SDK needs to emit a Payment-Receipt.
 ///
@@ -224,17 +199,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dleq_location_display() {
-        assert_eq!(DleqLocation::InputProof.to_string(), "input proof");
-        assert_eq!(DleqLocation::SwapOutput.to_string(), "swap output");
-    }
-
-    #[test]
-    fn dleq_invalid_display_interpolates_location() {
-        let err = ChargeError::DleqInvalid {
-            location: DleqLocation::SwapOutput,
-        };
-        assert_eq!(err.to_string(), "DLEQ verification failed (swap output)");
+    fn dleq_invalid_displays() {
+        let err = ChargeError::DleqInvalid;
+        assert_eq!(err.to_string(), "swap-output DLEQ verification failed");
     }
 
     #[test]

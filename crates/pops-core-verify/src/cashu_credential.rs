@@ -16,7 +16,7 @@ use std::str::FromStr;
 
 use cashu::nuts::nut00::ProofsMethods;
 use cashu::{Amount, CurrencyUnit, MintUrl, Proofs, Token};
-use crate::charge::{ChargeError, DleqLocation, RedeemedProofs};
+use crate::charge::{ChargeError, RedeemedProofs};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -415,12 +415,10 @@ fn map_validation_error(e: ValidationError, mint_url: &str) -> ChargeError {
         // needs the mint's NUT-03 error-body parse, which is not yet done.
         ValidationError::MintRejectedSwap(_) => ChargeError::DoubleSpend,
         // Money-safety: a missing/invalid swap-output DLEQ is verification-
-        // failed at the SwapOutput location — a 402 (gateway serves nothing),
-        // distinct from a double-spend so the operator sees the mint-trust
-        // signal. NEVER serve the resource on this path.
-        ValidationError::SwapOutputDleqInvalid(_) => ChargeError::DleqInvalid {
-            location: DleqLocation::SwapOutput,
-        },
+        // failed — a 402 (gateway serves nothing), distinct from a double-spend
+        // so the operator sees the mint-trust signal. NEVER serve the resource
+        // on this path.
+        ValidationError::SwapOutputDleqInvalid(_) => ChargeError::DleqInvalid,
     }
 }
 
@@ -1417,10 +1415,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_and_redeem_maps_swap_output_dleq_to_dleq_invalid_swap_output() {
-        // Money-safety: a swap-output DLEQ failure maps to DleqInvalid{SwapOutput},
-        // NOT DoubleSpend — the gateway serves nothing and no proofs are produced.
-        use crate::charge::DleqLocation;
+    async fn verify_and_redeem_maps_swap_output_dleq_to_dleq_invalid() {
+        // Money-safety: a swap-output DLEQ failure maps to DleqInvalid, NOT
+        // DoubleSpend — the gateway serves nothing and no proofs are produced.
         let presented = make_token(mint_a(), pop_unit(), vec![make_proof(10, 0)]).to_string();
         let req = charge_req("pop_1700000000", vec![mint_a()], 10);
 
@@ -1431,16 +1428,10 @@ mod tests {
             .verify_and_redeem(&presented, &req)
             .await
             .expect_err("swap-output DLEQ failure must map to DleqInvalid");
-        match err {
-            ChargeError::DleqInvalid { location } => {
-                assert_eq!(
-                    location,
-                    DleqLocation::SwapOutput,
-                    "swap-output DLEQ failure must carry the SwapOutput location"
-                );
-            }
-            other => panic!("expected DleqInvalid {{ SwapOutput }}, got {other:?}"),
-        }
+        assert!(
+            matches!(err, ChargeError::DleqInvalid),
+            "swap-output DLEQ failure must map to DleqInvalid, got {err:?}"
+        );
     }
 
     #[tokio::test]

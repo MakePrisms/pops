@@ -84,7 +84,7 @@ pub enum MintClientError {
     /// SECURITY-CRITICAL, deliberately distinct from [`Self::RejectedSwap`]: the
     /// mint did NOT prove it signed the outputs with the advertised key, so the
     /// proofs are not provably valid bearer value and MUST NOT be redeemed (no
-    /// redeemed value without a verified DLEQ). Maps to `DleqInvalid { SwapOutput }`
+    /// redeemed value without a verified DLEQ). Maps to `DleqInvalid`
     /// (402, resource not served), NOT a double-spend.
     #[error("swap-output DLEQ verification failed: {0}")]
     SwapOutputDleqInvalid(String),
