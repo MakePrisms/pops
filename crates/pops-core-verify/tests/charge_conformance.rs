@@ -103,31 +103,67 @@ impl Redeemer for CannedRedeemer {
 /// A router that gates an echo handler behind `require_charge` with the canned
 /// redeemer.
 fn router(outcome: Outcome) -> Router {
+    router_with_ttl(outcome, None)
+}
+
+/// As [`router`] with an explicit challenge TTL (for the expiry tests).
+fn router_with_ttl(outcome: Outcome, ttl: Option<std::time::Duration>) -> Router {
     async fn echo(Extension(redeemed): Extension<Redeemed>) -> String {
         format!("ok:{}", redeemed.amount)
     }
-    let state = Arc::new(ChargeMiddlewareState::new(
-        requirement(),
-        CannedRedeemer { outcome },
-    ));
+    let mut state = ChargeMiddlewareState::new(requirement(), CannedRedeemer { outcome });
+    if let Some(ttl) = ttl {
+        state = state.with_challenge_ttl(ttl);
+    }
     Router::new()
         .route("/gated", get(echo))
-        .layer(from_fn_with_state(state, require_charge::<CannedRedeemer>))
+        .layer(from_fn_with_state(
+            Arc::new(state),
+            require_charge::<CannedRedeemer>,
+        ))
 }
 
-/// Build an `Authorization: Payment` header around a token with a shapely echoed
-/// challenge; `expires` rides the echo when supplied.
-fn auth_header(token: &str, expires: Option<&str>) -> String {
+/// Fetch a REAL challenge off the router (bare request → 402) and parse its
+/// auth-params.
+async fn fetch_challenge(app: &Router) -> pops_core_verify::envelope::PaymentParams {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/gated")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("challenge fetch");
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let header = resp
+        .headers()
+        .get(http::header::WWW_AUTHENTICATE)
+        .expect("WWW-Authenticate present")
+        .to_str()
+        .expect("ASCII")
+        .to_string();
+    parse_payment_params(&header).expect("challenge params parse")
+}
+
+/// Build the `Authorization: Payment` header echoing `params` verbatim around
+/// `token` — the faithful client half of the dance.
+fn auth_header_for(
+    params: &pops_core_verify::envelope::PaymentParams,
+    token: &str,
+) -> String {
     let creds = PaymentCredentials {
         challenge: EchoedChallenge {
-            id: "ch-conf".into(),
-            realm: "pops-core-verify".into(),
-            method: "cashu".into(),
-            intent: "charge".into(),
-            request: "echoed-request".into(),
-            digest: None,
-            opaque: None,
-            expires: expires.map(str::to_string),
+            id: params.id.clone(),
+            realm: params.realm.clone(),
+            method: params.method.clone(),
+            intent: params.intent.clone(),
+            request: params.request.clone(),
+            digest: params.digest.clone(),
+            opaque: params.opaque.clone(),
+            expires: params.expires.clone(),
+            description: params.description.clone(),
         },
         payload: CashuPayload {
             token: token.into(),
@@ -251,6 +287,7 @@ fn credential_echo_round_trips_optional_fields() {
             digest: Some("sha-256-digest".into()),
             opaque: Some("server-opaque".into()),
             expires: Some("2999-01-01T00:00:00Z".into()),
+            description: Some("weather report".into()),
         },
         payload: CashuPayload {
             token: "cashuBtok".into(),
@@ -277,11 +314,12 @@ async fn success_emits_payment_receipt_and_cache_control_private() {
         amount: 100,
         unit: "pop_1782668279".to_string(),
     });
+    let params = fetch_challenge(&app).await;
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/gated")
-                .header(AUTHORIZATION, auth_header("cashuBany", None))
+                .header(AUTHORIZATION, auth_header_for(&params, "cashuBany"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -313,7 +351,10 @@ async fn success_emits_payment_receipt_and_cache_control_private() {
         .expect("Payment-Receipt is base64url-nopad");
     let receipt = body_json(&receipt_bytes);
     assert_eq!(receipt["method"], "cashu");
-    assert_eq!(receipt["challengeId"], "ch-conf");
+    assert_eq!(
+        receipt["challengeId"], params.id,
+        "receipt echoes the issued (HMAC-bound) challenge id"
+    );
     assert_eq!(receipt["status"], "success");
     assert!(
         receipt["reference"].as_str().unwrap().starts_with("hash-of-"),
@@ -335,20 +376,22 @@ async fn success_emits_payment_receipt_and_cache_control_private() {
 
 #[tokio::test]
 async fn expired_echoed_challenge_returns_payment_expired_problem() {
-    // An echoed `expires` in the PAST → payment-expired, BEFORE any redeem. The
-    // canned redeemer is set to Ok so a 402 here proves the swap never ran.
-    let app = router(Outcome::Ok {
-        amount: 100,
-        unit: "pop_1782668279".to_string(),
-    });
+    // A zero-TTL router issues authentic-but-instantly-stale challenges: the
+    // faithful echo passes the HMAC, fails freshness → payment-expired BEFORE
+    // any redeem (the canned redeemer is Ok, so a 402 proves it never ran).
+    let app = router_with_ttl(
+        Outcome::Ok {
+            amount: 100,
+            unit: "pop_1782668279".to_string(),
+        },
+        Some(std::time::Duration::ZERO),
+    );
+    let params = fetch_challenge(&app).await;
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/gated")
-                .header(
-                    AUTHORIZATION,
-                    auth_header("cashuBany", Some("2000-01-01T00:00:00Z")),
-                )
+                .header(AUTHORIZATION, auth_header_for(&params, "cashuBany"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -377,19 +420,19 @@ async fn expired_echoed_challenge_returns_payment_expired_problem() {
 
 #[tokio::test]
 async fn unexpired_echoed_challenge_passes_through() {
-    // A future `expires` does NOT block the success path.
+    // The fresh-challenge pass: a faithful echo of an unexpired challenge
+    // (default 300 s TTL) reaches the redeemer and serves.
     let app = router(Outcome::Ok {
         amount: 100,
         unit: "pop_1782668279".to_string(),
     });
+    let params = fetch_challenge(&app).await;
+    assert!(params.expires.is_some(), "stateless challenge carries expires");
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/gated")
-                .header(
-                    AUTHORIZATION,
-                    auth_header("cashuBany", Some("2999-01-01T00:00:00Z")),
-                )
+                .header(AUTHORIZATION, auth_header_for(&params, "cashuBany"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -401,14 +444,16 @@ async fn unexpired_echoed_challenge_passes_through() {
 // ─────────────── each ChargeError → its problem-type + status ────────────────
 
 /// Drive the `Payment` middleware with a canned error and return
-/// (status, problem json).
+/// (status, problem json). The full dance: fetch a real challenge, echo it
+/// faithfully (passing the binding), and let the canned redeemer fail.
 async fn problem_for(make: fn() -> ChargeError) -> (StatusCode, serde_json::Value) {
     let app = router(Outcome::Err(make));
+    let params = fetch_challenge(&app).await;
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/gated")
-                .header(AUTHORIZATION, auth_header("cashuBany", None))
+                .header(AUTHORIZATION, auth_header_for(&params, "cashuBany"))
                 .body(Body::empty())
                 .unwrap(),
         )

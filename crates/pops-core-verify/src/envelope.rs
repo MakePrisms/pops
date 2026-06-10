@@ -70,6 +70,11 @@ pub struct EchoedChallenge {
     /// carried it. The verifier rejects an echo whose `expires` is in the past.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<String>,
+    /// Echo of the optional human-readable description, present iff the 402
+    /// carried it. Display-only: the framework excludes it from the challenge
+    /// binding, so it is echoed but never authenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Cashu-method `payload`. This struct just carries the token string out of the
@@ -185,7 +190,10 @@ pub fn encode_payment_credentials(credentials: &PaymentCredentials) -> String {
 /// The `WWW-Authenticate: Payment …` auth-params a client receives on a 402.
 /// Cashu-free: `request` stays the raw base64url request object (the client
 /// decodes it via [`decode_request_object`] or the cashu-coupled
-/// [`crate::challenge::decode_charge_request`]).
+/// [`crate::challenge::decode_charge_request`]). The optional params
+/// (`expires`/`digest`/`opaque`/`description`) are captured when present
+/// because a client MUST echo each issued param unchanged in its credential
+/// (spec Credential Schema + Challenge Binding).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentParams {
     /// Server-issued challenge id.
@@ -198,6 +206,18 @@ pub struct PaymentParams {
     pub intent: String,
     /// The base64url-nopad request envelope (wraps the `creqA…`).
     pub request: String,
+    /// Optional RFC 3339 challenge expiry, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+    /// Optional request-body digest, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Optional server correlation opaque, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opaque: Option<String>,
+    /// Optional human-readable description, present iff the 402 carried it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Strip exactly ONE matched pair of surrounding double-quotes, or `None` (a
@@ -235,6 +255,10 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
     let mut method = None;
     let mut intent = None;
     let mut request = None;
+    let mut expires = None;
+    let mut digest = None;
+    let mut opaque = None;
+    let mut description = None;
 
     // Commas never appear in our values, so a naive split is safe.
     for piece in params_str.split(',') {
@@ -246,7 +270,17 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
             continue;
         };
         let key = key.trim();
-        if !matches!(key, "id" | "realm" | "method" | "intent" | "request") {
+        if !matches!(
+            key,
+            "id" | "realm"
+                | "method"
+                | "intent"
+                | "request"
+                | "expires"
+                | "digest"
+                | "opaque"
+                | "description"
+        ) {
             continue;
         }
         // Strict quoted-string (see `strip_quoted` / the fn doc).
@@ -264,6 +298,10 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
             "method" => method = Some(val.to_string()),
             "intent" => intent = Some(val.to_string()),
             "request" => request = Some(val.to_string()),
+            "expires" => expires = Some(val.to_string()),
+            "digest" => digest = Some(val.to_string()),
+            "opaque" => opaque = Some(val.to_string()),
+            "description" => description = Some(val.to_string()),
             _ => {}
         }
     }
@@ -278,6 +316,10 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
         method: method.ok_or_else(|| missing("method"))?,
         intent: intent.ok_or_else(|| missing("intent"))?,
         request: request.ok_or_else(|| missing("request"))?,
+        expires,
+        digest,
+        opaque,
+        description,
     })
 }
 
@@ -350,6 +392,7 @@ mod tests {
                 digest: None,
                 opaque: None,
                 expires: None,
+                description: None,
             },
             payload: CashuPayload {
                 token: token.into(),
@@ -830,6 +873,7 @@ mod tests {
                 digest: Some("d".into()),
                 opaque: Some("o".into()),
                 expires: Some("2999-01-01T00:00:00Z".into()),
+                description: Some("a memo".into()),
             },
             payload: CashuPayload {
                 token: "cashuBz".into(),
@@ -844,6 +888,32 @@ mod tests {
             parsed.challenge.expires.as_deref(),
             Some("2999-01-01T00:00:00Z")
         );
+        assert_eq!(parsed.challenge.description.as_deref(), Some("a memo"));
         assert_eq!(parsed.source.as_deref(), Some("did:example:1"));
+    }
+
+    #[test]
+    fn parse_payment_params_captures_optional_params() {
+        // A client MUST echo every issued param, so the parser captures the
+        // optionals (expires/digest/opaque/description) when present.
+        let header = r#"Payment id="x", realm="r", method="cashu", intent="charge", request="e", expires="2026-03-15T12:05:00Z", digest="sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:", opaque="b3BhcXVl", description="weather report""#;
+        let params = parse_payment_params(header).expect("parses with optionals");
+        assert_eq!(params.expires.as_deref(), Some("2026-03-15T12:05:00Z"));
+        assert_eq!(
+            params.digest.as_deref(),
+            Some("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:")
+        );
+        assert_eq!(params.opaque.as_deref(), Some("b3BhcXVl"));
+        assert_eq!(params.description.as_deref(), Some("weather report"));
+    }
+
+    #[test]
+    fn parse_payment_params_leaves_absent_optionals_none() {
+        let header = r#"Payment id="x", realm="r", method="cashu", intent="charge", request="e""#;
+        let params = parse_payment_params(header).expect("parses without optionals");
+        assert_eq!(params.expires, None);
+        assert_eq!(params.digest, None);
+        assert_eq!(params.opaque, None);
+        assert_eq!(params.description, None);
     }
 }

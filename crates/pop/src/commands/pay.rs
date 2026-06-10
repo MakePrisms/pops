@@ -586,10 +586,13 @@ fn build_premint(
     .map_err(|e| format!("failed to build premint secrets for {amount} sat: {e}").into())
 }
 
-/// Builds the `Authorization: Payment` credentials: a VERBATIM echo of the
-/// parsed challenge params, plus the exact-amount token as the cashu payload. The
-/// 402 carries no `digest`/`opaque`/`expires` (binding is server-deferred), so
-/// those echo fields and the optional `source` are `None`.
+/// Builds the `Authorization: Payment` credentials: a VERBATIM echo of EVERY
+/// parsed challenge param — required and optional alike — plus the
+/// exact-amount token as the cashu payload. The server's stateless binding
+/// recomputes its id-HMAC over the echo, so a dropped or altered param
+/// (`expires` included) makes the credential `invalid-challenge`; an optional
+/// the 402 did not carry stays absent. `source` is `None` (bearer tokens carry
+/// no payer identity).
 pub fn build_credentials(params: &PaymentParams, token: &str) -> PaymentCredentials {
     PaymentCredentials {
         challenge: EchoedChallenge {
@@ -598,9 +601,10 @@ pub fn build_credentials(params: &PaymentParams, token: &str) -> PaymentCredenti
             method: params.method.clone(),
             intent: params.intent.clone(),
             request: params.request.clone(),
-            digest: None,
-            opaque: None,
-            expires: None,
+            digest: params.digest.clone(),
+            opaque: params.opaque.clone(),
+            expires: params.expires.clone(),
+            description: params.description.clone(),
         },
         payload: CashuPayload {
             token: token.to_string(),
@@ -886,6 +890,10 @@ mod tests {
             method: "cashu".into(),
             intent: "charge".into(),
             request: legacy,
+            expires: None,
+            digest: None,
+            opaque: None,
+            description: None,
         };
         let err = decode_charge_from_params(&params).expect_err("legacy shape must not parse");
         assert_eq!(
@@ -947,5 +955,40 @@ mod tests {
         let parsed = parse_payment_authorization(&auth).expect("gateway parses our credentials");
         assert_eq!(parsed.challenge.id, "ch-42");
         assert_eq!(parsed.payload.token, "cashuBexampletoken");
+    }
+
+    #[test]
+    fn build_credentials_echoes_every_issued_optional_param_verbatim() {
+        // A stateless-binding server recomputes its id-HMAC over the echo, so
+        // the client MUST return every issued param byte-for-byte — expires
+        // above all (a dropped expires makes the credential invalid-challenge).
+        let header = r#"Payment id="hmacid", realm="pops", method="cashu", intent="charge", request="cmVxdWVzdA", expires="2026-03-15T12:05:00Z", digest="sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:", opaque="b3BhcXVl", description="weather report""#;
+        let params = parse_payment_params(header).expect("parses params");
+        let creds = build_credentials(&params, "cashuBtok");
+        assert_eq!(
+            creds.challenge.expires.as_deref(),
+            Some("2026-03-15T12:05:00Z")
+        );
+        assert_eq!(
+            creds.challenge.digest.as_deref(),
+            Some("sha-256=:X48E9qOokqqrvdts8nOJRJN3OWDUoyWxBf7kbu9DBPE=:")
+        );
+        assert_eq!(creds.challenge.opaque.as_deref(), Some("b3BhcXVl"));
+        assert_eq!(
+            creds.challenge.description.as_deref(),
+            Some("weather report")
+        );
+
+        // And an optional the 402 did NOT carry stays absent (an invented one
+        // would equally break the byte-exact echo).
+        let bare = r#"Payment id="hmacid", realm="pops", method="cashu", intent="charge", request="cmVxdWVzdA""#;
+        let creds = build_credentials(
+            &parse_payment_params(bare).expect("parses"),
+            "cashuBtok",
+        );
+        assert_eq!(creds.challenge.expires, None);
+        assert_eq!(creds.challenge.digest, None);
+        assert_eq!(creds.challenge.opaque, None);
+        assert_eq!(creds.challenge.description, None);
     }
 }

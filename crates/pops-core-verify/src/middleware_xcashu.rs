@@ -547,6 +547,10 @@ mod tests {
             response.headers().get(super::x_cashu_header()).is_none(),
             "a 503 must NOT carry an X-Cashu re-challenge (the token is still good)"
         );
+        assert!(
+            response.headers().get(http::header::RETRY_AFTER).is_some(),
+            "a 503 SHOULD carry Retry-After"
+        );
         let body = body_string(response).await;
         assert!(
             body.contains("mint unavailable"),

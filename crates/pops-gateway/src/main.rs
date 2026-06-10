@@ -67,7 +67,9 @@ fn main() -> ExitCode {
 }
 
 /// Resolve the config path, read it, parse it, and validate it. Any failure is
-/// returned as a fully-formed stderr message string (already structured).
+/// returned as a fully-formed stderr message string (already structured). The
+/// `POPS_BINDING_KEY` env var (hex), when set, overrides the TOML
+/// `binding_key` — secrets travel better in env than in mounted files.
 fn load_config() -> Result<ValidatedConfig, String> {
     let path =
         std::env::var("POPS_GATEWAY_CONFIG").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
@@ -75,8 +77,12 @@ fn load_config() -> Result<ValidatedConfig, String> {
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("config file {path}: could not read: {e}"))?;
 
-    let config = Config::from_toml_str(&raw)
+    let mut config = Config::from_toml_str(&raw)
         .map_err(|e| format!("config file {path}: invalid TOML: {e}"))?;
+
+    if let Ok(key_hex) = std::env::var("POPS_BINDING_KEY") {
+        config.binding_key = Some(key_hex);
+    }
 
     config.validate().map_err(|e| e.to_string())
 }

@@ -15,15 +15,17 @@ use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 
+use pops_core_verify::binding::{issue_challenge, validate_challenge_echo};
 use pops_core_verify::charge::ChargeError;
 use pops_core_verify::cashu_credential::{charge_requirement_from_cashu, CashuCredential};
 use pops_core_verify::cdk_mint_client::CdkMintClient;
-use pops_core_verify::challenge::{encode_charge_request, CashuRequirement};
+use pops_core_verify::challenge::encode_charge_request;
 use pops_core_verify::http_status::charge_error_status;
+use pops_core_verify::middleware::count_payment_credentials;
 use pops_core_verify::problem::{Problem, PROBLEM_JSON};
 use pops_core_verify::redeemer::Redeemer;
 use pops_core_verify::envelope::{
-    parse_payment_authorization, AuthParseError, PAYMENT_SCHEME,
+    parse_payment_authorization, AuthParseError, PaymentCredentials, CASHU_METHOD,
 };
 
 use crate::config::ValidatedConfig;
@@ -36,21 +38,18 @@ pub const REALM: &str = "pops-gateway";
 /// The `intent` value — a one-shot charge.
 pub const INTENT_CHARGE: &str = "charge";
 
-/// A fixed challenge `id`: the gate does not enforce challenge-id binding, so a
-/// constant keeps the prebuilt header truly constant.
-pub const CHALLENGE_ID: &str = "pops-gateway";
-
 /// Per-request shared state, built once at startup (`Arc`). `C` is the credential
 /// seam (production: `CashuCredential<CdkMintClient>` via [`AppState::production`]).
 pub struct AppState<C: Redeemer> {
-    /// The pre-parsed config.
+    /// The pre-parsed config (carries the binding key + challenge TTL).
     pub config: ValidatedConfig,
     /// The credential that verifies + redeems on retry.
     pub credential: Arc<C>,
     /// Durable sink for redeemed proofs (persist-before-forward).
     pub sink: Arc<ProofsSink>,
-    /// The prebuilt `WWW-Authenticate: Payment …` value (cloned onto every 402).
-    pub www_authenticate: HeaderValue,
+    /// The request object emitted in every challenge (constant per config; the
+    /// per-challenge id + expires are stamped per request).
+    pub request_object: String,
     /// HTTP client for forwarding gated requests upstream.
     pub upstream: reqwest::Client,
 }
@@ -59,13 +58,15 @@ impl<C: Redeemer> AppState<C> {
     /// Build the shared state. The forwarding client gets the configured request
     /// + connect timeout so a hung upstream is bounded (and `504` is reachable).
     pub fn new(config: ValidatedConfig, credential: C, sink: ProofsSink) -> Self {
-        let www_authenticate = build_www_authenticate(&config.requirement);
+        let request_object = encode_charge_request(&config.requirement).expect(
+            "ValidatedConfig guarantees a non-empty mint set (charge.mints defaults to [mint_url])",
+        );
         let upstream = build_upstream_client(config.upstream_timeout);
         Self {
             config,
             credential: Arc::new(credential),
             sink: Arc::new(sink),
-            www_authenticate,
+            request_object,
             upstream,
         }
     }
@@ -95,18 +96,22 @@ impl AppState<CashuCredential<CdkMintClient>> {
     }
 }
 
-/// Build the `WWW-Authenticate: Payment …` value once from the requirement.
-/// The `request` param is the shared `draft-cashu-charge-01` request object
-/// codec ([`encode_charge_request`]) — the same object the core middleware
-/// emits, so the two hosts speak ONE wire.
-fn build_www_authenticate(requirement: &CashuRequirement) -> HeaderValue {
-    let request_object = encode_charge_request(requirement)
-        .expect("ValidatedConfig guarantees a non-empty mint set (charge.mints defaults to [mint_url])");
-    let header = format!(
-        r#"{PAYMENT_SCHEME} id="{CHALLENGE_ID}", realm="{REALM}", method="cashu", intent="{INTENT_CHARGE}", request="{request_object}""#
+/// Build one fresh `WWW-Authenticate: Payment …` value: the constant request
+/// object (the shared `draft-cashu-charge-01` codec — the same object the core
+/// middleware emits, so the two hosts speak ONE wire) plus a per-request
+/// `expires` (`now + challenge_ttl`) and the framework's stateless HMAC `id`
+/// binding every issued param under the configured key.
+fn fresh_www_authenticate<C: Redeemer>(state: &AppState<C>) -> HeaderValue {
+    let issued = issue_challenge(
+        &state.config.binding_key,
+        REALM,
+        CASHU_METHOD,
+        INTENT_CHARGE,
+        &state.request_object,
+        state.config.challenge_ttl,
     );
     // All components are base64url-nopad / ASCII; from_str validates as a guard.
-    HeaderValue::from_str(&header)
+    HeaderValue::from_str(&issued.header_value)
         .expect("WWW-Authenticate value is ASCII (request object is base64url-nopad)")
 }
 
@@ -127,9 +132,9 @@ where
 /// The gated path: enforce payment, persist on success, then forward.
 ///
 /// The ordering is load-bearing for value-safety + DoS-resistance:
-/// 1. extract the credential first — a bare/malformed request 402s without ever
-///    buffering its body (an unauthenticated caller can't make us buffer up to
-///    the cap);
+/// 1. extract the credential and authenticate its challenge echo first — a
+///    bare/malformed/unbound request 402s without ever buffering its body (an
+///    unauthenticated caller can't make us buffer up to the cap);
 /// 2. buffer the body (capped) before the swap — over-cap → 413, read failure →
 ///    4xx, both while the pop is still unspent (so we never spend a pop on a
 ///    request we then can't read);
@@ -143,11 +148,21 @@ where
 
     // Extract the credential first (a bare/malformed request errors without
     // buffering its body).
-    let token = match extract_token(&parts.headers) {
-        Ok(t) => t,
+    let credentials = match extract_credentials(&parts.headers) {
+        Ok(c) => c,
         Err(TokenExtract::NoAttempt) => return challenge_402(&state, None),
         Err(TokenExtract::Failed(e)) => return charge_error_to_response(&state, e),
     };
+
+    // Spec verification step 3, before the body buffer and any swap:
+    // authenticate the echoed challenge (recompute the id-HMAC; tampered /
+    // inconsistent → invalid-challenge) and check `expires` freshness
+    // (stale → payment-expired).
+    if let Err(e) = validate_challenge_echo(&state.config.binding_key, &credentials.challenge)
+    {
+        return charge_error_to_response(&state, e);
+    }
+    let token = credentials.payload.token;
 
     // Buffer the body (capped) before the swap, while the pop is still unspent.
     let body_bytes = match read_body_capped(body, state.config.max_body_bytes).await {
@@ -390,7 +405,8 @@ fn is_hop_by_hop(name: &str) -> bool {
     )
 }
 
-/// Outcome of trying to pull a cashu token out of the `Authorization` header.
+/// Outcome of trying to pull payment credentials out of the `Authorization`
+/// header.
 enum TokenExtract {
     /// No header, or a non-`Payment` scheme — identical to "no payment attempt".
     NoAttempt,
@@ -400,23 +416,13 @@ enum TokenExtract {
     Failed(ChargeError),
 }
 
-/// Extract the `cashuB…` token from `Authorization: Payment <blob>`. A non-Payment
-/// scheme is treated as no attempt; more than one Payment credential is a
-/// malformed request frame per the framework.
-fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
-    let payment_values = headers
-        .get_all(header::AUTHORIZATION)
-        .iter()
-        .filter(|v| {
-            v.to_str().is_ok_and(|s| {
-                s.trim()
-                    .split_whitespace()
-                    .next()
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PAYMENT_SCHEME))
-            })
-        })
-        .count();
-    if payment_values > 1 {
+/// Extract the full credentials object from `Authorization: Payment <blob>` (the
+/// echoed challenge feeds the binding check; `payload.token` feeds the redeem).
+/// A non-Payment scheme is treated as no attempt; more than one Payment
+/// credential is a malformed request frame per the framework (counted by the
+/// shared [`count_payment_credentials`]).
+fn extract_credentials(headers: &HeaderMap) -> Result<PaymentCredentials, TokenExtract> {
+    if count_payment_credentials(headers) > 1 {
         return Err(TokenExtract::Failed(ChargeError::MalformedRequest(
             "request bears more than one Authorization: Payment credential".to_string(),
         )));
@@ -431,7 +437,7 @@ fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
         ))
     })?;
     match parse_payment_authorization(value) {
-        Ok(creds) => Ok(creds.payload.token),
+        Ok(creds) => Ok(creds),
         Err(AuthParseError::UnknownScheme) => Err(TokenExtract::NoAttempt),
         Err(AuthParseError::WrongMethod(method)) => {
             Err(TokenExtract::Failed(ChargeError::MethodUnsupported {
@@ -444,10 +450,11 @@ fn extract_token(headers: &HeaderMap) -> Result<String, TokenExtract> {
     }
 }
 
-/// Build a 402 carrying the prebuilt challenge (always `Cache-Control:
-/// no-store`). The body is RFC-9457 `application/problem+json` from the shared
-/// [`pops_core_verify::problem`] map: the supplied failure problem, or the
-/// framework's `payment-required` type on a bare "no attempt yet" challenge.
+/// Build a 402 carrying a FRESH challenge (per-request HMAC id + expires;
+/// always `Cache-Control: no-store`). The body is RFC-9457
+/// `application/problem+json` from the shared [`pops_core_verify::problem`]
+/// map: the supplied failure problem, or the framework's `payment-required`
+/// type on a bare "no attempt yet" challenge.
 fn challenge_402<C>(state: &AppState<C>, problem: Option<&Problem>) -> Response
 where
     C: Redeemer,
@@ -460,7 +467,7 @@ where
     (
         StatusCode::PAYMENT_REQUIRED,
         [
-            (header::WWW_AUTHENTICATE, state.www_authenticate.clone()),
+            (header::WWW_AUTHENTICATE, fresh_www_authenticate(state)),
             (
                 header::CONTENT_TYPE,
                 HeaderValue::from_static(PROBLEM_JSON),

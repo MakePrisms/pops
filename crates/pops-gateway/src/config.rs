@@ -16,6 +16,7 @@ use cashu::nuts::CurrencyUnit;
 use cashu::{Amount, MintUrl};
 use serde::Deserialize;
 
+use pops_core_verify::binding::BindingKey;
 use pops_core_verify::challenge::CashuRequirement;
 
 /// The default listen address when `listen` is omitted.
@@ -34,6 +35,10 @@ pub const DEFAULT_UPSTREAM_TIMEOUT_SECS: u64 = 30;
 /// handful (power-of-two split), so 64 is generous headroom while bounding a
 /// swap-DoS by a token stuffed with tiny proofs. Over → a pre-swap 402.
 pub const DEFAULT_MAX_PROOFS: usize = 64;
+
+/// Default challenge lifetime stamped into the `expires` auth-param (300 s —
+/// `expires` is MUST under the stateless binding the gateway runs).
+pub const DEFAULT_CHALLENGE_TTL_SECS: u64 = 300;
 
 /// Top-level gateway config from the mounted TOML. Required fields are plain (no
 /// `Option`) so a missing key is a serde error before semantic validation;
@@ -66,6 +71,19 @@ pub struct Config {
     /// upstream then strands a request whose pop is already spent).
     #[serde(default = "default_upstream_timeout_secs")]
     pub upstream_timeout_secs: u64,
+
+    /// Hex-encoded server secret for the stateless challenge binding (the
+    /// HMAC-SHA256 challenge `id`; 32 bytes / 64 hex chars RECOMMENDED, ≥ 16
+    /// bytes required). Also settable via the `POPS_BINDING_KEY` env var
+    /// (which wins). Omitted ⇒ a fresh key is generated at boot — outstanding
+    /// challenges then die with the process and clients refetch the 402.
+    #[serde(default)]
+    pub binding_key: Option<String>,
+
+    /// Challenge lifetime in seconds, stamped into the `expires` auth-param
+    /// (must be > 0; default 300).
+    #[serde(default = "default_challenge_ttl_secs")]
+    pub challenge_ttl_secs: u64,
 
     /// The charge advertised on the 402 + enforced on retry.
     pub charge: ChargeConfig,
@@ -128,6 +146,10 @@ fn default_max_proofs() -> usize {
     DEFAULT_MAX_PROOFS
 }
 
+fn default_challenge_ttl_secs() -> u64 {
+    DEFAULT_CHALLENGE_TTL_SECS
+}
+
 /// A semantic config failure, naming the field and the human reason. Rendered
 /// by `main` as `config field <field>: <reason>` to stderr before a nonzero
 /// exit (never a panic / stacktrace).
@@ -179,6 +201,11 @@ pub struct ValidatedConfig {
     pub max_proofs: usize,
     /// Per-path gating rules (empty ⇒ gate all).
     pub routes: Vec<RouteConfig>,
+    /// The challenge-binding key (configured, or generated at boot when the
+    /// config named none).
+    pub binding_key: BindingKey,
+    /// Challenge lifetime stamped into `expires`.
+    pub challenge_ttl: std::time::Duration,
 }
 
 impl Config {
@@ -237,6 +264,24 @@ impl Config {
             Some(std::time::Duration::from_secs(self.upstream_timeout_secs))
         };
 
+        // A 0-TTL challenge is born expired — every payment would 402.
+        if self.challenge_ttl_secs == 0 {
+            return Err(ConfigError::new(
+                "challenge_ttl_secs",
+                "must be greater than 0",
+            ));
+        }
+        let challenge_ttl = std::time::Duration::from_secs(self.challenge_ttl_secs);
+
+        // A configured key must be plausible hex (BindingKey enforces ≥ 16
+        // bytes); absent ⇒ generate at boot (restart invalidates outstanding
+        // challenges; clients refetch).
+        let binding_key = match self.binding_key.as_deref() {
+            Some(hex) => BindingKey::from_hex(hex)
+                .map_err(|e| ConfigError::new("binding_key", e))?,
+            None => BindingKey::generate(),
+        };
+
         // Default to [mint_url] when empty; otherwise parse each.
         let mints: Vec<MintUrl> = if self.charge.mints.is_empty() {
             vec![mint_url.clone()]
@@ -273,6 +318,8 @@ impl Config {
             requirement,
             max_proofs: self.charge.max_proofs,
             routes: self.routes,
+            binding_key,
+            challenge_ttl,
         })
     }
 }
@@ -583,6 +630,67 @@ max_proofs = 0
         let cfg = Config::from_toml_str(toml).expect("parses");
         let err = cfg.validate().expect_err("max_proofs=0 must fail");
         assert_eq!(err.field, "charge.max_proofs");
+    }
+
+    #[test]
+    fn challenge_ttl_defaults_to_300s() {
+        let cfg = Config::from_toml_str(&valid_toml("/tmp/pops-proofs.jsonl")).expect("parses");
+        let v = cfg.validate().expect("validates");
+        assert_eq!(
+            v.challenge_ttl,
+            std::time::Duration::from_secs(DEFAULT_CHALLENGE_TTL_SECS)
+        );
+    }
+
+    #[test]
+    fn zero_challenge_ttl_is_named_field_error() {
+        let toml = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+challenge_ttl_secs = 0
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let cfg = Config::from_toml_str(toml).expect("parses");
+        let err = cfg.validate().expect_err("ttl=0 must fail");
+        assert_eq!(err.field, "challenge_ttl_secs");
+    }
+
+    #[test]
+    fn configured_binding_key_round_trips_and_bad_hex_is_named_field_error() {
+        let good = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+binding_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        Config::from_toml_str(good)
+            .expect("parses")
+            .validate()
+            .expect("a 32-byte hex key validates");
+
+        let bad = r#"
+upstream_url = "http://127.0.0.1:9999"
+mint_url = "https://mint.example.com"
+proofs_sink = "/tmp/pops-proofs.jsonl"
+binding_key = "not-hex"
+
+[charge]
+unit = "pop_1782668279"
+amount = 1
+"#;
+        let err = Config::from_toml_str(bad)
+            .expect("parses")
+            .validate()
+            .expect_err("a non-hex key must fail");
+        assert_eq!(err.field, "binding_key");
     }
 
     #[test]

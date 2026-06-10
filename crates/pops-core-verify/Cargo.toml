@@ -25,6 +25,12 @@ thiserror = "1"
 # Pure-Rust, wasm-clean — kept out of the cashu/secp dep so the envelope-only
 # wasm surface stays lean while token_hash is still computable in core.
 sha2 = "0.10"
+# HMAC-SHA256 for the framework's stateless challenge binding (the `id` is
+# base64url(HMAC(server_key, the 7 pipe-joined slots))). Pure-Rust, wasm-clean.
+hmac = "0.12"
+# OS randomness for the generate-at-boot binding-key fallback. Already in the
+# tree transitively; the `wasm` feature flips on its `js` backend.
+getrandom = "0.2"
 # JCS / RFC 8785 canonical JSON for the `request` object and the `Authorization`
 # credential blob (`draft-cashu-charge-01` §Encoding): lexicographic key sort +
 # ECMAScript number formatting, over serde_json. Pure-Rust + wasm-clean (ryu-js
@@ -54,12 +60,6 @@ js-sys = { version = "0.3", optional = true }
 # reflection on `globalThis` (Node has no `window`/Worker global), so only the
 # Response feature is needed here.
 web-sys = { version = "0.3", optional = true, features = ["Response"] }
-# getrandom appears here ONLY so the wasm feature can flip on its `js` backend
-# (the redeem path's blinding RNG needs it on wasm32; envelope-only does not, but
-# selecting the backend at the crate root is harmless). Pinned to 0.2 to match
-# the cashu/bitcoin transitive major.
-getrandom = { version = "0.2", optional = true }
-
 [features]
 default = ["native"]
 native = ["dep:cdk", "dep:axum", "dep:http", "dep:uuid", "dep:chrono"]

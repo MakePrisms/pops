@@ -21,6 +21,11 @@
 
 #![warn(missing_docs)]
 
+// The framework's stateless challenge binding: the HMAC-SHA256 challenge `id`
+// over the seven fixed slots + echo verification. hmac/sha2/base64 only —
+// always compiled, wasm-clean; issuance/freshness helpers are native-gated
+// (they need the clock).
+pub mod binding;
 pub mod cashu_credential;
 pub mod challenge;
 // The committed charge contract (`ChargeError` / `RedeemedProofs`) and the

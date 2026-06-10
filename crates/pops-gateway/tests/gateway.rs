@@ -37,6 +37,9 @@ use pops_core_verify::envelope::{
 };
 use pops_core_verify::mint_client::{MintClient, MintClientError};
 
+use pops_core_verify::binding::BindingKey;
+use pops_core_verify::envelope::{parse_payment_params, PaymentParams};
+
 use pops_gateway::build_router;
 use pops_gateway::config::{Config, RouteConfig, ValidatedConfig};
 use pops_gateway::gateway::AppState;
@@ -120,8 +123,10 @@ fn valid_token_string() -> String {
     .to_string()
 }
 
-/// Wrap a raw cashuB token in the `Payment` auth envelope.
-fn payment_header(token: &str) -> String {
+/// Wrap a raw cashuB token in the `Payment` auth envelope around an UNISSUED
+/// echo — fails the gateway's stateless binding by construction. For the
+/// pre-binding paths (>1-credential 400) and the rejection test itself.
+fn unissued_echo_header(token: &str) -> String {
     let creds = PaymentCredentials {
         challenge: EchoedChallenge {
             id: "test-id".into(),
@@ -132,6 +137,55 @@ fn payment_header(token: &str) -> String {
             digest: None,
             opaque: None,
             expires: None,
+            description: None,
+        },
+        payload: CashuPayload {
+            token: token.into(),
+        },
+        source: None,
+    };
+    format!("Payment {}", encode_payment_credentials(&creds))
+}
+
+/// Fetch a REAL challenge off the gateway (bare request → 402) and parse its
+/// auth-params — the first half of the client dance.
+async fn fetch_challenge(app: &Router) -> PaymentParams {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("challenge fetch");
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let www = resp
+        .headers()
+        .get(http::header::WWW_AUTHENTICATE)
+        .expect("WWW-Authenticate present")
+        .to_str()
+        .expect("ASCII")
+        .to_string();
+    parse_payment_params(&www).expect("challenge params parse")
+}
+
+/// The full client dance: fetch a real challenge from `app` and build the
+/// `Authorization` header echoing every issued param verbatim around `token`.
+async fn paid_header(app: &Router, token: &str) -> String {
+    let params = fetch_challenge(app).await;
+    let creds = PaymentCredentials {
+        challenge: EchoedChallenge {
+            id: params.id.clone(),
+            realm: params.realm.clone(),
+            method: params.method.clone(),
+            intent: params.intent.clone(),
+            request: params.request.clone(),
+            digest: params.digest.clone(),
+            opaque: params.opaque.clone(),
+            expires: params.expires.clone(),
+            description: params.description.clone(),
         },
         payload: CashuPayload {
             token: token.into(),
@@ -172,6 +226,13 @@ fn validated_config(
         requirement: requirement(),
         max_proofs: pops_gateway::config::DEFAULT_MAX_PROOFS,
         routes,
+        binding_key: BindingKey::from_hex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("test binding key"),
+        challenge_ttl: std::time::Duration::from_secs(
+            pops_gateway::config::DEFAULT_CHALLENGE_TTL_SECS,
+        ),
     }
 }
 
@@ -351,11 +412,12 @@ async fn valid_credential_persists_then_forwards_and_returns_body() {
     let (upstream, up_hits) = spawn_upstream("THE-SECRET-PAYLOAD").await;
     let (app, swap_calls) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
 
+    let auth = paid_header(&app, &valid_token_string()).await;
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/protected")
-                .header(AUTHORIZATION, payment_header(&valid_token_string()))
+                .header(AUTHORIZATION, auth)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -398,11 +460,12 @@ async fn mint_unreachable_returns_503_no_persist_no_forward() {
     let (upstream, up_hits) = spawn_upstream("SECRET").await;
     let (app, _swap_calls) = gateway(&upstream, &sink, SwapResponse::Unreachable, vec![]);
 
+    let auth = paid_header(&app, &valid_token_string()).await;
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/protected")
-                .header(AUTHORIZATION, payment_header(&valid_token_string()))
+                .header(AUTHORIZATION, auth)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -433,11 +496,12 @@ async fn upstream_down_still_persists_proofs() {
     let dead_upstream = "http://127.0.0.1:1"; // port 1: connection refused.
     let (app, swap_calls) = gateway(dead_upstream, &sink, SwapResponse::Echo, vec![]);
 
+    let auth = paid_header(&app, &valid_token_string()).await;
     let resp = app
         .oneshot(
             Request::builder()
                 .uri("/protected")
-                .header(AUTHORIZATION, payment_header(&valid_token_string()))
+                .header(AUTHORIZATION, auth)
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -585,15 +649,16 @@ async fn oversized_body_on_gated_path_returns_413_before_charge() {
     let dir = tempfile::tempdir().unwrap();
     let sink = dir.path().join("proofs.jsonl");
     let (upstream, up_hits) = spawn_upstream("SECRET").await;
-    // Cap at 64 bytes; send a valid credential + a 4 KiB body.
+    // Cap at 64 bytes; send a validly-bound credential + a 4 KiB body.
     let (app, swap_calls) = gateway_with_cap(&upstream, &sink, SwapResponse::Echo, vec![], 64);
 
+    let auth = paid_header(&app, &valid_token_string()).await;
     let resp = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/protected")
-                .header(AUTHORIZATION, payment_header(&valid_token_string()))
+                .header(AUTHORIZATION, auth)
                 .body(Body::from(vec![b'x'; 4096]))
                 .unwrap(),
         )
@@ -696,11 +761,12 @@ async fn gateway_emits_the_shared_problem_mapping_for_every_charge_error() {
         ));
         let app = build_router(state);
 
-        let resp = app
+        let auth = paid_header(&app, &valid_token_string()).await;
+    let resp = app
             .oneshot(
                 Request::builder()
                     .uri("/protected")
-                    .header(AUTHORIZATION, payment_header(&valid_token_string()))
+                    .header(AUTHORIZATION, auth)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -753,6 +819,7 @@ async fn gateway_non_cashu_method_returns_400_method_unsupported() {
             digest: None,
             opaque: None,
             expires: None,
+            description: None,
         },
         payload: CashuPayload {
             token: "cashuBabc".into(),
@@ -779,6 +846,181 @@ async fn gateway_non_cashu_method_returns_400_method_unsupported() {
         problem["type"],
         "https://paymentauth.org/problems/method-unsupported"
     );
+    assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "no swap on a 400");
+    assert_eq!(up_hits.load(Ordering::SeqCst), 0, "not forwarded on a 400");
+    assert!(read_lines(&sink).is_empty(), "nothing persisted on a 400");
+}
+
+// ───────────── challenge binding (per-request HMAC id + expires) ─────────────
+
+#[tokio::test]
+async fn gateway_challenges_carry_per_request_hmac_ids_and_expires() {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, _hits) = spawn_upstream("SECRET").await;
+    let (app, _swaps) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
+
+    let first = fetch_challenge(&app).await;
+    // The id is a 32-byte HMAC output, not the dead fixed "pops-gateway".
+    let id_bytes = URL_SAFE_NO_PAD
+        .decode(&first.id)
+        .expect("id is base64url-nopad");
+    assert_eq!(id_bytes.len(), 32, "id is an HMAC-SHA256 output");
+    assert_ne!(first.id, "pops-gateway");
+    // Stateless operation: every challenge carries expires.
+    assert!(first.expires.is_some(), "challenge carries expires");
+}
+
+#[tokio::test]
+async fn gateway_rejects_unbound_challenge_echo_as_invalid_challenge() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, up_hits) = spawn_upstream("SECRET").await;
+    let (app, swap_calls) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(AUTHORIZATION, unissued_echo_header(&valid_token_string()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem body");
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/invalid-challenge"
+    );
+    // The token was never swapped or forwarded — binding precedes the charge.
+    assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "no swap on a bad echo");
+    assert_eq!(up_hits.load(Ordering::SeqCst), 0, "not forwarded");
+    assert!(read_lines(&sink).is_empty(), "nothing persisted");
+}
+
+#[tokio::test]
+async fn gateway_rejects_tampered_request_echo_as_invalid_challenge() {
+    // Echo a REAL challenge but swap in a different request blob — the
+    // redirection the binding exists to catch.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, _hits) = spawn_upstream("SECRET").await;
+    let (app, swap_calls) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
+
+    let params = fetch_challenge(&app).await;
+    let creds = PaymentCredentials {
+        challenge: EchoedChallenge {
+            id: params.id.clone(),
+            realm: params.realm.clone(),
+            method: params.method.clone(),
+            intent: params.intent.clone(),
+            request: format!("{}x", params.request),
+            digest: None,
+            opaque: None,
+            expires: params.expires.clone(),
+            description: None,
+        },
+        payload: CashuPayload {
+            token: valid_token_string(),
+        },
+        source: None,
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(
+                    AUTHORIZATION,
+                    format!("Payment {}", encode_payment_credentials(&creds)),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem body");
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/invalid-challenge"
+    );
+    assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "no swap on a tampered echo");
+}
+
+#[tokio::test]
+async fn gateway_stale_challenge_returns_payment_expired() {
+    // Zero TTL ⇒ authentic-but-instantly-stale challenges: a faithful echo
+    // passes the HMAC, fails freshness → payment-expired, token untouched.
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, _hits) = spawn_upstream("SECRET").await;
+    let (mock, swap_calls) = MockMintClient::new(SwapResponse::Echo);
+    let credential = CashuCredential::new(mock);
+    let proofs_sink = ProofsSink::open(&sink).expect("open sink");
+    let mut cfg = validated_config(&upstream, &sink, vec![]);
+    cfg.challenge_ttl = std::time::Duration::ZERO;
+    let state = Arc::new(AppState::new(cfg, credential, proofs_sink));
+    let app = build_router(state);
+
+    let auth = paid_header(&app, &valid_token_string()).await;
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/protected")
+                .header(AUTHORIZATION, auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem body");
+    assert_eq!(
+        problem["type"],
+        "https://paymentauth.org/problems/payment-expired"
+    );
+    assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "no swap on a stale echo");
+}
+
+// Framework: a request bearing more than one Authorization: Payment credential
+// is rejected with 400 (about:blank body), before any binding or swap.
+#[tokio::test]
+async fn gateway_multiple_payment_credentials_return_400() {
+    let dir = tempfile::tempdir().unwrap();
+    let sink = dir.path().join("proofs.jsonl");
+    let (upstream, up_hits) = spawn_upstream("SECRET").await;
+    let (app, swap_calls) = gateway(&upstream, &sink, SwapResponse::Echo, vec![]);
+
+    let header = paid_header(&app, &valid_token_string()).await;
+    let mut req = Request::builder()
+        .uri("/protected")
+        .body(Body::empty())
+        .unwrap();
+    req.headers_mut().append(
+        AUTHORIZATION,
+        http::HeaderValue::from_str(&header).expect("ascii"),
+    );
+    req.headers_mut().append(
+        AUTHORIZATION,
+        http::HeaderValue::from_str(&header).expect("ascii"),
+    );
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+    let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem body");
+    assert_eq!(problem["type"], "about:blank");
+    assert_eq!(problem["status"], 400);
     assert_eq!(swap_calls.load(Ordering::SeqCst), 0, "no swap on a 400");
     assert_eq!(up_hits.load(Ordering::SeqCst), 0, "not forwarded on a 400");
     assert!(read_lines(&sink).is_empty(), "nothing persisted on a 400");
