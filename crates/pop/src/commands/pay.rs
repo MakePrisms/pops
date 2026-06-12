@@ -62,6 +62,113 @@ pub struct PayArgs {
     /// must not be tricked by a malicious 402 into overspending.
     #[arg(long, value_name = "SATS")]
     pub max_amount: Option<u64>,
+
+    /// Dry run: report what pay WOULD do against this URL without spending
+    /// anything. The initial request IS sent (the challenge can only be obtained
+    /// that way); only the payment is withheld. Token is optional under
+    /// --dry-run (stdin is NOT read when no --token/--token-file is given, so
+    /// the command never hangs waiting on a pipe). Exit 0 whenever the report
+    /// is produced, even if would_pay is false.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Facts about a supplied token, extracted before any spend.
+#[derive(Debug, Clone)]
+pub struct TokenFacts {
+    /// Total value of the token in the charge's unit.
+    pub total: u64,
+    /// The token's currency unit.
+    pub unit: CurrencyUnit,
+    /// The mint the token is from.
+    pub mint: MintUrl,
+}
+
+/// A single refusal entry in the dry-run report: an existing [`PopError`] code
+/// plus its structured details, surfaced as a report field rather than an error.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DryRunRefusal {
+    /// The existing contract code string (e.g. `"challenge_expired"`).
+    pub code: String,
+    /// The structured details matching the error variant's `details()` shape.
+    pub details: serde_json::Value,
+}
+
+/// The dry-run plan for a swap.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DryRunPlan {
+    /// `"fast"` when token_total == amount (no swap needed), else `"swap"`.
+    pub path: &'static str,
+    /// Sats to send (always == charge amount).
+    pub send: u64,
+    /// Swap fee in sats (0 on the fast path).
+    pub fee: u64,
+    /// Change sats (token_total - amount - fee).
+    pub change: u64,
+}
+
+/// The token-check section of the dry-run report (present when a token was supplied).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DryRunTokenCheck {
+    /// Always true when this struct is present (a token was supplied).
+    pub supplied: bool,
+    /// True iff the token's unit matches the charge.
+    pub unit_ok: bool,
+    /// True iff the token's mint is accepted by the charge.
+    pub mint_ok: bool,
+    /// True iff token_total >= amount (or amount + fee for swap).
+    pub value_ok: bool,
+    /// The token's total value.
+    pub token_total: u64,
+    /// The planned split, or null if any earlier check failed.
+    pub plan: Option<DryRunPlan>,
+}
+
+/// The full dry-run report emitted when `--dry-run` is passed.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DryRunReport {
+    /// Always 1. Required on every output envelope.
+    pub schema_version: u64,
+    /// Always true for dry-run outputs.
+    pub dry_run: bool,
+    /// HTTP status of the initial response.
+    pub status: u16,
+    /// The URL that was probed.
+    pub url: String,
+    /// The decoded charge (only present on a 402).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub charge: Option<DryRunCharge>,
+    /// True iff the challenge is fresh (present on a 402).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_fresh: Option<bool>,
+    /// True iff the charge is within --max-amount; null when --max-amount was
+    /// not given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cap_ok: Option<bool>,
+    /// Token validation result; null when no token was supplied.
+    pub token_check: Option<DryRunTokenCheck>,
+    /// True iff all checks passed and a real pay would succeed.
+    pub would_pay: bool,
+    /// Structured refusals that would prevent payment (non-fatal under dry-run).
+    pub refusals: Vec<DryRunRefusal>,
+    /// Response body (only for the 2xx case).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+/// Charge fields surfaced in the dry-run report.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DryRunCharge {
+    /// Exact sat amount required.
+    pub amount: u64,
+    /// Unit required.
+    pub unit: String,
+    /// Mints accepted.
+    pub mints: Vec<String>,
+    /// The challenge's `expires` field verbatim, if present.
+    pub expires: Option<String>,
+    /// The challenge's `description`, if present.
+    pub description: Option<String>,
 }
 
 /// The concrete charge decoded from a 402's `creqA` payment request: the EXACT
@@ -125,7 +232,25 @@ pub async fn run(
             status.as_u16()
         );
         let body = resp.text().await.unwrap_or_default();
-        emit_unpaid(args, status.as_u16(), &body, json)?;
+        if args.dry_run {
+            // Dry-run on a 2xx: report the charge as not needed.
+            let report = DryRunReport {
+                schema_version: crate::SCHEMA_VERSION,
+                dry_run: true,
+                status: status.as_u16(),
+                url: args.url.clone(),
+                charge: None,
+                challenge_fresh: None,
+                cap_ok: None,
+                token_check: None,
+                would_pay: false,
+                refusals: vec![],
+                body: Some(body),
+            };
+            emit_dry_run_report(&report, json)?;
+        } else {
+            emit_unpaid(args, status.as_u16(), &body, json)?;
+        }
         return Ok(());
     }
 
@@ -153,14 +278,12 @@ pub async fn run(
         reason: format!("WWW-Authenticate Payment params did not parse: {e}"),
     })?;
 
-    // A credential MUST NOT be submitted against an expired challenge
-    // (framework `expires`), so check freshness FIRST — before the charge is
-    // even decoded, and long before any token is read or swapped.
-    if let Some(e) = expired_challenge_error(&params, &args.url) {
-        return Err(e.into());
-    }
-
     // ---- 3b/3c. Decode the request object → creqA → the concrete charge. ----
+    // NOTE: on the paying path, the freshness check fires BEFORE the charge is
+    // decoded (a credential must not be submitted against an expired challenge).
+    // On the dry-run path we defer it to evaluate_dry_run which folds it into a
+    // report refusal instead of an error. The challenge parse errors (transport +
+    // format) remain real errors in BOTH paths.
     let charge = decode_charge_from_params(&params)?;
     eprintln!(
         "Charge: {} sat of {} (mints: {})",
@@ -178,6 +301,23 @@ pub async fn run(
         }
     );
 
+    // ---- DRY-RUN BRANCH: report what WOULD happen, send nothing, spend nothing. ----
+    if args.dry_run {
+        // The dry-run path exits here, before read_token, before any mint call
+        // that spends value. It cannot reach build_exact_payment or
+        // mint_client::swap.
+        return run_dry_run(args, &http, &params, &charge, json).await;
+    }
+
+    // ---- PAYING PATH (dry_run == false only below this point) ----
+
+    // A credential MUST NOT be submitted against an expired challenge
+    // (framework `expires`), so check freshness FIRST — before the charge is
+    // even decoded, and long before any token is read or swapped.
+    if let Some(e) = expired_challenge_error(&params, &args.url) {
+        return Err(e.into());
+    }
+
     // ---- 4a. Safety cap FIRST (before touching the token or the mint). ----
     if let Some(cap) = args.max_amount {
         if charge.amount > cap {
@@ -190,7 +330,7 @@ pub async fn run(
     }
 
     // ---- 4b. Decode + validate the held token against the charge. ----
-    let token_str = read_token(args)?;
+    let token_str = read_token_opt(args, false)?.expect("non-dry-run always returns Some");
     let token = Token::from_str(token_str.trim())
         .map_err(|e| PopError::invalid_input(format!("--token is not a valid cashu token: {e}")))?;
     let token_unit = token
@@ -250,6 +390,108 @@ pub async fn run(
     )
     .await
     .map_err(|e| ensure_post_swap_token_bearing(e, &send_token, change_token.as_deref()))
+}
+
+/// Executes the dry-run path: report what pay WOULD do, send nothing, spend
+/// nothing. Exits via emit_dry_run_report (exit 0 on success).
+async fn run_dry_run(
+    args: &PayArgs,
+    http: &reqwest::Client,
+    params: &PaymentParams,
+    charge: &Charge,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Read the token if supplied (optional under dry-run; stdin is SKIPPED when
+    // neither --token nor --token-file is given).
+    let token_str_opt = read_token_opt(args, true)?;
+
+    // Extract token facts if a token was supplied.
+    let token_facts_owned: Option<TokenFacts> = match token_str_opt.as_deref() {
+        Some(s) => {
+            // Parse the token — a malformed token is a real error even under
+            // dry-run (the caller supplied garbage).
+            let token = Token::from_str(s.trim()).map_err(|e| {
+                PopError::invalid_input(format!("--token is not a valid cashu token: {e}"))
+            })?;
+            let unit = token
+                .unit()
+                .ok_or_else(|| PopError::invalid_input("--token has no unit".to_string()))?;
+            let mint = token.mint_url().map_err(|e| {
+                PopError::invalid_input(format!("--token has no single mint url: {e}"))
+            })?;
+            let total = token
+                .value()
+                .map_err(|e| PopError::invalid_input(format!("--token value is unreadable: {e}")))?
+                .to_u64();
+            Some(TokenFacts { total, unit, mint })
+        }
+        None => None,
+    };
+    let token_facts = token_facts_owned.as_ref();
+
+    // Determine fee. The fast path needs no mint call; the swap path needs
+    // keyset infos to compute the fee. A mint read failure is a real error
+    // (a "would_pay: true" computed from a guessed fee is worse than an honest
+    // transient error).
+    let (fee_sats, keyset_fetch_failed) = if let Some(tf) = token_facts {
+        if tf.total == charge.amount {
+            // Fast path: no swap, fee is 0, no mint call needed.
+            (0u64, false)
+        } else {
+            // Swap path: fetch keysets to compute the fee.
+            let base = tf.mint.to_string();
+            let base_trimmed = base.trim_end_matches('/');
+            match mint_client::fetch_keyset_infos(http, base_trimmed).await {
+                Ok(keyset_infos) => {
+                    match mint_client::select_active_keyset(&keyset_infos, &tf.unit) {
+                        Ok(active) => {
+                            // We don't know the exact proof count yet (we'd
+                            // need to decode the proofs), so use 1 proof as a
+                            // conservative lower bound for fee estimation.
+                            // The dry-run plan shows this fee; it may differ
+                            // by a few sats on the real path with more inputs.
+                            // For exact fee: parse proofs from token.
+                            let n_inputs = {
+                                // Re-parse token to get actual proof count.
+                                let token = token_str_opt
+                                    .as_deref()
+                                    .and_then(|s| Token::from_str(s.trim()).ok());
+                                token
+                                    .and_then(|t| t.proofs(&keyset_infos).ok())
+                                    .map(|p| p.len())
+                                    .unwrap_or(1)
+                            };
+                            let fee = swap_fee_sats(active.input_fee_ppk, n_inputs);
+                            (fee, false)
+                        }
+                        Err(e) => {
+                            // No active keyset is a mint error (upstream).
+                            return Err(e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Keyset fetch failed: return the real transport error.
+                    return Err(e);
+                }
+            }
+        }
+    } else {
+        // No token supplied: no mint call needed.
+        (0u64, false)
+    };
+
+    let report = evaluate_dry_run(
+        &args.url,
+        charge,
+        params,
+        args.max_amount,
+        token_facts,
+        fee_sats,
+        keyset_fetch_failed,
+    );
+    emit_dry_run_report(&report, json)?;
+    Ok(())
 }
 
 /// Builds the credentials, retries the SAME request with the exact-amount token,
@@ -431,16 +673,28 @@ async fn build_exact_payment(
         None
     };
 
-    // HARD ASSERTION: the send set must sum to EXACTLY the charge.
-    let send_sum = proofs_value(&send_proofs);
-    assert_send_is_exact(send_sum, charge.amount)?;
-
     // POST-SWAP: the inputs are SPENT, so the freshly-minted ecash exists only as
-    // these proofs/strings. Pre-serialize both to raw JSON so a failed `cashuB`
-    // encode still recovers the value as proofs — never a `.to_string()` panic
-    // that vaporizes spent ecash.
+    // these proofs/strings. Pre-serialize both to raw JSON BEFORE the assertion so
+    // a failed assertion can carry them — never silent value loss.
     let send_proofs_json = proofs_to_json(&send_proofs);
     let change_proofs_json = change_proofs.as_ref().map(proofs_to_json);
+
+    // HARD ASSERTION: the send set must sum to EXACTLY the charge.
+    // POST-SWAP: inputs are already spent, so a failure here MUST carry the
+    // minted proofs or the value is silently lost. Pre-serialize first (above).
+    let send_sum = proofs_value(&send_proofs);
+    if send_sum != charge.amount {
+        return Err(PopError::TokenEncodeFailed {
+            reason: format!(
+                "POST-SWAP exact-amount assertion failed: send set summed to {send_sum}, \
+                 not the required {} (inputs already spent; raw proofs preserved)",
+                charge.amount
+            ),
+            send_proofs_json: Some(send_proofs_json.clone()),
+            change_proofs_json: change_proofs_json.clone(),
+        }
+        .into());
+    }
 
     let send_token = token_to_string(&Token::new(
         mint_url_typed.clone(),
@@ -499,7 +753,6 @@ fn decode_charge_from_params(params: &PaymentParams) -> Result<Charge, Box<dyn s
         mints: decoded.mints,
     })
 }
-
 
 /// The expired-challenge refusal, when the 402's `expires` forbids paying it:
 /// a challenge whose RFC 3339 `expires` is in the past (or unparseable, which
@@ -595,6 +848,254 @@ pub fn assert_send_is_exact(send_sum: u64, amount: u64) -> Result<(), Box<dyn st
     Ok(())
 }
 
+/// Evaluates a dry-run report from pure inputs (no network calls, no side
+/// effects). Refusal evaluation converts pay-path errors into report entries
+/// rather than process errors, so the dry-run answers "what would happen" in
+/// one shot. A `fee` of `None` means the fee could not be fetched (handled by
+/// the caller as a real transport error before this is called).
+///
+/// This function is pure and unit-testable.
+pub fn evaluate_dry_run(
+    url: &str,
+    charge: &Charge,
+    params: &PaymentParams,
+    cap: Option<u64>,
+    token_facts: Option<&TokenFacts>,
+    // fee: None means swap-fee could not be fetched (caller returns Err before
+    // calling this); for the fast path (token_total == amount), always 0.
+    fee_sats: u64,
+    keyset_fetch_failed: bool,
+) -> DryRunReport {
+    let mut refusals: Vec<DryRunRefusal> = Vec::new();
+    let mut would_pay = true;
+
+    // Check challenge freshness (already done before this is called via
+    // expired_challenge_error; here we record it as a report field).
+    let challenge_fresh = match expired_challenge_error(params, url) {
+        Some(e) => {
+            would_pay = false;
+            let d = e.details().unwrap_or(serde_json::json!({}));
+            refusals.push(DryRunRefusal {
+                code: e.code().to_string(),
+                details: d,
+            });
+            false
+        }
+        None => true,
+    };
+
+    // Cap check.
+    let cap_ok: Option<bool> = cap.map(|c| {
+        if charge.amount > c {
+            would_pay = false;
+            let e = PopError::AmountExceedsCap {
+                amount: charge.amount,
+                cap: c,
+            };
+            refusals.push(DryRunRefusal {
+                code: e.code().to_string(),
+                details: e.details().unwrap_or(serde_json::json!({})),
+            });
+            false
+        } else {
+            true
+        }
+    });
+
+    // Token check.
+    let token_check = token_facts.map(|tf| {
+        let unit_ok = tf.unit == charge.unit;
+        let mint_ok = charge.mints.iter().any(|m| m == &tf.mint);
+        let value_ok_basic = tf.total >= charge.amount;
+
+        if !unit_ok {
+            would_pay = false;
+            let e = PopError::TokenUnitMismatch {
+                required: charge.unit.to_string(),
+                got: tf.unit.to_string(),
+            };
+            refusals.push(DryRunRefusal {
+                code: e.code().to_string(),
+                details: e.details().unwrap_or(serde_json::json!({})),
+            });
+        }
+        if !mint_ok {
+            would_pay = false;
+            let e = PopError::TokenMintMismatch {
+                token_mint: tf.mint.to_string(),
+                accepted_mints: charge.mints.iter().map(ToString::to_string).collect(),
+            };
+            refusals.push(DryRunRefusal {
+                code: e.code().to_string(),
+                details: e.details().unwrap_or(serde_json::json!({})),
+            });
+        }
+
+        // Plan the split (only when unit+mint are ok and we have a valid fee).
+        let plan = if unit_ok && mint_ok && !keyset_fetch_failed {
+            if tf.total == charge.amount {
+                // Fast path: no swap needed.
+                if value_ok_basic {
+                    Some(DryRunPlan {
+                        path: "fast",
+                        send: charge.amount,
+                        fee: 0,
+                        change: 0,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                // Swap path: check value covers amount + fee.
+                match plan_split(tf.total, charge.amount, fee_sats) {
+                    Ok(split) => Some(DryRunPlan {
+                        path: "swap",
+                        send: split.send,
+                        fee: fee_sats,
+                        change: split.change,
+                    }),
+                    Err(e) => {
+                        would_pay = false;
+                        let pe = crate::error::from_boxed(e);
+                        refusals.push(DryRunRefusal {
+                            code: pe.code().to_string(),
+                            details: pe.details().unwrap_or(serde_json::json!({})),
+                        });
+                        None
+                    }
+                }
+            }
+        } else {
+            if value_ok_basic && unit_ok && mint_ok {
+                // keyset_fetch_failed means we can't plan; would_pay stays false
+                // from the caller's Err return (this path unreachable when
+                // keyset_fetch_failed).
+            }
+            None
+        };
+
+        // value_ok: true iff the token would cover the charge (+ fee if swap).
+        let value_ok = plan.is_some()
+            || (unit_ok
+                && mint_ok
+                && tf.total >= charge.amount
+                && (tf.total == charge.amount
+                    || tf.total >= charge.amount.saturating_add(fee_sats)));
+
+        if unit_ok && mint_ok && !value_ok && plan.is_none() && !keyset_fetch_failed {
+            // Only add a refusal if we haven't already added one above.
+            let already_refused = refusals
+                .iter()
+                .any(|r| r.code == "insufficient_token_value");
+            if !already_refused {
+                would_pay = false;
+                let e = PopError::InsufficientTokenValue {
+                    have: tf.total,
+                    need: charge.amount.saturating_add(fee_sats),
+                };
+                refusals.push(DryRunRefusal {
+                    code: e.code().to_string(),
+                    details: e.details().unwrap_or(serde_json::json!({})),
+                });
+            }
+        }
+
+        DryRunTokenCheck {
+            supplied: true,
+            unit_ok,
+            mint_ok,
+            value_ok,
+            token_total: tf.total,
+            plan,
+        }
+    });
+
+    // No token supplied: would_pay = false (absence is not a refusal).
+    if token_check.is_none() {
+        would_pay = false;
+    }
+
+    DryRunReport {
+        schema_version: crate::SCHEMA_VERSION,
+        dry_run: true,
+        status: 402,
+        url: url.to_string(),
+        charge: Some(DryRunCharge {
+            amount: charge.amount,
+            unit: charge.unit.to_string(),
+            mints: charge.mints.iter().map(ToString::to_string).collect(),
+            expires: params.expires.clone(),
+            description: params.description.clone(),
+        }),
+        challenge_fresh: Some(challenge_fresh),
+        cap_ok,
+        token_check,
+        would_pay,
+        refusals,
+        body: None,
+    }
+}
+
+/// Emits a dry-run report to stdout (JSON) or stdout (human).
+fn emit_dry_run_report(
+    report: &DryRunReport,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        // Human-readable rendering to STDOUT (a successful diagnosis, exit 0).
+        println!("DRY RUN: {}", report.url);
+        println!("  status: {}", report.status);
+        if let Some(charge) = &report.charge {
+            println!(
+                "  charge: {} sat of {} (mints: {})",
+                charge.amount,
+                charge.unit,
+                if charge.mints.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    charge.mints.join(", ")
+                }
+            );
+            if let Some(exp) = &charge.expires {
+                println!("  expires: {exp}");
+            }
+        }
+        if let Some(fresh) = report.challenge_fresh {
+            println!("  challenge fresh: {fresh}");
+        }
+        if let Some(cap_ok) = report.cap_ok {
+            println!("  cap ok: {cap_ok}");
+        }
+        if let Some(tc) = &report.token_check {
+            println!("  token_total: {}", tc.token_total);
+            println!("  unit ok: {}", tc.unit_ok);
+            println!("  mint ok: {}", tc.mint_ok);
+            println!("  value ok: {}", tc.value_ok);
+            if let Some(plan) = &tc.plan {
+                println!(
+                    "  plan: {} path, send {}, fee {}, change {}",
+                    plan.path, plan.send, plan.fee, plan.change
+                );
+            }
+        } else {
+            println!("  token: not supplied");
+        }
+        if !report.refusals.is_empty() {
+            println!("  refusals:");
+            for r in &report.refusals {
+                println!("    {}: {}", r.code, r.details);
+            }
+        }
+        println!(
+            "  WOULD PAY: {}",
+            if report.would_pay { "yes" } else { "no" }
+        );
+    }
+    Ok(())
+}
+
 /// Builds a [`PreMintSecrets`] for `amount` on `keyset_id` (least-proofs
 /// power-of-2 split, no swap fee folded into the OUTPUT split — outputs are
 /// 0-fee; the input fee is handled by the change bucket).
@@ -642,12 +1143,22 @@ pub fn build_credentials(params: &PaymentParams, token: &str) -> PaymentCredenti
 }
 
 /// Reads the `cashuB` token from `--token`, else `--token-file`, else stdin.
-fn read_token(args: &PayArgs) -> Result<String, Box<dyn std::error::Error>> {
+///
+/// When `dry_run == true` and neither `--token` nor `--token-file` is given,
+/// returns `Ok(None)` WITHOUT touching stdin (a dry-run must never hang an
+/// agent waiting on a pipe). When `dry_run == false`, behavior is byte-identical
+/// to the paying path: precedence token, then token-file, then stdin; the same
+/// `invalid_input` errors for unreadable file, stdin read failure, and empty
+/// stdin. A present-but-unreadable `--token-file` is always a real error.
+pub fn read_token_opt(
+    args: &PayArgs,
+    dry_run: bool,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     if let Some(t) = &args.token {
-        return Ok(t.clone());
+        return Ok(Some(t.clone()));
     }
     if let Some(path) = &args.token_file {
-        return std::fs::read_to_string(path).map_err(|e| {
+        return std::fs::read_to_string(path).map(Some).map_err(|e| {
             PopError::invalid_input(format!(
                 "failed to read --token-file {}: {e}",
                 path.display()
@@ -655,6 +1166,12 @@ fn read_token(args: &PayArgs) -> Result<String, Box<dyn std::error::Error>> {
             .into()
         });
     }
+    // Neither --token nor --token-file was given.
+    if dry_run {
+        // Skip stdin: a dry-run must never hang an agent waiting on a pipe.
+        return Ok(None);
+    }
+    // Paying path: read from stdin (byte-identical to prior behavior).
     let mut buf = String::new();
     std::io::stdin()
         .read_to_string(&mut buf)
@@ -665,7 +1182,7 @@ fn read_token(args: &PayArgs) -> Result<String, Box<dyn std::error::Error>> {
         )
         .into());
     }
-    Ok(buf)
+    Ok(Some(buf))
 }
 
 /// Parses the `--method` string into a reqwest `Method`.
@@ -836,7 +1353,8 @@ mod tests {
     #[test]
     fn validate_token_ok_when_unit_mint_value_match() {
         assert!(validate_token(1000, &pop_unit(), &mint_a(), &charge(600)).is_ok());
-        assert!(validate_token(600, &pop_unit(), &mint_a(), &charge(600)).is_ok()); // exact
+        assert!(validate_token(600, &pop_unit(), &mint_a(), &charge(600)).is_ok());
+        // exact
     }
 
     #[test]
@@ -904,7 +1422,10 @@ mod tests {
         let d = err.details().expect("details required");
         assert_eq!(d["url"], serde_json::json!("https://app.example/r"));
         assert_eq!(d["expires"], serde_json::json!("2020-01-01T00:00:00Z"));
-        assert!(!err.retriable(), "re-fetch the challenge, don't retry as-is");
+        assert!(
+            !err.retriable(),
+            "re-fetch the challenge, don't retry as-is"
+        );
     }
 
     #[test]
@@ -922,8 +1443,7 @@ mod tests {
     #[test]
     fn challenge_without_expires_passes_the_expiry_check() {
         assert!(
-            expired_challenge_error(&params_with_expires(None), "https://app.example/r")
-                .is_none(),
+            expired_challenge_error(&params_with_expires(None), "https://app.example/r").is_none(),
             "no expires ⇒ no expiry signal to refuse on"
         );
     }
@@ -1076,13 +1596,353 @@ mod tests {
         // And an optional the 402 did NOT carry stays absent (an invented one
         // would equally break the byte-exact echo).
         let bare = r#"Payment id="hmacid", realm="pops", method="cashu", intent="charge", request="cmVxdWVzdA""#;
-        let creds = build_credentials(
-            &parse_payment_params(bare).expect("parses"),
-            "cashuBtok",
-        );
+        let creds = build_credentials(&parse_payment_params(bare).expect("parses"), "cashuBtok");
         assert_eq!(creds.challenge.expires, None);
         assert_eq!(creds.challenge.digest, None);
         assert_eq!(creds.challenge.opaque, None);
         assert_eq!(creds.challenge.description, None);
+    }
+
+    // ---- Part 2: dry-run report builder ----------------------------------
+
+    fn tf(total: u64) -> TokenFacts {
+        TokenFacts {
+            total,
+            unit: pop_unit(),
+            mint: mint_a(),
+        }
+    }
+
+    /// No token supplied: would_pay false, token_check null, no refusals.
+    #[test]
+    fn dry_run_no_token_would_pay_false_no_refusals() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, None, 0, false);
+        assert!(!report.would_pay);
+        assert!(report.token_check.is_none());
+        assert!(
+            report.refusals.is_empty(),
+            "absence of token is not a refusal"
+        );
+        assert_eq!(report.schema_version, crate::SCHEMA_VERSION);
+        assert!(report.dry_run);
+        assert_eq!(report.status, 402);
+    }
+
+    /// Fast path (token == amount): plan shows fast, fee 0, change 0.
+    #[test]
+    fn dry_run_fast_path_plan() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, Some(&tf(600)), 0, false);
+        assert!(report.would_pay, "exact match should would_pay");
+        let tc = report.token_check.unwrap();
+        let plan = tc.plan.unwrap();
+        assert_eq!(plan.path, "fast");
+        assert_eq!(plan.send, 600);
+        assert_eq!(plan.fee, 0);
+        assert_eq!(plan.change, 0);
+        assert!(report.refusals.is_empty());
+    }
+
+    /// Swap path (token > amount): plan shows swap, correct send/fee/change.
+    #[test]
+    fn dry_run_swap_path_plan() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        // fee = 3, total = 1000 => change = 1000 - 600 - 3 = 397
+        let report = evaluate_dry_run(
+            "https://app/r",
+            &c,
+            &params,
+            None,
+            Some(&tf(1000)),
+            3,
+            false,
+        );
+        assert!(report.would_pay);
+        let tc = report.token_check.unwrap();
+        let plan = tc.plan.unwrap();
+        assert_eq!(plan.path, "swap");
+        assert_eq!(plan.send, 600);
+        assert_eq!(plan.fee, 3);
+        assert_eq!(plan.change, 397);
+        assert!(report.refusals.is_empty());
+    }
+
+    /// Expired challenge becomes a refusal (not an error); would_pay false.
+    #[test]
+    fn dry_run_expired_challenge_is_refusal() {
+        let params = params_with_expires(Some("2020-01-01T00:00:00Z"));
+        let c = charge(600);
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, Some(&tf(600)), 0, false);
+        assert!(!report.would_pay);
+        assert_eq!(report.challenge_fresh, Some(false));
+        assert!(
+            report
+                .refusals
+                .iter()
+                .any(|r| r.code == "challenge_expired"),
+            "expected challenge_expired refusal"
+        );
+    }
+
+    /// Cap exceeded becomes a refusal; would_pay false.
+    #[test]
+    fn dry_run_cap_exceeded_is_refusal() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        let report = evaluate_dry_run(
+            "https://app/r",
+            &c,
+            &params,
+            Some(500),
+            Some(&tf(600)),
+            0,
+            false,
+        );
+        assert!(!report.would_pay);
+        assert_eq!(report.cap_ok, Some(false));
+        assert!(
+            report
+                .refusals
+                .iter()
+                .any(|r| r.code == "amount_exceeds_cap"),
+            "expected amount_exceeds_cap refusal"
+        );
+    }
+
+    /// Unit mismatch becomes a refusal.
+    #[test]
+    fn dry_run_unit_mismatch_is_refusal() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        let bad_tf = TokenFacts {
+            total: 1000,
+            unit: CurrencyUnit::Custom("pop_9999999999".to_string()),
+            mint: mint_a(),
+        };
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, Some(&bad_tf), 0, false);
+        assert!(!report.would_pay);
+        assert!(
+            report
+                .refusals
+                .iter()
+                .any(|r| r.code == "token_unit_mismatch"),
+            "expected token_unit_mismatch refusal"
+        );
+        let tc = report.token_check.unwrap();
+        assert!(!tc.unit_ok);
+    }
+
+    /// Mint mismatch becomes a refusal.
+    #[test]
+    fn dry_run_mint_mismatch_is_refusal() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        let bad_tf = TokenFacts {
+            total: 1000,
+            unit: pop_unit(),
+            mint: MintUrl::from_str("https://other.example").unwrap(),
+        };
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, Some(&bad_tf), 0, false);
+        assert!(!report.would_pay);
+        assert!(
+            report
+                .refusals
+                .iter()
+                .any(|r| r.code == "token_mint_mismatch"),
+            "expected token_mint_mismatch refusal"
+        );
+        let tc = report.token_check.unwrap();
+        assert!(!tc.mint_ok);
+    }
+
+    /// Insufficient value (after fee) becomes a refusal.
+    #[test]
+    fn dry_run_insufficient_value_is_refusal() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        // Token has 601 sats (> amount, so swap path), but fee=3 means
+        // need 600 + 3 = 603, and 601 < 603 => insufficient.
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, Some(&tf(601)), 3, false);
+        assert!(!report.would_pay);
+        assert!(
+            report
+                .refusals
+                .iter()
+                .any(|r| r.code == "insufficient_token_value"),
+            "expected insufficient_token_value refusal"
+        );
+    }
+
+    /// Refusal details match the corresponding PopError::details() shape.
+    #[test]
+    fn dry_run_refusal_details_match_pop_error_details() {
+        // Cap exceeded: details should match PopError::AmountExceedsCap{}.details().
+        let params = params_for_charge(600);
+        let c = charge(600);
+        let report = evaluate_dry_run(
+            "https://app/r",
+            &c,
+            &params,
+            Some(500),
+            Some(&tf(600)),
+            0,
+            false,
+        );
+        let refusal = report
+            .refusals
+            .iter()
+            .find(|r| r.code == "amount_exceeds_cap")
+            .unwrap();
+        let expected = PopError::AmountExceedsCap {
+            amount: 600,
+            cap: 500,
+        }
+        .details()
+        .unwrap();
+        assert_eq!(
+            refusal.details, expected,
+            "refusal details must match PopError::details()"
+        );
+
+        // Token unit mismatch.
+        let bad_tf = TokenFacts {
+            total: 1000,
+            unit: CurrencyUnit::Custom("pop_9999".to_string()),
+            mint: mint_a(),
+        };
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, Some(&bad_tf), 0, false);
+        let refusal = report
+            .refusals
+            .iter()
+            .find(|r| r.code == "token_unit_mismatch")
+            .unwrap();
+        let expected = PopError::TokenUnitMismatch {
+            required: pop_unit().to_string(),
+            got: "pop_9999".to_string(),
+        }
+        .details()
+        .unwrap();
+        assert_eq!(
+            refusal.details, expected,
+            "unit mismatch details must match"
+        );
+    }
+
+    /// cap_ok is null when --max-amount was not given.
+    #[test]
+    fn dry_run_cap_ok_null_when_no_max_amount() {
+        let params = params_for_charge(600);
+        let c = charge(600);
+        let report = evaluate_dry_run("https://app/r", &c, &params, None, Some(&tf(600)), 0, false);
+        assert_eq!(
+            report.cap_ok, None,
+            "cap_ok must be null when no --max-amount"
+        );
+    }
+
+    /// read_token_opt: dry_run + no flags returns Ok(None).
+    #[test]
+    fn read_token_opt_dry_run_no_flags_returns_none() {
+        let args = PayArgs {
+            url: "https://app/r".to_string(),
+            token: None,
+            token_file: None,
+            method: "GET".to_string(),
+            max_amount: None,
+            dry_run: true,
+        };
+        let result = read_token_opt(&args, true).unwrap();
+        assert!(
+            result.is_none(),
+            "dry_run with no token flags must return None"
+        );
+    }
+
+    /// read_token_opt: dry_run + --token returns Some.
+    #[test]
+    fn read_token_opt_dry_run_with_token_flag_returns_some() {
+        let args = PayArgs {
+            url: "https://app/r".to_string(),
+            token: Some("cashuBfoo".to_string()),
+            token_file: None,
+            method: "GET".to_string(),
+            max_amount: None,
+            dry_run: true,
+        };
+        let result = read_token_opt(&args, true).unwrap();
+        assert_eq!(result, Some("cashuBfoo".to_string()));
+    }
+
+    /// read_token_opt: dry_run + unreadable --token-file returns invalid_input Err.
+    #[test]
+    fn read_token_opt_dry_run_unreadable_token_file_is_error() {
+        let args = PayArgs {
+            url: "https://app/r".to_string(),
+            token: None,
+            token_file: Some(std::path::PathBuf::from("/nonexistent/file.token")),
+            method: "GET".to_string(),
+            max_amount: None,
+            dry_run: true,
+        };
+        let err = read_token_opt(&args, true).unwrap_err();
+        assert_eq!(
+            crate::error::from_boxed(err).code(),
+            "invalid_input",
+            "unreadable token-file must be invalid_input even under dry-run"
+        );
+    }
+
+    // ---- Part 3: post-swap assertion value-loss fix ----------------------
+
+    /// A TokenEncodeFailed built with the post-swap-assertion reason carries
+    /// both proof JSONs and maps to exit 6 (value at risk).
+    #[test]
+    fn post_swap_assertion_failure_is_token_bearing_and_exit_6() {
+        let e = PopError::TokenEncodeFailed {
+            reason: "POST-SWAP exact-amount assertion failed: send set summed to 601, \
+                     not the required 600 (inputs already spent; raw proofs preserved)"
+                .to_string(),
+            send_proofs_json: Some(r#"[{"amount":600}]"#.to_string()),
+            change_proofs_json: Some(r#"[{"amount":400}]"#.to_string()),
+        };
+        // Must be token-bearing (carries proofs).
+        assert!(
+            e.recovery_proofs_json().is_some(),
+            "post-swap assertion failure must be token-bearing"
+        );
+        // Must map to exit 6.
+        assert_eq!(
+            e.exit_code(),
+            6,
+            "token-bearing errors must be exit 6 (VALUE AT RISK)"
+        );
+        // Details must carry both proof sets.
+        let d = e.details().unwrap();
+        assert!(
+            d.get("send_proofs").is_some(),
+            "send_proofs must be in details"
+        );
+        assert!(
+            d.get("change_proofs").is_some(),
+            "change_proofs must be in details"
+        );
+    }
+
+    /// The FAST-PATH assertion (inputs NOT spent) still fires as
+    /// exact_amount_assertion_failed (exit 5, NOT token-bearing).
+    #[test]
+    fn fast_path_assertion_stays_exact_amount_assertion_failed_exit_5() {
+        let err = assert_send_is_exact(601, 600).unwrap_err();
+        let pe = crate::error::from_boxed(err);
+        assert_eq!(pe.code(), "exact_amount_assertion_failed");
+        // Not token-bearing.
+        assert!(pe.recovery_tokens().is_none());
+        assert!(pe.recovery_proofs_json().is_none());
+        // Exit 5.
+        assert_eq!(pe.exit_code(), 5);
     }
 }

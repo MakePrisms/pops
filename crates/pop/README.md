@@ -206,6 +206,23 @@ Machine-readable **JSON is the default output** of every command (on success and
 failure, on stdout). Pass `--human` (alias `--pretty`) for human-readable text
 instead; `--json` is still accepted as a deprecated no-op.
 
+### Exit codes (agent-facing, additive alongside the JSON envelope)
+
+| exit | meaning |
+|------|---------|
+| 0 | success |
+| 1 | internal / unmapped failure (`internal_error` only) |
+| 2 | usage error (clap argument parse; no JSON envelope) |
+| 3 | needs input: caller can repair the call from `details` and re-invoke |
+| 4 | transient: safe to retry the same call as-is |
+| 5 | upstream rejected: a mint or gateway said no, terminally |
+| 6 | VALUE AT RISK: error carries recovery tokens or proofs that exist nowhere else; caller MUST harvest them from `details` (JSON mode) or stderr (human mode) |
+
+Always branch on the JSON `code` for full detail; exit codes are a coarse
+shortcut. Exit 4 is exactly the `retriable: true` set. Exit 6 dominates
+classification (a post-swap token-bearing error is exit 6 even if it is also an
+upstream rejection).
+
 ## Recovery
 
 Two documented paths (both need only the seed mnemonic + the recovery file):

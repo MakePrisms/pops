@@ -73,6 +73,18 @@ CONTRACT below and `pop-wallet.schema.json` for the schema.
     Fix your call from these fields, never from prose.
   - clap **argument-parse** errors (missing/invalid flags) exit **2** with no
     JSON envelope — that's a bug in how you invoked `pop`, not a wallet error.
+- **Exit-code contract** (additive alongside the JSON envelope; branch on the
+  JSON `code` for full detail):
+
+  | exit | meaning |
+  |------|---------|
+  | 0 | success |
+  | 1 | internal / unmapped failure (`internal_error` only) |
+  | 2 | usage error (clap; no JSON envelope) |
+  | 3 | needs input: caller can repair from `details` and re-invoke |
+  | 4 | transient: safe to retry the same call as-is |
+  | 5 | upstream rejected: a mint or gateway said no, terminally |
+  | 6 | VALUE AT RISK: error carries recovery tokens or proofs; MUST harvest from `details` |
 
 ---
 

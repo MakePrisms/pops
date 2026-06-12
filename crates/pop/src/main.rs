@@ -157,7 +157,7 @@ async fn main() {
                 ),
             }
         }
-        std::process::exit(1);
+        std::process::exit(pe.exit_code());
     }
 }
 

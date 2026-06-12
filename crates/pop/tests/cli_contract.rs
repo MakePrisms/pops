@@ -44,8 +44,9 @@ fn run_pop(wallet_dir: &Path, args: &[&str]) -> Output {
 fn parse_single_json(stdout: &str) -> serde_json::Value {
     let trimmed = stdout.trim_end_matches('\n');
     // A single object: serde_json must consume the ENTIRE string.
-    let v: serde_json::Value = serde_json::from_str(trimmed)
-        .unwrap_or_else(|e| panic!("stdout is not a single JSON value: {e}\nstdout was:\n{stdout}"));
+    let v: serde_json::Value = serde_json::from_str(trimmed).unwrap_or_else(|e| {
+        panic!("stdout is not a single JSON value: {e}\nstdout was:\n{stdout}")
+    });
     v
 }
 
@@ -55,10 +56,7 @@ fn parse_single_json(stdout: &str) -> serde_json::Value {
 #[test]
 fn success_emits_json_with_schema_version_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
-    let out = run_pop(
-        dir.path(),
-        &["init", "--network", "regtest"],
-    );
+    let out = run_pop(dir.path(), &["init", "--network", "regtest"]);
     assert_eq!(out.code, 0, "init should succeed; stderr:\n{}", out.stderr);
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["schema_version"], serde_json::json!(1));
@@ -74,7 +72,8 @@ fn success_emits_json_with_schema_version_on_stdout() {
     assert_eq!(v["mnemonic_delivery"], serde_json::json!("stderr"));
     // The actual mnemonic line went to stderr (clearly labelled, shown once).
     assert!(
-        out.stderr.contains("mnemonic (write this down, shown once):"),
+        out.stderr
+            .contains("mnemonic (write this down, shown once):"),
         "the mnemonic should be printed to stderr; got:\n{}",
         out.stderr
     );
@@ -86,8 +85,15 @@ fn success_emits_json_with_schema_version_on_stdout() {
 #[test]
 fn init_show_mnemonic_puts_mnemonic_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
-    let out = run_pop(dir.path(), &["init", "--network", "regtest", "--show-mnemonic"]);
-    assert_eq!(out.code, 0, "init --show-mnemonic should succeed; stderr:\n{}", out.stderr);
+    let out = run_pop(
+        dir.path(),
+        &["init", "--network", "regtest", "--show-mnemonic"],
+    );
+    assert_eq!(
+        out.code, 0,
+        "init --show-mnemonic should succeed; stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert!(
         v["mnemonic"].is_string() && !v["mnemonic"].as_str().unwrap().is_empty(),
@@ -102,13 +108,19 @@ fn init_show_mnemonic_puts_mnemonic_on_stdout() {
 #[test]
 fn list_is_json_by_default_with_envelope() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
 
     let out = run_pop(dir.path(), &["list"]);
     assert_eq!(out.code, 0, "stderr:\n{}", out.stderr);
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["schema_version"], serde_json::json!(1));
-    assert!(v["deposits"].is_array(), "list envelope has a deposits array");
+    assert!(
+        v["deposits"].is_array(),
+        "list envelope has a deposits array"
+    );
     assert_eq!(v["deposits"].as_array().unwrap().len(), 0);
 }
 
@@ -122,21 +134,37 @@ fn balance_degrades_to_null_recoverable_when_chain_unreachable() {
     assert_eq!(
         run_pop(
             dir.path(),
-            &["init", "--network", "regtest", "--esplora-url", "http://127.0.0.1:1"],
+            &[
+                "init",
+                "--network",
+                "regtest",
+                "--esplora-url",
+                "http://127.0.0.1:1"
+            ],
         )
         .code,
         0
     );
 
     let out = run_pop(dir.path(), &["balance"]);
-    assert_eq!(out.code, 0, "balance must not hard-fail on a chain read; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 0,
+        "balance must not hard-fail on a chain read; stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["schema_version"], serde_json::json!(1));
     assert_eq!(v["mtp_available"], serde_json::json!(false));
     assert_eq!(v["recoverable_now"], serde_json::json!(null));
     assert_eq!(v["total_locked_sats"], serde_json::json!(0));
-    assert_eq!(v["mintable_now"], serde_json::json!({ "count": 0, "sats": 0 }));
-    assert_eq!(v["by_state"]["paid"], serde_json::json!({ "count": 0, "sats": 0 }));
+    assert_eq!(
+        v["mintable_now"],
+        serde_json::json!({ "count": 0, "sats": 0 })
+    );
+    assert_eq!(
+        v["by_state"]["paid"],
+        serde_json::json!({ "count": 0, "sats": 0 })
+    );
     assert!(
         out.stderr.contains("esplora"),
         "expected an esplora-unreachable warning on stderr; got:\n{}",
@@ -152,14 +180,24 @@ fn status_signals_mtp_available_false_when_chain_unreachable() {
     assert_eq!(
         run_pop(
             dir.path(),
-            &["init", "--network", "regtest", "--esplora-url", "http://127.0.0.1:1"],
+            &[
+                "init",
+                "--network",
+                "regtest",
+                "--esplora-url",
+                "http://127.0.0.1:1"
+            ],
         )
         .code,
         0
     );
 
     let out = run_pop(dir.path(), &["status"]);
-    assert_eq!(out.code, 0, "status must not hard-fail on a chain read; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 0,
+        "status must not hard-fail on a chain read; stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["schema_version"], serde_json::json!(1));
     // The degrade flag is present at the envelope level (empty ledger here).
@@ -182,7 +220,13 @@ fn balance_human_prints_text_summary() {
     assert_eq!(
         run_pop(
             dir.path(),
-            &["init", "--network", "regtest", "--esplora-url", "http://127.0.0.1:1"],
+            &[
+                "init",
+                "--network",
+                "regtest",
+                "--esplora-url",
+                "http://127.0.0.1:1"
+            ],
         )
         .code,
         0
@@ -206,7 +250,10 @@ fn balance_human_prints_text_summary() {
 #[test]
 fn deprecated_json_flag_is_accepted_noop() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
     let out = run_pop(dir.path(), &["list", "--json"]);
     assert_eq!(out.code, 0, "stderr:\n{}", out.stderr);
     let v = parse_single_json(&out.stdout);
@@ -215,16 +262,24 @@ fn deprecated_json_flag_is_accepted_noop() {
 }
 
 /// (b) Error envelope shape — `wallet_not_initialized` (message-only): running a
-/// command before `init` yields the failure envelope on stdout, exit 1.
+/// command before `init` yields the failure envelope on stdout, exit 3
+/// (needs_input: the caller can fix by running `pop init`).
 #[test]
 fn error_envelope_wallet_not_initialized() {
     let dir = tempfile::tempdir().unwrap();
     // No init → list must fail with wallet_not_initialized.
     let out = run_pop(dir.path(), &["list"]);
-    assert_eq!(out.code, 1, "expected app-error exit 1; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 3,
+        "expected needs_input exit 3; stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["schema_version"], serde_json::json!(1));
-    assert_eq!(v["error"]["code"], serde_json::json!("wallet_not_initialized"));
+    assert_eq!(
+        v["error"]["code"],
+        serde_json::json!("wallet_not_initialized")
+    );
     assert_eq!(v["error"]["retriable"], serde_json::json!(false));
     assert!(v["error"]["message"].is_string());
     // message-only code → no details key.
@@ -236,7 +291,10 @@ fn error_envelope_wallet_not_initialized() {
 #[test]
 fn error_envelope_deposit_not_found_has_required_details() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
 
     let out = run_pop(
         dir.path(),
@@ -249,10 +307,17 @@ fn error_envelope_deposit_not_found_has_required_details() {
             "bcrt1psjw4ymy3cl0a2cp32nnh4kjj9fus8m5daust4kd4hzwnkm7ctmhq29z2wd",
         ],
     );
-    assert_eq!(out.code, 1, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 3,
+        "deposit_not_found is needs_input (exit 3); stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("deposit_not_found"));
-    assert_eq!(v["error"]["details"]["deposit_id"], serde_json::json!("no-such-id"));
+    assert_eq!(
+        v["error"]["details"]["deposit_id"],
+        serde_json::json!("no-such-id")
+    );
 }
 
 /// (b) Error envelope with REQUIRED details — `network_mismatch{expected, got}`:
@@ -260,7 +325,10 @@ fn error_envelope_deposit_not_found_has_required_details() {
 #[test]
 fn error_envelope_network_mismatch_has_required_details() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
 
     let out = run_pop(
         dir.path(),
@@ -272,22 +340,34 @@ fn error_envelope_network_mismatch_has_required_details() {
             "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
         ],
     );
-    assert_eq!(out.code, 1, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 3,
+        "network_mismatch is needs_input (exit 3); stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("network_mismatch"));
-    assert_eq!(v["error"]["details"]["expected"], serde_json::json!("regtest"));
+    assert_eq!(
+        v["error"]["details"]["expected"],
+        serde_json::json!("regtest")
+    );
     assert_eq!(v["error"]["details"]["got"], serde_json::json!("mainnet"));
     assert_eq!(v["error"]["retriable"], serde_json::json!(false));
 }
 
-/// invalid_input (message-only, exit 1) for a bad `--network` at `init`. (The
-/// `--state` filter is now a clap ValueEnum, so a bad `--state` is instead a clap
-/// usage error exit 2 — covered by `invalid_state_filter_is_clap_exit_2`.)
+/// invalid_input (message-only, exit 3 needs_input) for a bad `--network` at
+/// `init`. (The `--state` filter is now a clap ValueEnum, so a bad `--state` is
+/// instead a clap usage error exit 2 — covered by
+/// `invalid_state_filter_is_clap_exit_2`.)
 #[test]
 fn error_envelope_invalid_input() {
     let dir = tempfile::tempdir().unwrap();
     let out = run_pop(dir.path(), &["init", "--network", "bogus"]);
-    assert_eq!(out.code, 1, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 3,
+        "invalid_input is needs_input (exit 3); stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("invalid_input"));
     assert!(v["error"].get("details").is_none());
@@ -298,9 +378,16 @@ fn error_envelope_invalid_input() {
 #[test]
 fn invalid_state_filter_is_clap_exit_2() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
     let out = run_pop(dir.path(), &["list", "--state", "bogus"]);
-    assert_eq!(out.code, 2, "bad --state must be a clap usage error; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 2,
+        "bad --state must be a clap usage error; stderr:\n{}",
+        out.stderr
+    );
     // The accepted values are enumerated in the clap error/help.
     assert!(
         out.stderr.contains("unpaid") && out.stderr.contains("expired"),
@@ -323,8 +410,13 @@ fn json_mode_stdout_is_pure_progress_on_stderr() {
 
     // A second init fails (wallet_exists); stdout stays pure (the human `message`
     // lives INSIDE the envelope — what's forbidden is loose prose OUTSIDE it).
+    // wallet_exists is needs_input (exit 3).
     let second = run_pop(dir.path(), &["init", "--network", "regtest"]);
-    assert_eq!(second.code, 1);
+    assert_eq!(
+        second.code, 3,
+        "wallet_exists is needs_input (exit 3); stderr:\n{}",
+        second.stderr
+    );
     let v = parse_single_json(&second.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("wallet_exists"));
     assert!(
@@ -338,7 +430,10 @@ fn json_mode_stdout_is_pure_progress_on_stderr() {
 #[test]
 fn human_mode_prints_text_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
 
     let out = run_pop(dir.path(), &["list", "--human"]);
     assert_eq!(out.code, 0, "stderr:\n{}", out.stderr);
@@ -355,14 +450,28 @@ fn human_mode_prints_text_on_stdout() {
 }
 
 /// (d) `--human` mode failure: the human message goes to STDERR (NOT json), and
-/// stdout is empty; exit 1. `--pretty` is an accepted alias.
+/// stdout is empty; non-zero exit. `--pretty` is an accepted alias.
+/// wallet_not_initialized is needs_input (exit 3).
 #[test]
 fn human_mode_failure_message_on_stderr_no_json() {
     let dir = tempfile::tempdir().unwrap();
     // No init → list --pretty fails; message on stderr, nothing on stdout.
     let out = run_pop(dir.path(), &["list", "--pretty"]);
-    assert_eq!(out.code, 1);
-    assert!(out.stdout.trim().is_empty(), "human-mode failure must not write stdout: {:?}", out.stdout);
+    assert_ne!(
+        out.code, 0,
+        "human-mode failure must exit non-zero; stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(
+        out.code, 3,
+        "wallet_not_initialized is needs_input (exit 3); stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stdout.trim().is_empty(),
+        "human-mode failure must not write stdout: {:?}",
+        out.stdout
+    );
     assert!(
         out.stderr.contains("error:"),
         "human-mode failure should print to stderr; got:\n{}",
@@ -378,7 +487,11 @@ fn clap_usage_error_is_exit_2() {
     let dir = tempfile::tempdir().unwrap();
     // `recover` requires --dest; omitting it is a clap usage error.
     let out = run_pop(dir.path(), &["recover", "--all"]);
-    assert_eq!(out.code, 2, "clap usage error must be exit 2; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 2,
+        "clap usage error must be exit 2; stderr:\n{}",
+        out.stderr
+    );
 }
 
 /// An unknown subcommand is also a clap usage error (exit 2), not our envelope.
@@ -409,15 +522,30 @@ fn pay_subcommand_exists_help_ok_missing_url_is_exit_2() {
 #[test]
 fn mint_resume_parses_without_mint_url_or_amount() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
 
     let out = run_pop(dir.path(), &["mint", "--resume", "no-such-deposit-id"]);
     // NOT a clap usage error: bare `--resume` is a valid invocation.
-    assert_ne!(out.code, 2, "bare `mint --resume <id>` must parse; stderr:\n{}", out.stderr);
-    assert_eq!(out.code, 1, "expected an app-level error; stderr:\n{}", out.stderr);
+    assert_ne!(
+        out.code, 2,
+        "bare `mint --resume <id>` must parse; stderr:\n{}",
+        out.stderr
+    );
+    // deposit_not_found is needs_input (exit 3).
+    assert_eq!(
+        out.code, 3,
+        "deposit_not_found is needs_input (exit 3); stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("deposit_not_found"));
-    assert_eq!(v["error"]["details"]["deposit_id"], serde_json::json!("no-such-deposit-id"));
+    assert_eq!(
+        v["error"]["details"]["deposit_id"],
+        serde_json::json!("no-such-deposit-id")
+    );
 }
 
 /// (item 2) A FRESH `pop mint` (no --resume) WITHOUT --mint-url/--amount is a
@@ -425,10 +553,17 @@ fn mint_resume_parses_without_mint_url_or_amount() {
 #[test]
 fn fresh_mint_without_required_args_is_clap_exit_2() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
     // No --mint-url, no --amount, no --resume → clap usage error.
     let out = run_pop(dir.path(), &["mint", "--duration", "30d"]);
-    assert_eq!(out.code, 2, "fresh mint missing --mint-url/--amount must be exit 2; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 2,
+        "fresh mint missing --mint-url/--amount must be exit 2; stderr:\n{}",
+        out.stderr
+    );
 }
 
 /// (item 3) A fresh `pop mint` with NEITHER --duration NOR --unit is a clap usage
@@ -436,12 +571,25 @@ fn fresh_mint_without_required_args_is_clap_exit_2() {
 #[test]
 fn fresh_mint_without_unit_group_is_clap_exit_2() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
     let out = run_pop(
         dir.path(),
-        &["mint", "--mint-url", "https://mint.example", "--amount", "1000"],
+        &[
+            "mint",
+            "--mint-url",
+            "https://mint.example",
+            "--amount",
+            "1000",
+        ],
     );
-    assert_eq!(out.code, 2, "missing unit/duration must be exit 2; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 2,
+        "missing unit/duration must be exit 2; stderr:\n{}",
+        out.stderr
+    );
 }
 
 /// (item 3) `pop quote` with NEITHER --duration NOR --unit is a clap usage error
@@ -449,12 +597,27 @@ fn fresh_mint_without_unit_group_is_clap_exit_2() {
 #[test]
 fn quote_without_unit_group_is_clap_exit_2() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
     let out = run_pop(
         dir.path(),
-        &["quote", "--mint-url", "https://mint.example", "--amount", "1000", "--mint-pubkey", "02ab"],
+        &[
+            "quote",
+            "--mint-url",
+            "https://mint.example",
+            "--amount",
+            "1000",
+            "--mint-pubkey",
+            "02ab",
+        ],
     );
-    assert_eq!(out.code, 2, "quote missing unit/duration must be exit 2; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 2,
+        "quote missing unit/duration must be exit 2; stderr:\n{}",
+        out.stderr
+    );
 }
 
 /// (item 3) Supplying BOTH --duration and --unit is mutually exclusive (clap exit
@@ -462,15 +625,31 @@ fn quote_without_unit_group_is_clap_exit_2() {
 #[test]
 fn duration_and_unit_together_is_clap_exit_2() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
     let out = run_pop(
         dir.path(),
         &[
-            "quote", "--mint-url", "https://mint.example", "--amount", "1000",
-            "--mint-pubkey", "02ab", "--duration", "30d", "--unit", "pop_1788000000",
+            "quote",
+            "--mint-url",
+            "https://mint.example",
+            "--amount",
+            "1000",
+            "--mint-pubkey",
+            "02ab",
+            "--duration",
+            "30d",
+            "--unit",
+            "pop_1788000000",
         ],
     );
-    assert_eq!(out.code, 2, "duration+unit together must be exit 2; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 2,
+        "duration+unit together must be exit 2; stderr:\n{}",
+        out.stderr
+    );
 }
 
 /// `recover --all` with NO funded candidates is an empty SUCCESS (exit 0) that
@@ -482,7 +661,13 @@ fn recover_all_empty_is_success_with_no_chain_call() {
     assert_eq!(
         run_pop(
             dir.path(),
-            &["init", "--network", "regtest", "--esplora-url", "http://127.0.0.1:1"],
+            &[
+                "init",
+                "--network",
+                "regtest",
+                "--esplora-url",
+                "http://127.0.0.1:1"
+            ],
         )
         .code,
         0
@@ -490,9 +675,18 @@ fn recover_all_empty_is_success_with_no_chain_call() {
 
     let out = run_pop(
         dir.path(),
-        &["recover", "--all", "--dest", "bcrt1psjw4ymy3cl0a2cp32nnh4kjj9fus8m5daust4kd4hzwnkm7ctmhq29z2wd"],
+        &[
+            "recover",
+            "--all",
+            "--dest",
+            "bcrt1psjw4ymy3cl0a2cp32nnh4kjj9fus8m5daust4kd4hzwnkm7ctmhq29z2wd",
+        ],
     );
-    assert_eq!(out.code, 0, "empty --all sweep must succeed; stderr:\n{}", out.stderr);
+    assert_eq!(
+        out.code, 0,
+        "empty --all sweep must succeed; stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["schema_version"], serde_json::json!(1));
     assert_eq!(v["tip_height"], serde_json::json!(null));
@@ -511,9 +705,20 @@ fn recover_all_empty_is_success_with_no_chain_call() {
 #[test]
 fn recover_malformed_dest_message_is_clear_no_base58() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(run_pop(dir.path(), &["init", "--network", "regtest"]).code, 0);
-    let out = run_pop(dir.path(), &["recover", "--all", "--dest", "not-an-address"]);
-    assert_eq!(out.code, 1, "stderr:\n{}", out.stderr);
+    assert_eq!(
+        run_pop(dir.path(), &["init", "--network", "regtest"]).code,
+        0
+    );
+    let out = run_pop(
+        dir.path(),
+        &["recover", "--all", "--dest", "not-an-address"],
+    );
+    // invalid_input is needs_input (exit 3).
+    assert_eq!(
+        out.code, 3,
+        "invalid_input is needs_input (exit 3); stderr:\n{}",
+        out.stderr
+    );
     let v = parse_single_json(&out.stdout);
     assert_eq!(v["error"]["code"], serde_json::json!("invalid_input"));
     let msg = v["error"]["message"].as_str().unwrap();

@@ -17,6 +17,18 @@
 //! returns the matching [`PopError`] (it boxes transparently). At the top,
 //! [`crate::run`] downcasts back — anything not ours becomes
 //! [`PopError::Internal`].
+//!
+//! ## Exit-code contract (additive, alongside the JSON envelope)
+//!
+//! | exit | meaning |
+//! |------|---------|
+//! | 0 | success |
+//! | 1 | internal / unmapped failure (`internal_error` only) |
+//! | 2 | usage error (clap argument parse; unchanged) |
+//! | 3 | needs input: caller can repair the call from `details` and re-invoke |
+//! | 4 | transient: safe to retry the same call as-is (`retriable == true`) |
+//! | 5 | upstream rejected: a mint or gateway said no, terminally |
+//! | 6 | VALUE AT RISK: error carries recovery tokens or proofs that exist nowhere else; caller MUST harvest them from `details` (JSON mode) or stderr (human mode) |
 
 use serde_json::{json, Value};
 
@@ -372,6 +384,60 @@ impl PopError {
                 | PopError::CltvNotExpired { .. }
                 | PopError::BroadcastFailed { .. }
         )
+    }
+
+    /// The exit code for this error. See the module-level exit-code contract.
+    ///
+    /// The exhaustive match (no `_` arm) ensures a future variant forces a
+    /// conscious classification choice.
+    ///
+    /// Precedence: exit 6 (value at risk) dominates exit 5 (upstream terminal)
+    /// for the post-swap token-bearing errors.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            // exit 6: VALUE AT RISK (token-bearing; dominates all other classes)
+            PopError::GatewayRejectedPayment { .. }
+            | PopError::GatewayRetryFailed { .. }
+            | PopError::TokenEncodeFailed { .. } => 6,
+
+            // exit 4: transient (retriable == true)
+            PopError::MintUnreachable { .. }
+            | PopError::ChainUnreachable { .. }
+            | PopError::FundingPending { .. }
+            | PopError::CltvNotExpired { .. }
+            | PopError::BroadcastFailed { .. } => 4,
+
+            // exit 5: upstream terminal rejections
+            PopError::MintError { .. }
+            | PopError::AddressMismatch { .. }
+            | PopError::PaymentRejected { .. }
+            | PopError::SwapFailed { .. }
+            | PopError::ExactAmountAssertionFailed { .. } => 5,
+
+            // exit 3: needs_input (caller can repair and re-invoke)
+            PopError::InsufficientFunds { .. }
+            | PopError::DepositNotFound { .. }
+            | PopError::NetworkMismatch { .. }
+            | PopError::AmountMismatch { .. }
+            | PopError::QuoteExpired { .. }
+            | PopError::ValueBelowFee { .. }
+            | PopError::FeeTooHigh { .. }
+            | PopError::WalletNotInitialized { .. }
+            | PopError::WalletExists { .. }
+            | PopError::InvalidMnemonic { .. }
+            | PopError::InvalidInput { .. }
+            | PopError::Not402 { .. }
+            | PopError::NoPaymentChallenge { .. }
+            | PopError::ChallengeParseFailed { .. }
+            | PopError::ChallengeExpired { .. }
+            | PopError::TokenUnitMismatch { .. }
+            | PopError::TokenMintMismatch { .. }
+            | PopError::InsufficientTokenValue { .. }
+            | PopError::AmountExceedsCap { .. } => 3,
+
+            // exit 1: internal / unmapped
+            PopError::Internal { .. } => 1,
+        }
     }
 
     /// The structured `details` object for this error, or `None` for the
@@ -1187,14 +1253,13 @@ mod tests {
     /// stale count is exactly the drift this pins against.
     #[test]
     fn error_code_table_in_pop_wallet_skill_matches_the_contract() {
-        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../skills/pop-wallet.md");
-        let doc = std::fs::read_to_string(&doc_path)
-            .unwrap_or_else(|e| panic!("read {doc_path:?}: {e}"));
+        let doc_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills/pop-wallet.md");
+        let doc =
+            std::fs::read_to_string(&doc_path).unwrap_or_else(|e| panic!("read {doc_path:?}: {e}"));
 
         let samples = sample_errors();
-        let codes: std::collections::BTreeSet<&str> =
-            samples.iter().map(|e| e.code()).collect();
+        let codes: std::collections::BTreeSet<&str> = samples.iter().map(|e| e.code()).collect();
         assert_eq!(
             codes.len(),
             samples.len(),
@@ -1215,6 +1280,97 @@ mod tests {
              ({}; expected the phrase {advertised:?})",
             codes.len()
         );
+    }
+
+    /// Exit codes: every sample maps to the correct exit code per the contract
+    /// table, keyed by `code()` string so the assertion is self-documenting.
+    #[test]
+    fn exit_code_per_variant_matches_contract_table() {
+        use std::collections::HashMap;
+        let expected: HashMap<&str, i32> = [
+            // exit 3: needs_input
+            ("insufficient_funds", 3),
+            ("deposit_not_found", 3),
+            ("network_mismatch", 3),
+            ("amount_mismatch", 3),
+            ("quote_expired", 3),
+            ("value_below_fee", 3),
+            ("fee_too_high", 3),
+            ("wallet_not_initialized", 3),
+            ("wallet_exists", 3),
+            ("invalid_mnemonic", 3),
+            ("invalid_input", 3),
+            ("not_402", 3),
+            ("no_payment_challenge", 3),
+            ("challenge_parse_failed", 3),
+            ("challenge_expired", 3),
+            ("token_unit_mismatch", 3),
+            ("token_mint_mismatch", 3),
+            ("insufficient_token_value", 3),
+            ("amount_exceeds_cap", 3),
+            // exit 4: transient
+            ("mint_unreachable", 4),
+            ("chain_unreachable", 4),
+            ("funding_pending", 4),
+            ("cltv_not_expired", 4),
+            ("broadcast_failed", 4),
+            // exit 5: upstream terminal
+            ("mint_error", 5),
+            ("address_mismatch", 5),
+            ("payment_rejected", 5),
+            ("swap_failed", 5),
+            ("exact_amount_assertion_failed", 5),
+            // exit 6: value at risk
+            ("gateway_rejected_payment", 6),
+            ("gateway_retry_failed", 6),
+            ("token_encode_failed", 6),
+            // exit 1: internal
+            ("internal_error", 1),
+        ]
+        .into();
+
+        let samples = sample_errors();
+        for e in &samples {
+            let code = e.code();
+            let got = e.exit_code();
+            let want = *expected
+                .get(code)
+                .unwrap_or_else(|| panic!("no expected exit code for `{code}`"));
+            assert_eq!(
+                got, want,
+                "exit_code for `{code}` should be {want}, got {got}"
+            );
+        }
+    }
+
+    /// Invariant: retriable() == true iff exit_code() == 4.
+    #[test]
+    fn retriable_iff_exit_4() {
+        for e in &sample_errors() {
+            let code = e.code();
+            let retriable = e.retriable();
+            let exit = e.exit_code();
+            assert_eq!(
+                retriable,
+                exit == 4,
+                "retriable/exit-4 mismatch for `{code}`: retriable={retriable}, exit={exit}"
+            );
+        }
+    }
+
+    /// Invariant: recovery_tokens().is_some() || recovery_proofs_json().is_some() iff exit_code() == 6.
+    #[test]
+    fn token_bearing_iff_exit_6() {
+        for e in &sample_errors() {
+            let code = e.code();
+            let token_bearing = e.recovery_tokens().is_some() || e.recovery_proofs_json().is_some();
+            let exit = e.exit_code();
+            assert_eq!(
+                token_bearing,
+                exit == 6,
+                "token-bearing/exit-6 mismatch for `{code}`: token_bearing={token_bearing}, exit={exit}"
+            );
+        }
     }
 
     /// A non-PopError boxed error resolves to internal_error.
