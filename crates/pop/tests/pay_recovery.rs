@@ -411,9 +411,10 @@ fn swap_then_retry_transport_error_surfaces_both_tokens_json() {
     let token = build_input_token(&mint, &base);
 
     let out = run_pay(&base, &token, false);
+    // gateway_retry_failed is token-bearing (VALUE AT RISK): exit 6.
     assert_eq!(
-        out.code, 1,
-        "expected failure exit; stderr:\n{}",
+        out.code, 6,
+        "expected value-at-risk exit 6; stderr:\n{}",
         out.stderr
     );
     let v = parse_json(&out.stdout);
@@ -441,7 +442,8 @@ fn swap_then_retry_transport_error_surfaces_both_tokens_human() {
     let token = build_input_token(&mint, &base);
 
     let out = run_pay(&base, &token, true);
-    assert_eq!(out.code, 1, "expected failure exit");
+    // gateway_retry_failed is token-bearing (VALUE AT RISK): exit 6.
+    assert_eq!(out.code, 6, "expected value-at-risk exit 6");
     // Human mode prints NOTHING parseable on stdout for errors.
     assert!(
         out.stdout.trim().is_empty(),
@@ -474,9 +476,10 @@ fn swap_then_gateway_reject_surfaces_both_tokens_json() {
         let token = build_input_token(&mint, &base);
 
         let out = run_pay(&base, &token, false);
+        // gateway_rejected_payment is token-bearing (VALUE AT RISK): exit 6.
         assert_eq!(
-            out.code, 1,
-            "expected failure exit ({code}); stderr:\n{}",
+            out.code, 6,
+            "expected value-at-risk exit 6 ({code}); stderr:\n{}",
             out.stderr
         );
         let v = parse_json(&out.stdout);
@@ -507,7 +510,8 @@ fn swap_then_gateway_reject_surfaces_both_tokens_human() {
     let token = build_input_token(&mint, &base);
 
     let out = run_pay(&base, &token, true);
-    assert_eq!(out.code, 1);
+    // gateway_rejected_payment is token-bearing (VALUE AT RISK): exit 6.
+    assert_eq!(out.code, 6, "expected value-at-risk exit 6");
     assert!(out.stdout.trim().is_empty(), "human errors go to stderr");
     let cashu_count = out.stderr.matches("cashuB").count();
     assert!(
