@@ -62,7 +62,8 @@ CONTRACT below and `pop-wallet.schema.json` for the schema.
   failure).
 - **Success**: `{ "schema_version": 1, <command fields> }`.
 - **Failure**: `{ "schema_version": 1, "error": { "code", "retriable",
-  "message", "details"? } }` on **stdout**, with a **non-zero exit (1)**. Two
+  "message", "details"? } }` on **stdout**, with a **typed non-zero exit**
+  (see the exit-code contract below). Two
   failure signals: the `error` key AND the non-zero exit.
   - `code` — stable lower_snake_case enum (the 33 codes below). **Branch on
     `code`, never on `message`.**
@@ -99,7 +100,7 @@ pop recover (--deposit <id> | --all) --dest <addr> [--fee <sats> | --target <blo
 pop list    [--state unpaid|paid|minted|recovered|expired]
 pop status  [--deposit <id>]
 pop balance
-pop pay     <URL> [--token <cashuB> | --token-file <path> | <stdin>] [--max-amount <sats>] [--method GET]
+pop pay     <URL> [--dry-run] [--token <cashuB> | --token-file <path> | <stdin>] [--max-amount <sats>] [--method GET]
 ```
 
 For a **fresh** `pop mint` (no `--resume`), `--mint-url`, `--amount`, and exactly
@@ -291,7 +292,21 @@ cap — `pay` refuses a charge larger than it, so a malicious 402 cannot trick y
 into overspending). If the human asks to pay a service that isn't authorized,
 confirm and add it to the state file first.
 
+**Preview first (`--dry-run`), pay second.** Before spending, run the same
+command with **`--dry-run`**: it fetches the URL, decodes the 402 charge
+(amount, unit, mints, expiry), checks your token against it (unit, mint,
+value, swap fee), and reports a one-shot verdict, **spending nothing and
+sending no payment** (the initial request is still made; only the payment is
+withheld). The report is `{schema_version, dry_run: true, paid: false,
+would_pay, charge, token_check, refusals[]}` with **exit 0** whenever the
+report was produced; every check `pay` would refuse on appears in `refusals`
+with the same `code` + `details` the real error would carry. The token is
+OPTIONAL under dry-run: omit it to just read the charge (`token_check: null`,
+`would_pay: false`); dry-run never blocks waiting on stdin. Pay only after
+`would_pay: true`.
+
 ```
+pop pay https://app.example/resource --dry-run --token cashuB... --max-amount 5000
 pop pay https://app.example/resource --token cashuB... --max-amount 5000
 ```
 
@@ -317,8 +332,11 @@ pop pay https://app.example/resource --token cashuB... --max-amount 5000
    stored.** When the held token equalled the charge exactly, `change_token` is
    `null`.
 
-3. **Failure** — the standard `{schema_version, error:{…}}` envelope on stdout,
-   exit 1. The pay-specific codes (see the table) tell you exactly what to fix.
+3. **Failure** — the standard `{schema_version, error:{…}}` envelope on stdout
+   with the typed exit code (pay failures land on 3, 4, 5, or 6 per the
+   exit-code contract; **exit 6 means recovery tokens are in `details`,
+   harvest them before anything else**). The pay-specific codes (see the
+   table) tell you exactly what to fix.
    Notably, the **post-swap** codes **`gateway_rejected_payment`** and
    **`gateway_retry_failed`** carry BOTH `details.send_token` (worth the charge)
    AND any `details.change_token` — once the swap ran, the held input is spent,
