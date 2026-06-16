@@ -382,7 +382,7 @@ async fn bare_request_returns_402_with_www_authenticate() {
     assert!(read_lines(&sink).is_empty(), "no proofs on a bare request");
 }
 
-// The gateway's challenge is the SHARED draft-cashu-charge-01 request object —
+// The gateway's challenge is the SHARED draft-cashu-charge-00 request object —
 // the flat {"cashu_request": ...} dialect is dead.
 #[tokio::test]
 async fn gateway_challenge_request_param_is_the_spec_request_object() {

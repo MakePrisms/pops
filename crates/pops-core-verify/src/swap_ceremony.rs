@@ -25,7 +25,7 @@ use crate::mint_client::{MintClientError, SwapOutcome};
 /// accepts a `dleq: None` signature, so this is the ONLY place the mint is held
 /// to proving it signed the outputs with its advertised key.
 ///
-/// The verdict is a FLAG, not a gate (`draft-cashu-charge-01` verification
+/// The verdict is a FLAG, not a gate (`draft-cashu-charge-00` verification
 /// step 8): by the time these signatures exist the swap SUCCEEDED — the
 /// presented inputs are consumed and cannot be restored — so a failure here is
 /// a mint-trust incident the caller reports (WARN + the
@@ -204,7 +204,7 @@ async fn resolve_output_keyset<H: MintHttp + ?Sized>(
 /// MONEY-SAFETY INVARIANT: the swap-output DLEQ verification
 /// (`verify_swap_output_dleq`) ALWAYS runs, and its verdict is returned as
 /// [`SwapOutcome::dleq_ok`]. A failed verdict does NOT fail the ceremony
-/// (`draft-cashu-charge-01` §security-dleq: a mint-trust incident, not a
+/// (`draft-cashu-charge-00` §security-dleq: a mint-trust incident, not a
 /// payment failure — the inputs were consumed by the successful swap, so
 /// erroring here would destroy the redeemed value AND fail a settled payment).
 /// It is logged at WARN naming the mint so the operator can alert and
@@ -272,7 +272,7 @@ pub async fn swap_to_redeem<H: MintHttp + ?Sized>(
                 mint_url = %mint_url,
                 detail = %detail,
                 "swap-output DLEQ missing or invalid — mint-trust incident \
-                 (draft-cashu-charge-01 §security-dleq): payment is settled and \
+                 (draft-cashu-charge-00 §security-dleq): payment is settled and \
                  the resource will be served; alert the operator and quarantine \
                  this mint pending investigation"
             );
@@ -299,7 +299,7 @@ mod tests {
     //! Money-safety tests for the swap-output DLEQ verdict. A mock [`MintHttp`]
     //! signs the blinded outputs as a real mint would, then attaches VALID,
     //! MISSING, or PRESENT-BUT-INVALID DLEQ. Invariants under test
-    //! (`draft-cashu-charge-01` step 8): the redeemed value is returned in EVERY
+    //! (`draft-cashu-charge-00` step 8): the redeemed value is returned in EVERY
     //! DLEQ mode (the swap consumed the inputs; discarding outputs would destroy
     //! value), `dleq_ok` is `true` iff every signature's DLEQ verified, and a
     //! failed verdict WARNs naming the mint.

@@ -1,7 +1,7 @@
 //! HTTP-402 `Payment` envelope codec for the wallet.
 //!
 //! A thin re-export of the codec from [`pops_core_verify`], so the wallet and the
-//! verifier share ONE wire (`draft-cashu-charge-01`) and cannot drift: the
+//! verifier share ONE wire (`draft-cashu-charge-00`) and cannot drift: the
 //! cashu-free `Authorization` credentials envelope + the spec request object,
 //! plus the cashu-coupled [`decode_charge_request`] that derives the charge from
 //! the authoritative `methodDetails.paymentRequest` (rejecting a creqA missing

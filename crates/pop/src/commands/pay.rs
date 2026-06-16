@@ -725,7 +725,7 @@ async fn build_exact_payment(
 }
 
 /// Decodes the concrete [`Charge`] from parsed 402 params: read the
-/// `draft-cashu-charge-01` request object, deriving amount/unit/mints from the
+/// `draft-cashu-charge-00` request object, deriving amount/unit/mints from the
 /// authoritative `methodDetails.paymentRequest` (the shared codec rejects a
 /// creqA missing `a`/`u`/`m` or disagreeing with the top-level
 /// `amount`/`currency`). A 0-sat charge is rejected before any spend (an exact

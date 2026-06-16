@@ -17,7 +17,7 @@
 //! a generate-at-boot fallback: a restart then invalidates outstanding
 //! challenges, which clients resolve by refetching the 402.
 //!
-//! `draft-cashu-charge-01` step 3 + Challenge Binding §: a server operating
+//! `draft-cashu-charge-00` step 3 + Challenge Binding §: a server operating
 //! statelessly MUST include `expires` on every challenge (nothing else ever
 //! lapses it), so issuance here always emits it and verification requires it.
 

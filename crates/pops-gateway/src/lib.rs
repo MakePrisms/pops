@@ -3,7 +3,7 @@
 //!
 //! The gateway is a THIN HOST around the existing verify gate in
 //! `pops-core-verify`: it reuses `CashuCredential<CdkMintClient>` (verify +
-//! NUT-03 swap), the shared `draft-cashu-charge-01` request-object codec, and
+//! NUT-03 swap), the shared `draft-cashu-charge-00` request-object codec, and
 //! the single-sourced problem map, and adds only the host concerns — config,
 //! durable proof persistence (persist-before-forward), upstream forwarding,
 //! health/readiness, and JSON structured logs. Operator-run, non-custodial:

@@ -20,7 +20,7 @@ use thiserror::Error;
 /// NUT-12 verdict on the blind signatures the mint returned.
 ///
 /// `dleq_ok: false` is a MINT-TRUST INCIDENT, not a payment failure
-/// (`draft-cashu-charge-01` §security-dleq): the client's inputs were genuine
+/// (`draft-cashu-charge-00` §security-dleq): the client's inputs were genuine
 /// and were consumed by the successful swap; only the mint controls the
 /// signatures it returns. Callers serve the resource, surface the flag to the
 /// operator (alert + quarantine the mint), and MUST NOT answer with a payment
@@ -109,7 +109,7 @@ pub enum MintClientError {
 
     /// The mint refused the call with a KEYSET-class error (NUT error codes
     /// 12001 keyset-not-known / 12002 keyset-inactive): the keyset has retired
-    /// or its `final_expiry` has passed. `draft-cashu-charge-01` step 8 makes
+    /// or its `final_expiry` has passed. `draft-cashu-charge-00` step 8 makes
     /// this a `verification-failed` swap rejection, alongside the double-spend
     /// and other-rejection causes. Kept as its own arm so the cause can be named
     /// in the problem `detail`. The token was NOT consumed; the client needs

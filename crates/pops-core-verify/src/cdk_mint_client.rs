@@ -125,7 +125,7 @@ impl CdkMintClient {
 /// case. So match 12003 in the `UnknownErrorResponse` payload and route it to
 /// the same arm as 12001/12002. All of these mean the keyset has retired or its
 /// `final_expiry` has passed: a `verification-failed` swap rejection per
-/// `draft-cashu-charge-01` step 8, kept in its own arm so the cause is named in
+/// `draft-cashu-charge-00` step 8, kept in its own arm so the cause is named in
 /// the problem `detail`. A mint rejecting an expired keyset under any code OTHER
 /// than 12001/12002/12003 stays in the rejected catch-all, also
 /// `verification-failed`.

@@ -4,7 +4,7 @@
 //!
 //! Flow: a request without `Authorization: Payment <blob>` gets a 402 carrying a
 //! `WWW-Authenticate: Payment` challenge (whose `request="…"` is the
-//! `draft-cashu-charge-01` request object built from the
+//! `draft-cashu-charge-00` request object built from the
 //! [`CashuRequirement`]). Every challenge is stateless-bound per the framework:
 //! its `id` is the HMAC-SHA256 over the issued auth-params under the state's
 //! [`BindingKey`], and it carries an RFC 3339 `expires` (`now + challenge_ttl`).
@@ -19,7 +19,7 @@
 //! or malformed-credential failure → 402 + a fresh re-challenge; a transport
 //! failure to reach the mint → 503; a malformed request frame or a non-"cashu"
 //! method → 400. Every error body is RFC-9457 `application/problem+json`
-//! carrying the absolute `draft-cashu-charge-01` problem-type URI. Every 402
+//! carrying the absolute `draft-cashu-charge-00` problem-type URI. Every 402
 //! carries `Cache-Control: no-store`; the 200 carries `Cache-Control: private`.
 
 use std::sync::Arc;
@@ -372,7 +372,7 @@ fn challenge_response<C: Redeemer>(
 
 /// Map a [`ChargeError`] to an HTTP response with an RFC-9457
 /// `application/problem+json` body from the single-sourced
-/// [`crate::problem`] map (`draft-cashu-charge-01` §Errors). The three
+/// [`crate::problem`] map (`draft-cashu-charge-00` §Errors). The three
 /// non-collapsing concerns drive the status: `MintUnreachable` is 503 (transport,
 /// token NOT consumed, NEVER a 402) and carries `Retry-After`;
 /// `MalformedRequest`/`MethodUnsupported` are 400 (not a well-formed payment
@@ -789,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn www_authenticate_request_is_spec_request_object() {
-        // The `request` param decodes as the draft-cashu-charge-01 request object
+        // The `request` param decodes as the draft-cashu-charge-00 request object
         // (amount/currency/mints + the inner creqA), with the mints-superset
         // satisfied.
         use crate::challenge::decode_charge_request;

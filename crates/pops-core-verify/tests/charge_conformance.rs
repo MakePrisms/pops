@@ -1,4 +1,4 @@
-//! `draft-cashu-charge-01` wire-conformance tests, driving only the public API
+//! `draft-cashu-charge-00` wire-conformance tests, driving only the public API
 //! (a separate crate sees the same surface a consumer does).
 //!
 //! Covers the conformance bar this build raises: the spec request-object
@@ -328,7 +328,7 @@ async fn success_emits_payment_receipt_and_cache_control_private() {
 
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Cache-Control: private on the 200 (draft-cashu-charge-01 §Receipt).
+    // Cache-Control: private on the 200 (draft-cashu-charge-00 §Receipt).
     assert_eq!(
         resp.headers()
             .get(http::header::CACHE_CONTROL)
@@ -617,7 +617,7 @@ fn all_charge_error_cases() -> Vec<fn() -> ChargeError> {
 
 #[tokio::test]
 async fn charge_errors_map_to_spec_problem_types_and_statuses() {
-    // (ABSOLUTE problem-type URI, HTTP status) per draft-cashu-charge-01
+    // (ABSOLUTE problem-type URI, HTTP status) per draft-cashu-charge-00
     // §Errors + the framework's status table. The method defines NO problem
     // types of its own: mint unreachability is a plain 503 (about:blank body,
     // no custom URI) and an under-funded token is the framework's

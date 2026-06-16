@@ -1,7 +1,7 @@
 //! The cashu-coupled `creqA` layer (the cashu-free envelopes live in
 //! [`crate::envelope`]). [`encode_challenge`] serializes a [`CashuRequirement`]
 //! into the opaque `creqA…`; [`encode_charge_request`] wraps it in the
-//! `draft-cashu-charge-01` request object the 402's `request` auth-param carries
+//! `draft-cashu-charge-00` request object the 402's `request` auth-param carries
 //! (`methodDetails.paymentRequest`, the authoritative artifact), and
 //! [`decode_charge_request`] reads that object back, enforcing the spec's
 //! creqA requirements (`a`/`u`/non-empty-`m` present, top-level
@@ -75,7 +75,7 @@ pub fn encode_challenge(req: &CashuRequirement) -> String {
     req.to_payment_request().to_string()
 }
 
-/// The decoded `draft-cashu-charge-01` request object: the payment parameters
+/// The decoded `draft-cashu-charge-00` request object: the payment parameters
 /// derived from the authoritative `methodDetails.paymentRequest` (already
 /// checked against the top-level `amount`/`currency`), plus the opaque `creqA…`
 /// itself.
@@ -96,7 +96,7 @@ pub struct DecodedChargeRequest {
     pub creq_a: String,
 }
 
-/// Build the `draft-cashu-charge-01` request object for the 402's `request`
+/// Build the `draft-cashu-charge-00` request object for the 402's `request`
 /// auth-param: the spec amount/currency/description plus
 /// `methodDetails.paymentRequest` (the creqA, carrying the same amount/unit and
 /// the accepted mint set). Returns the base64url-nopad JCS string
@@ -126,7 +126,7 @@ pub fn encode_charge_request(req: &CashuRequirement) -> Result<String, Error> {
 }
 
 /// Decode the 402's `request` auth-param into a [`DecodedChargeRequest`],
-/// enforcing the `draft-cashu-charge-01` rules on the embedded payment request
+/// enforcing the `draft-cashu-charge-00` rules on the embedded payment request
 /// (the authoritative artifact):
 ///
 /// - the creqA MUST carry `a` (amount), `u` (unit), and a NON-EMPTY `m` (mints);

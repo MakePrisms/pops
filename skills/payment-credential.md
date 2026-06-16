@@ -1,7 +1,7 @@
 # The `Payment` credential — wire format
 
 The single canonical description of the `Payment` HTTP auth-scheme that pops
-uses (the `draft-cashu-charge-01` wire): the `402` challenge a gate sends, and
+uses (the `draft-cashu-charge-00` wire): the `402` challenge a gate sends, and
 the `Authorization: Payment` credential a client sends back. **Source of
 truth:**
 [`crates/pops-core-verify/src/envelope.rs`](../crates/pops-core-verify/src/envelope.rs)

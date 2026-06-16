@@ -32,12 +32,12 @@ hmac = "0.12"
 # tree transitively; the `wasm` feature flips on its `js` backend.
 getrandom = "0.2"
 # JCS / RFC 8785 canonical JSON for the `request` object and the `Authorization`
-# credential blob (`draft-cashu-charge-01` §Encoding): lexicographic key sort +
+# credential blob (`draft-cashu-charge-00` §Encoding): lexicographic key sort +
 # ECMAScript number formatting, over serde_json. Pure-Rust + wasm-clean (ryu-js
 # for the number serialization), so the envelope codec stays wasm-targetable.
 serde_jcs = "0.1"
 # Operator-facing diagnostics from the shared swap ceremony — the WARN on a
-# missing/invalid swap-output DLEQ (`draft-cashu-charge-01` §security-dleq:
+# missing/invalid swap-output DLEQ (`draft-cashu-charge-00` §security-dleq:
 # alert + quarantine, never fail the payment). Core-only, wasm-clean; hosts
 # bring their own subscriber.
 tracing = { version = "0.1", default-features = false, features = ["std"] }
