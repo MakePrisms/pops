@@ -23,18 +23,18 @@ flagged to the operator rather than failing a settled payment. The verifier is
 
 ## How it works
 
-- **[Mint](https://github.com/cashubtc/nuts/blob/main/04.md) a pop** by sending
-  BTC to a Taproot (P2TR) address that commits to the mint pubkey, an expiry, a
+- **Mint ([NUT-04](https://github.com/cashubtc/nuts/blob/main/04.md)) a pop** by
+  sending BTC to a Taproot (P2TR) address that commits to the mint pubkey, an expiry, a
   nonce, and your recovery pubkey. The internal key is a NUMS point, so the key
   path is unspendable and the funds move only through the one script leaf.
 - **Locking script** (that single Taproot leaf):
   `<ts_expiry> OP_CHECKLOCKTIMEVERIFY OP_VERIFY <funder_pubkey> OP_CHECKSIG`, the
   funder's recovery path, spendable only after `ts_expiry`.
 - **Unit and expiry**: the pop's unit is `pop_<ts_expiry>`, where `ts_expiry` is
-  that CLTV locktime (a Unix timestamp). The
-  [keyset](https://github.com/cashubtc/nuts/blob/main/02.md) `final_expiry`
+  that CLTV locktime (a Unix timestamp). The keyset
+  ([NUT-02](https://github.com/cashubtc/nuts/blob/main/02.md)) `final_expiry`
   tracks it, so a unit is mintable and redeemable only until its Bitcoin unlocks.
-- **[Redeem](https://github.com/cashubtc/nuts/blob/main/03.md) a pop** by
+- **Redeem ([NUT-03](https://github.com/cashubtc/nuts/blob/main/03.md)) a pop** by
   swapping it at the mint for fresh proofs the operator controls.
 - **Recover** the unspent BTC after `ts_expiry` through the leaf, signing with
   your recovery key.
