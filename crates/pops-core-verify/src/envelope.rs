@@ -24,7 +24,7 @@
 //! and any further unknown fields.
 //!
 //! Request object (`request="…"`): a base64url-nopad encoding of the JCS-canonical
-//! bytes of the `draft-cashu-charge-01` request schema —
+//! bytes of the `draft-cashu-charge-00` request schema —
 //! `{ amount, currency, description?, externalId?, methodDetails: { paymentRequest } }`
 //! — where `methodDetails.paymentRequest` is the opaque `creqA…`, the
 //! authoritative source of all payment parameters (amount, unit, accepted mints).
@@ -86,7 +86,7 @@ pub struct CashuPayload {
     pub token: String,
 }
 
-/// Full `draft-cashu-charge-01` credentials object. The top-level `source` is
+/// Full `draft-cashu-charge-00` credentials object. The top-level `source` is
 /// optional (tolerated, MUST NOT be required); any further unknown field is
 /// tolerated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,7 +323,7 @@ pub fn parse_payment_params(header_value: &str) -> Result<PaymentParams, AuthPar
     })
 }
 
-/// Cashu method-details of the `draft-cashu-charge-01` request object. Exactly
+/// Cashu method-details of the `draft-cashu-charge-00` request object. Exactly
 /// ONE field: the opaque payment request, the authoritative source of all
 /// payment parameters (amount, unit, accepted mints, spending-condition kind,
 /// single-use flag).
@@ -334,7 +334,7 @@ pub struct MethodDetails {
     pub payment_request: String,
 }
 
-/// The `draft-cashu-charge-01` `request` auth-param object. `amount` is the
+/// The `draft-cashu-charge-00` `request` auth-param object. `amount` is the
 /// canonical decimal string and `currency` is the unit; the cashu specifics live
 /// under `methodDetails`. Carried base64url-nopad over its JCS-canonical bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -692,7 +692,7 @@ mod tests {
         assert_eq!(strip_quoted(r#""a"b""#), None); // interior quote
     }
 
-    // ---- draft-cashu-charge-01 request object --------------------------------
+    // ---- draft-cashu-charge-00 request object --------------------------------
 
     fn sample_request_object() -> RequestObject {
         RequestObject {

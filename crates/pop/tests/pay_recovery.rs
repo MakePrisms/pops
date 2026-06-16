@@ -177,7 +177,7 @@ fn build_input_token(mint: &TestMint, mint_url: &str) -> String {
 
 /// The `WWW-Authenticate: Payment …` header value for a charge of `CHARGE_AMOUNT`
 /// in `pop_unit()` accepting exactly `mint_url`. The `request` param is the
-/// `draft-cashu-charge-01` request object.
+/// `draft-cashu-charge-00` request object.
 fn challenge_header(mint_url: &str) -> String {
     let req = CashuRequirement {
         unit: pop_unit(),

@@ -10,7 +10,7 @@ use crate::charge::ChargeError;
 use crate::problem::problem_mapping;
 use http::StatusCode;
 
-/// Map a [`ChargeError`] to its HTTP status per `draft-cashu-charge-01` §Errors
+/// Map a [`ChargeError`] to its HTTP status per `draft-cashu-charge-00` §Errors
 /// — the [`problem_mapping`] status as a typed `StatusCode`.
 ///
 /// THE load-bearing trichotomy (see the [`ChargeError`] banner): a transport

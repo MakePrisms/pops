@@ -38,7 +38,7 @@ pub struct ValidatedCharge {
     /// Total amount of the swapped proofs.
     pub amount: Amount,
     /// NUT-12 verdict on the swap-RETURNED blind signatures. `false` is a
-    /// mint-trust incident (`draft-cashu-charge-01` §security-dleq), already
+    /// mint-trust incident (`draft-cashu-charge-00` §security-dleq), already
     /// WARN-logged by the swap ceremony — the charge itself SUCCEEDED and the
     /// resource is served; the flag rides along so hosts can alert/quarantine.
     pub dleq_ok: bool,

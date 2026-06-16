@@ -48,7 +48,7 @@ pub fn parse_payment_params(www_authenticate: &str) -> Result<String, JsValue> {
 }
 
 /// Decode the base64url-nopad `request` auth-param into the JSON
-/// `draft-cashu-charge-01` request object (`{amount, currency, description?,
+/// `draft-cashu-charge-00` request object (`{amount, currency, description?,
 /// externalId?, methodDetails:{paymentRequest}}`).
 #[wasm_bindgen]
 pub fn decode_request_object(b64: &str) -> Result<String, JsValue> {
@@ -56,7 +56,7 @@ pub fn decode_request_object(b64: &str) -> Result<String, JsValue> {
     serde_json::to_string(&object).map_err(js_err)
 }
 
-/// Encode a JSON `draft-cashu-charge-01` request object as the base64url-nopad
+/// Encode a JSON `draft-cashu-charge-00` request object as the base64url-nopad
 /// JCS-canonical `request="…"` auth-param value.
 #[wasm_bindgen]
 pub fn encode_request_object(request_object_json: &str) -> Result<String, JsValue> {
@@ -98,7 +98,7 @@ pub fn build_payment_credential(credentials_json: &str) -> Result<String, JsValu
 
 /// Stable, machine-readable discriminant for a [`ChargeError`], carried as the
 /// `code` field of the rejection object. The codes are FINER-GRAINED than the
-/// `draft-cashu-charge-01` problem types — e.g. `wrong-unit`, `mint-not-allowed`,
+/// `draft-cashu-charge-00` problem types — e.g. `wrong-unit`, `mint-not-allowed`,
 /// and `double-spend` all map to the single `verification-failed` problem type —
 /// so a JS route uses `code` for diagnostics and the mapped `status` /
 /// `problem_type` / `problem_slug` fields (the shared [`crate::problem`] map)

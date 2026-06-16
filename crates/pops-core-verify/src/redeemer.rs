@@ -64,7 +64,7 @@ pub struct Redeemed {
     pub proofs: RedeemedProofs,
     /// Verdict of the redemption-output integrity check (for cashu: NUT-12
     /// DLEQ on the swap-RETURNED blind signatures). `false` is a SOURCE-trust
-    /// incident, not a payment failure (`draft-cashu-charge-01`
+    /// incident, not a payment failure (`draft-cashu-charge-00`
     /// §security-dleq): the payment settled and the resource is served; hosts
     /// surface this flag (it rides the middleware's `Extension<Redeemed>`) so
     /// the operator can alert and quarantine the source. Implementations
@@ -100,7 +100,7 @@ pub trait Redeemer {
     /// 2. **Output integrity verified and REPORTED** — the returned proofs'
     ///    integrity check (NUT-12 DLEQ for cashu) always RUNS, and its verdict
     ///    is returned as [`Redeemed::dleq_ok`]. A failed verdict MUST NOT fail
-    ///    the redemption (`draft-cashu-charge-01` §security-dleq: the
+    ///    the redemption (`draft-cashu-charge-00` §security-dleq: the
     ///    credential was already consumed by the successful redemption, so
     ///    erroring would both destroy the value and fail a settled payment);
     ///    it is surfaced to the operator instead (flag + WARN log).

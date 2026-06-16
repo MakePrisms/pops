@@ -9,7 +9,7 @@
 //! surface, wasm included; the native [`crate::http_status`] adapter lifts them
 //! into `http::StatusCode`.
 //!
-//! URIs per `draft-cashu-charge-01` Errors § and the framework's problem
+//! URIs per `draft-cashu-charge-00` Errors § and the framework's problem
 //! registry: the method defines NO problem types of its own — every 402 type
 //! is a framework-registered `https://paymentauth.org/problems/<slug>`, and
 //! mint unreachability carries no problem type at all (a plain 503 +
@@ -216,7 +216,7 @@ pub const PROBLEM_JSON: &str = "application/problem+json";
 #[cfg(test)]
 mod tests {
     //! Pins the WHOLE map, documenting the spec choice for each variant
-    //! (`draft-cashu-charge-01` Errors § + the framework's status table).
+    //! (`draft-cashu-charge-00` Errors § + the framework's status table).
 
     use super::*;
 

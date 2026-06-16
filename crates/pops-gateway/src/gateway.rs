@@ -102,7 +102,7 @@ impl AppState<CashuCredential<CdkMintClient>> {
 }
 
 /// Build one fresh `WWW-Authenticate: Payment …` value: the constant request
-/// object (the shared `draft-cashu-charge-01` codec — the same object the core
+/// object (the shared `draft-cashu-charge-00` codec — the same object the core
 /// middleware emits, so the two hosts speak ONE wire) plus a per-request
 /// `expires` (`now + challenge_ttl`) and the framework's stateless HMAC `id`
 /// binding every issued param under the configured key.
