@@ -1,0 +1,13 @@
+{
+  "name": "pops-core-verify",
+  "description": "PoPs ecash-agnostic verify core: Credential trait + CashuCredential<M:MintClient>; verify+swap-to-redeem behind a swappable MintClient; native (axum/cdk) + wasm surfaces.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "files": [
+    "pops_core_verify_bg.wasm",
+    "pops_core_verify.js",
+    "pops_core_verify.d.ts"
+  ],
+  "main": "pops_core_verify.js",
+  "types": "pops_core_verify.d.ts"
+}
