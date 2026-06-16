@@ -31,6 +31,12 @@ use crate::SCHEMA_VERSION;
 /// Default seconds in a "30d" style duration.
 const SECS_PER_DAY: u64 = 86_400;
 
+/// The "usable window" floor below which funding a unit still PROCEEDS but emits
+/// a stderr WARNING: the mint stops accepting swaps at the active keyset's
+/// `final_expiry`, so a pop whose keyset expires within this window is spendable
+/// only very briefly. Tunable here (no CLI flag — kept minimal). One hour.
+const USABLE_WINDOW_WARN_SECS: u64 = 3_600;
+
 /// Arguments for `pop mint`. `--mint-url`, `--amount`, and one of
 /// `{--duration, --unit}` are required for a fresh mint, but ALL are optional
 /// with `--resume <id>` (reloaded from the persisted deposit).
@@ -123,8 +129,14 @@ pub struct QuoteOutcome {
     pub deposit_id: String,
     /// Resolved unit string `pop_<ts_expiry>`.
     pub unit_str: String,
-    /// CLTV expiry / unit ts.
+    /// CLTV expiry / unit ts. This is the RECOVER-AFTER deadline: when the
+    /// on-chain BTC becomes reclaimable.
     pub ts_expiry: u64,
+    /// The active keyset's `final_expiry` (unix seconds), if the keyset sets one.
+    /// This is the SWAP / spend-by deadline: after it the mint stops accepting
+    /// the pop, so it is when the credential must be spent BY. Distinct from (and
+    /// earlier than) `ts_expiry`. `None` ⟹ the keyset advertises no swap-expiry.
+    pub usable_until: Option<u64>,
     /// Amount locked + to be minted, sats.
     pub amount: u64,
     /// The reconstructed taproot construction (carries the funding address).
@@ -175,6 +187,15 @@ pub async fn create_and_persist_quote(
         "Unit:    {unit_str}  (recover-after {})",
         utc_iso8601(ts_expiry)
     );
+
+    // GUARD: before any BTC is committed, confirm the unit's active keyset is not
+    // already past its swap-expiry. A pop's REAL spend deadline is the keyset's
+    // `final_expiry` (the mint sets it to `ts_expiry - safety_margin`), which is
+    // BEFORE the CLTV. Funding a unit whose keyset is already expired locks BTC
+    // for a dead-on-arrival pop (unswappable; only recoverable on-chain after the
+    // CLTV). Returns the keyset's `final_expiry` so it can surface as
+    // `usable_until`.
+    let usable_until = guard_keyset_not_expired(http, base, &unit_str).await?;
 
     let index = wallet.db.next_derivation_index()?;
     let funder = wallet.funder_key(seed, index)?;
@@ -246,6 +267,7 @@ pub async fn create_and_persist_quote(
         deposit_id,
         unit_str,
         ts_expiry,
+        usable_until,
         amount,
         construction,
         derivation_path,
@@ -337,6 +359,7 @@ pub async fn run(
         &seed,
         args,
         json,
+        outcome.usable_until,
     )
     .await
 }
@@ -433,7 +456,31 @@ async fn resume(
         wallet.db.set_state(deposit_id, DepositState::Paid)?;
     }
 
-    finish_mint(wallet, http, base, deposit_id, &dep.unit, seed, args, json).await
+    // Surface the keyset swap-expiry on the resume path too (best-effort: a
+    // resumed deposit's BTC may already be funded, so this is informational, NOT
+    // a refusal gate — never let a keyset lookup block issuing an already-paid
+    // deposit).
+    let usable_until = lookup_keyset_final_expiry(http, base, &dep.unit).await;
+    finish_mint(
+        wallet, http, base, deposit_id, &dep.unit, seed, args, json, usable_until,
+    )
+    .await
+}
+
+/// Best-effort `final_expiry` lookup for the active keyset of `unit_str`, for
+/// SURFACING `usable_until` only (never a gate). Any failure (mint unreachable,
+/// no active keyset, bad unit) yields `None` so it can't block issuing an
+/// already-funded deposit on the resume path.
+async fn lookup_keyset_final_expiry(
+    http: &reqwest::Client,
+    base: &str,
+    unit_str: &str,
+) -> Option<u64> {
+    let unit = CurrencyUnit::from_str(unit_str).ok()?;
+    let keysets = mint_client::fetch_keyset_infos(http, base).await.ok()?;
+    mint_client::select_active_keyset(&keysets, &unit)
+        .ok()?
+        .final_expiry
 }
 
 /// Mints the ecash for a PAID deposit and prints the cashuB token. The
@@ -449,6 +496,7 @@ async fn finish_mint(
     seed: &[u8],
     args: &MintArgs,
     json: bool,
+    usable_until: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let dep = wallet
         .db
@@ -500,6 +548,11 @@ async fn finish_mint(
             "amount_sats": dep.amount,
             "state": "minted",
             "token": token_str,
+            // SWAP / spend-by deadline (the mint's keyset final_expiry), distinct
+            // from and earlier than the recover-after CLTV (`ts_expiry`). null ⟹
+            // the keyset sets none.
+            "usable_until": usable_until,
+            "usable_until_utc": usable_until.map(utc_iso8601),
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
@@ -617,6 +670,103 @@ fn resolve_unit(args: &MintArgs) -> Result<String, Box<dyn std::error::Error>> {
 /// byte-identical to theirs, so any unit that funds here is one the mint honors.
 fn parse_unit_ts(unit: &str) -> Result<u64, Box<dyn std::error::Error>> {
     parse_pop_unit(unit).map_err(|e| PopError::invalid_input(e.to_string()).into())
+}
+
+/// The verdict of the keyset-expiry guard over a `(final_expiry, now)` pair.
+#[derive(Debug, PartialEq, Eq)]
+enum KeysetExpiryVerdict {
+    /// No swap-expiry on the keyset, or it is comfortably in the future: proceed
+    /// with no warning. Carries the keyset's `final_expiry` (`None` ⟹ no expiry).
+    Ok(Option<u64>),
+    /// `final_expiry` is in the future but within [`USABLE_WINDOW_WARN_SECS`]:
+    /// proceed, but warn that the pop is spendable only until `final_expiry`.
+    Warn { final_expiry: u64, secs_left: u64 },
+    /// `final_expiry <= now`: HARD REFUSE — funding would lock BTC for a pop the
+    /// mint will not accept.
+    Refuse { final_expiry: u64 },
+}
+
+/// Pure decision core of the keyset-expiry guard: classify an active keyset's
+/// `final_expiry` against `now`. Refuse if expired, warn if imminent, else
+/// proceed. Separated from the HTTP fetch so the boundaries are unit-testable.
+fn evaluate_keyset_expiry(final_expiry: Option<u64>, now: u64) -> KeysetExpiryVerdict {
+    let Some(fe) = final_expiry else {
+        return KeysetExpiryVerdict::Ok(None);
+    };
+    if fe <= now {
+        return KeysetExpiryVerdict::Refuse { final_expiry: fe };
+    }
+    let secs_left = fe - now;
+    if secs_left < USABLE_WINDOW_WARN_SECS {
+        return KeysetExpiryVerdict::Warn {
+            final_expiry: fe,
+            secs_left,
+        };
+    }
+    KeysetExpiryVerdict::Ok(Some(fe))
+}
+
+/// Money-safety guard: fetch the resolved unit's ACTIVE keyset and refuse to fund
+/// if its swap-expiry has already passed (warn if it is imminent). Returns the
+/// keyset's `final_expiry` (`None` ⟹ the keyset advertises no swap-expiry) so the
+/// caller can surface it as `usable_until`.
+///
+/// # Errors
+///
+/// - [`PopError::InvalidInput`] (refusal) when the active keyset's `final_expiry`
+///   is already past — NO quote is created and NO BTC moves.
+/// - propagates the `/v1/keysets` fetch and the "no active keyset for unit"
+///   selection errors unchanged.
+async fn guard_keyset_not_expired(
+    http: &reqwest::Client,
+    base: &str,
+    unit_str: &str,
+) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    let unit = CurrencyUnit::from_str(unit_str).map_err(|e| {
+        PopError::internal(format!("unit `{unit_str}` is not a valid CurrencyUnit: {e}"))
+    })?;
+    let keysets = mint_client::fetch_keyset_infos(http, base).await?;
+    // Existing behavior: an unadvertised unit errors "no active keyset for unit".
+    let keyset = mint_client::select_active_keyset(&keysets, &unit)?;
+    let now = now_unix();
+
+    match evaluate_keyset_expiry(keyset.final_expiry, now) {
+        KeysetExpiryVerdict::Ok(fe) => Ok(fe),
+        KeysetExpiryVerdict::Warn {
+            final_expiry,
+            secs_left,
+        } => {
+            eprintln!(
+                "warning: {unit_str} is spendable only until {} (the mint's keyset swap-expiry, \
+                 ~{} from now); after that the pop can no longer be redeemed (only the on-chain \
+                 BTC is recoverable, after the CLTV). Consider a later unit / longer duration.",
+                utc_iso8601(final_expiry),
+                humanize_secs(secs_left),
+            );
+            Ok(Some(final_expiry))
+        }
+        KeysetExpiryVerdict::Refuse { final_expiry } => Err(PopError::invalid_input(format!(
+            "refusing to fund {unit_str}: the mint's active keyset for this unit already expired \
+             at {} (its swap-expiry / final_expiry), so a pop minted now would be dead-on-arrival \
+             (the mint will not accept it and the locked BTC is recoverable only on-chain after \
+             the CLTV). Pick a unit with a later expiry, or a longer --duration.",
+            utc_iso8601(final_expiry),
+        ))
+        .into()),
+    }
+}
+
+/// Coarse, dependency-free "~Xh Ym" / "~Ns" rendering for the warning string.
+fn humanize_secs(secs: u64) -> String {
+    if secs >= 3_600 {
+        let h = secs / 3_600;
+        let m = (secs % 3_600) / 60;
+        format!("~{h}h {m}m")
+    } else if secs >= 60 {
+        format!("~{}m", secs / 60)
+    } else {
+        format!("~{secs}s")
+    }
 }
 
 /// Parses a duration like `30d`, `12h`, `45m`, `3600s` into seconds.
@@ -934,6 +1084,163 @@ mod tests {
         assert_eq!(back.value().unwrap().to_u64(), 9);
     }
 
+    // ---- keyset-expiry guard (Part 1) ----
+
+    #[test]
+    fn evaluate_keyset_expiry_none_is_ok_none() {
+        // No swap-expiry advertised: proceed, surface None.
+        assert_eq!(evaluate_keyset_expiry(None, 1_000), KeysetExpiryVerdict::Ok(None));
+    }
+
+    #[test]
+    fn evaluate_keyset_expiry_future_is_ok_some() {
+        // Comfortably ahead of the warn window: proceed, surface the expiry.
+        let now = 1_000_000;
+        let fe = now + USABLE_WINDOW_WARN_SECS + 1; // just past the window
+        assert_eq!(
+            evaluate_keyset_expiry(Some(fe), now),
+            KeysetExpiryVerdict::Ok(Some(fe))
+        );
+    }
+
+    #[test]
+    fn evaluate_keyset_expiry_past_is_refuse() {
+        let now = 1_000_000;
+        // Strictly past.
+        assert_eq!(
+            evaluate_keyset_expiry(Some(now - 1), now),
+            KeysetExpiryVerdict::Refuse {
+                final_expiry: now - 1
+            }
+        );
+        // Boundary: fe == now is already dead (<= now refuses).
+        assert_eq!(
+            evaluate_keyset_expiry(Some(now), now),
+            KeysetExpiryVerdict::Refuse { final_expiry: now }
+        );
+    }
+
+    #[test]
+    fn evaluate_keyset_expiry_imminent_is_warn() {
+        let now = 1_000_000;
+        // Inside the window (but in the future) -> warn + proceed.
+        let fe = now + USABLE_WINDOW_WARN_SECS - 1;
+        assert_eq!(
+            evaluate_keyset_expiry(Some(fe), now),
+            KeysetExpiryVerdict::Warn {
+                final_expiry: fe,
+                secs_left: USABLE_WINDOW_WARN_SECS - 1
+            }
+        );
+        // Exactly one second in the future is still a warn (not a refuse).
+        assert_eq!(
+            evaluate_keyset_expiry(Some(now + 1), now),
+            KeysetExpiryVerdict::Warn {
+                final_expiry: now + 1,
+                secs_left: 1
+            }
+        );
+        // The window boundary itself (secs_left == threshold) is OK, not a warn.
+        assert_eq!(
+            evaluate_keyset_expiry(Some(now + USABLE_WINDOW_WARN_SECS), now),
+            KeysetExpiryVerdict::Ok(Some(now + USABLE_WINDOW_WARN_SECS))
+        );
+    }
+
+    /// Spawns a one-request `/v1/keysets` stub returning a single active keyset
+    /// for `pop_<ts>` with the given `final_expiry`, and returns its base url.
+    async fn spawn_keysets_stub(final_expiry: Option<u64>) -> String {
+        use cdk_common::nuts::{Id, KeySetInfo};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let info = KeySetInfo {
+            id: Id::from_str("009a1f293253e41e").expect("valid v0 id"),
+            unit: CurrencyUnit::Custom("pop_1782259200".to_string()),
+            active: true,
+            input_fee_ppk: 0,
+            final_expiry,
+        };
+        let body = serde_json::json!({ "keysets": [info] }).to_string();
+
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Drain the request head (until CRLFCRLF) then reply.
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    match stream.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// Guard HARD-REFUSES (invalid_input, no quote created) when the unit's active
+    /// keyset already passed its swap-expiry. The stub serves ONLY `/v1/keysets`,
+    /// so reaching the quote-create HTTP would be a separate later call — a
+    /// refusal here proves nothing downstream ran.
+    #[tokio::test]
+    async fn guard_refuses_already_expired_keyset() {
+        let now = now_unix();
+        let base = spawn_keysets_stub(Some(now.saturating_sub(10))).await;
+        let http = reqwest::Client::new();
+
+        let err = guard_keyset_not_expired(&http, &base, "pop_1782259200")
+            .await
+            .expect_err("expired keyset must refuse");
+        let pe = crate::error::from_boxed(err);
+        assert_eq!(pe.code(), "invalid_input");
+        // Not retriable, needs_input (exit 3): the keyset is dead, re-quoting a
+        // later unit is the fix.
+        assert!(!pe.retriable());
+        assert_eq!(pe.exit_code(), 3);
+    }
+
+    /// Guard PROCEEDS and surfaces `final_expiry` as `usable_until` when the
+    /// keyset is comfortably alive.
+    #[tokio::test]
+    async fn guard_proceeds_on_alive_keyset() {
+        let now = now_unix();
+        let fe = now + 10 * SECS_PER_DAY;
+        let base = spawn_keysets_stub(Some(fe)).await;
+        let http = reqwest::Client::new();
+
+        let usable_until = guard_keyset_not_expired(&http, &base, "pop_1782259200")
+            .await
+            .expect("alive keyset must proceed");
+        assert_eq!(usable_until, Some(fe));
+    }
+
+    /// Guard PROCEEDS with `usable_until == None` when the keyset advertises no
+    /// swap-expiry.
+    #[tokio::test]
+    async fn guard_proceeds_with_none_when_no_final_expiry() {
+        let base = spawn_keysets_stub(None).await;
+        let http = reqwest::Client::new();
+
+        let usable_until = guard_keyset_not_expired(&http, &base, "pop_1782259200")
+            .await
+            .expect("no-expiry keyset must proceed");
+        assert_eq!(usable_until, None);
+    }
+
     #[test]
     fn btc_formatting() {
         assert_eq!(format_btc(100_000_000), "1.00000000");
@@ -983,6 +1290,7 @@ mod tests {
             deposit_id: "dep-bip21".to_string(),
             unit_str: "pop_1782259200".to_string(),
             ts_expiry: 1_782_259_200,
+            usable_until: None,
             amount: 10_000,
             construction,
             derivation_path: "m/5271376'/1'/0'/0/0".to_string(),
