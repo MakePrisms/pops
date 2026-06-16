@@ -227,10 +227,32 @@ Returns:
   "unit": "pop_1788000000",
   "ts_expiry": 1788000000,
   "recover_after_utc": "2026-12-29T00:00:00Z",
+  "usable_until": 1787913600,
+  "usable_until_utc": "2026-12-28T00:00:00Z",
   "bip21_uri": "bitcoin:bc1p…?amount=0.00050000",
   "mint_url": "https://mint.example"
 }
 ```
+
+**Two deadlines, do not confuse them.** A pop has two distinct expiry instants,
+and `quote`/`mint` surface both:
+- **`usable_until`** (+ `usable_until_utc`) is the **SPEND-BY deadline**: the
+  mint's keyset swap-expiry (`final_expiry`). After it the mint stops accepting
+  the pop, so the credential **must be spent before this instant**. It is
+  `null` only when the keyset advertises no swap-expiry. It is **earlier** than
+  the recover-after instant (the mint sets it to the CLTV minus a safety margin).
+- **`ts_expiry`** / **`recover_after_utc`** is the **RECOVER-AFTER deadline**:
+  when the locked on-chain BTC becomes reclaimable by you (the CLTV).
+Treat **`usable_until`, NOT the CLTV, as the spend-by deadline** when you decide
+whether a held pop is still good to pay with. The CLTV is only about reclaiming
+the underlying BTC once the credential is dead.
+
+`pop quote`/`mint` also **refuse up front** to fund a unit whose active keyset
+has **already** passed its swap-expiry: you get `invalid_input` (exit 3, no quote
+created, no BTC moved), because such a pop would be dead-on-arrival. If the
+keyset's swap-expiry is merely *imminent* (under an hour out) it still funds but
+prints a warning to stderr. **Never fund a unit whose keyset is expired or
+about to expire**: pick a later unit / longer `--duration`.
 
 Log the lock (see ACTIVITY LOG). Now **fund `funding_address` with EXACTLY
 `amount_sats`** (over- or under-funding will NOT credit) — via the human's
@@ -254,8 +276,14 @@ pop mint --resume <deposit_id>
 Returns:
 ```json
 { "schema_version": 1, "deposit_id": "…", "mint_url": "…", "unit": "pop_1788000000",
-  "amount_sats": 50000, "state": "minted", "token": "cashuB…" }
+  "amount_sats": 50000, "state": "minted", "token": "cashuB…",
+  "usable_until": 1787913600, "usable_until_utc": "2026-12-28T00:00:00Z" }
 ```
+
+The mint result also carries **`usable_until`** (the spend-by deadline: the
+mint's keyset swap-expiry; `null` if none), distinct from and earlier than the
+recover-after CLTV. The token is only redeemable until `usable_until`; spend it
+before then.
 
 While `mint --resume` polls for funding it prints poll-status / progress to
 **stderr** (stdout stays empty until the single final token object). If it
@@ -531,6 +559,13 @@ week's bitcoin" or "how much have I got locked":
   ETA — the funds genuinely cannot move yet.
 - **Exact funding only.** Fund `funding_address` with EXACTLY `amount_sats`;
   over/under-funding will not credit.
+- **Spend-by is `usable_until`, not the CLTV.** A pop is redeemable only until
+  its keyset's swap-expiry (`usable_until`), which is earlier than the
+  recover-after CLTV. Never fund a unit whose keyset is already expired (the
+  wallet refuses this up front with `invalid_input`) or about to expire (the
+  wallet warns on stderr); pick a later unit / longer `--duration`. Once a held
+  pop is past `usable_until` it can no longer be spent: only the underlying BTC
+  is recoverable, and only after the CLTV.
 - **Trust the wallet's verification, don't bypass it.** `pop quote/mint`
   independently re-derive and verify the funding address and abort on any
   mismatch; if a command fails with the **`address_mismatch`** code (terminal,

@@ -73,6 +73,19 @@ amount = 1                                   # exact net value required per requ
 > `pop_1780372941` above is currently active (also the Vercel demo's default),
 > but confirm against your mint.
 
+> **MINT-OPERATOR CAUTION (retiring a unit strands outstanding tokens).** If you
+> run the **mint** (the `cdk-pop` side, configured in the separate
+> [MakePrisms/cdk](https://github.com/MakePrisms/cdk) repo), do NOT drop a
+> `pop_<ts>` unit from the mint's `active_units` (or otherwise retire its keyset)
+> **before that unit's CLTV** while tokens against it are still outstanding.
+> Retiring the keyset makes those tokens unswappable (the mint stops accepting
+> them), and a downstream bearer cannot recover on-chain either: only the
+> original funder holds the CLTV key. The result is permanently stranded value.
+> Let a unit's keyset live until its CLTV has matured (the keyset's swap-expiry,
+> `final_expiry`, is already set to the CLTV minus a safety margin precisely so
+> the swap window closes a known interval before recovery opens). The mint-side
+> `active_units` config and retirement policy are documented in the cdk repo.
+
 ---
 
 ## Paying the gateway (client side)

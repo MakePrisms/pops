@@ -114,6 +114,10 @@ pub async fn run(
             "unit": outcome.unit_str,
             "ts_expiry": outcome.ts_expiry,
             "recover_after_utc": utc_iso8601(outcome.ts_expiry),
+            // SWAP / spend-by deadline (the mint's keyset final_expiry), distinct
+            // from and earlier than recover_after. null ⟹ the keyset sets none.
+            "usable_until": outcome.usable_until,
+            "usable_until_utc": outcome.usable_until.map(utc_iso8601),
             "bip21_uri": outcome.bip21_uri(),
             "mint_url": base,
         });
