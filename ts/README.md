@@ -84,7 +84,7 @@ about *how* you install them):
   toolchain for the secp256k1 C→wasm compile. The wasm32-scoped env vars
   `CC_wasm32_unknown_unknown` (clang) and `AR_wasm32_unknown_unknown` (llvm-ar)
   must point at a clang/llvm-ar.
-- **`wasm-pack`** (0.13.x works; e.g. `nix build nixpkgs#wasm-pack`).
+- **`wasm-pack`** (0.13.x and 0.15.x both work; e.g. `nix build nixpkgs#wasm-pack`).
 - **`wasm-bindgen` CLI pinned to Cargo.lock's `wasm-bindgen` version** — today
   **0.2.122**. This MUST match exactly or the build aborts on a schema mismatch.
   `--mode no-install` in the script makes wasm-pack use the on-PATH binary
@@ -138,7 +138,10 @@ override at runtime with `POPS_MINT_URL` / `POPS_UNIT` / `POPS_AMOUNT` **and**
 `creqA` whose `a`/`u`/`m` must equal the requirement, so overriding
 `POPS_MINT_URL`/`POPS_UNIT`/`POPS_AMOUNT` **without** a matching `POPS_CREQ_A`
 yields a self-contradicting challenge that conformant clients (e.g. `pop pay`)
-refuse. The gated route runs
+refuse. Additionally, the default hardcoded `CREQ_A` in `route.ts` uses a
+placeholder unit (`pop_1780372941`) from an old mutinynet mint; any real
+deployment must supply both `POPS_UNIT` (a currently-active keyset unit from
+your mint) and a corresponding `POPS_CREQ_A`. The gated route runs
 on the **Node** runtime (not Edge) — the wasm-pack nodejs glue reads its `.wasm`
 via `fs.readFileSync`, and `next.config.js` keeps the package un-bundled
 (`serverExternalPackages` + a webpack external) so `__dirname` stays intact for
