@@ -270,6 +270,7 @@ PoP's soundness depends on credentials becoming unspendable at `final_expiry`. P
 
 - A conformant PoP mint MUST set a non-null `final_expiry` ([NUT-02][02]) on every `pop_<ts>` keyset, equal to `ts_expiry − safety_margin`.
 - A conformant PoP mint MUST reject any operation (swap, melt, or issuance) that uses a keyset whose `final_expiry` has passed. This rejection is what makes a verifier's swap a proof of non-expiry.
+- A conformant PoP mint MUST refuse a mint-quote request at creation when the unit's keyset `final_expiry` has already passed (`final_expiry ≤ now`), even where `ts_expiry > now` — e.g. a requested duration shorter than `safety_margin`. Without this check the funder can fund a quote whose credentials are already unissuable under the preceding rule, stranding the BTC until on-chain recovery after `ts_expiry`; refusing the quote up front, rather than returning a funding address, is what prevents the strand.
 
 A mint that honors expired `pop_<ts>` keysets is not a conformant PoP mint: it would let a holder spend a credential after the funder can already reclaim the BTC, breaking backing soundness.
 
